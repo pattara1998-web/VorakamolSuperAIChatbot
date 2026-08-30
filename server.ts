@@ -806,12 +806,17 @@ async function startServer() {
       };
       const state = Buffer.from(JSON.stringify(stateObj)).toString('base64url');
       
-      const scopes = [
+      // Default scopes cover: listing pages, reading/replying to comments, sending
+      // messages, and webhook subscription. NOTE: `pages_manage_posts` is restricted
+      // for new Meta apps (requires App Review) and is NOT needed for comment
+      // replies — `pages_manage_engagement` is the correct permission for that.
+      // Override the full list via FB_OAUTH_SCOPES env var if Meta rejects a scope.
+      const scopes = process.env.FB_OAUTH_SCOPES || [
         'pages_show_list',
         'pages_manage_metadata',
         'pages_read_engagement',
         'pages_messaging',
-        'pages_manage_posts'
+        'pages_manage_engagement'
       ].join(',');
 
       const authUrl = `https://www.facebook.com/${META_GRAPH_API_VERSION}/dialog/oauth?client_id=${encodeURIComponent(appId)}&redirect_uri=${encodeURIComponent(callbackUrl)}&scope=${encodeURIComponent(scopes)}&state=${state}&response_type=code`;

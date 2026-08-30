@@ -285,7 +285,7 @@ export function decryptToken(encryptedToken: string): string {
 app.get('/api/facebook/connect', (req: Request, res: Response) => {
   const appId = process.env.FACEBOOK_APP_ID;
   const callbackUrl = \`\${req.protocol}://\${req.get('host')}/api/facebook/callback\`;
-  const scopes = 'pages_show_list,pages_manage_metadata,pages_read_engagement,pages_messaging,pages_manage_posts';
+  const scopes = 'pages_show_list,pages_manage_metadata,pages_read_engagement,pages_messaging,pages_manage_engagement';
   res.redirect(\`https://www.facebook.com/v19.0/dialog/oauth?client_id=\${appId}&redirect_uri=\${encodeURIComponent(callbackUrl)}&scope=\${encodeURIComponent(scopes)}&response_type=code\`);
 });`;
 
