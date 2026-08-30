@@ -44,11 +44,15 @@ services:
         sync: false
       - key: META_GRAPH_API_VERSION
         value: v24.0
-      # OAuth scopes requested during Facebook connect. `pages_manage_posts` is
-      # restricted for new Meta apps (needs App Review); comment replies only need
-      # `pages_manage_engagement`. Override here without redeploying if Meta changes policy.
+      # OAuth scopes requested during Facebook connect.
+      # IMPORTANT: `pages_manage_posts` and `pages_manage_engagement` are ADVANCED
+      # permissions that Meta rejects with "Invalid Scopes" until the app passes
+      # App Review (Advanced Access). The default below uses only Standard Access
+      # scopes that work immediately for new apps.
+      # Once Meta approves Advanced Access, add `pages_manage_engagement` here
+      # (needed for comment replies) without redeploying.
       - key: FB_OAUTH_SCOPES
-        value: pages_show_list,pages_manage_metadata,pages_read_engagement,pages_messaging,pages_manage_engagement
+        value: pages_show_list,pages_manage_metadata,pages_read_engagement,pages_messaging
       # Used by server.ts to AES-256-GCM encrypt stored tokens.
       # generateValue: true → Render creates a strong random secret for you.
       - key: ENCRYPTION_SECRET_KEY
