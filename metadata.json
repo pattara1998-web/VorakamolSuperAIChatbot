@@ -1,0 +1,10 @@
+{
+  "name": "Vorakamol SuperAI Chatbot",
+  "description": "ระบบจัดการ Facebook Pages อัตโนมัติ, CRM ลูกค้า, แชทบอทปิดการขายอัจฉริยะ และผู้ช่วยเสียง AI Copilot",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,746 @@
+import React, { useState, useEffect } from 'react';
+import { Navbar } from './components/Navbar';
+import { PagesHubTab } from './components/PagesHubTab';
+import { SalesDashboardTab } from './components/SalesDashboardTab';
+import { CrmHubTab } from './components/CrmHubTab';
+import { DatabaseSheetTab } from './components/DatabaseSheetTab';
+import { LiveSimulatorTab } from './components/LiveSimulatorTab';
+import { CommentModerationTab } from './components/CommentModerationTab';
+import { FollowUpEngineTab } from './components/FollowUpEngineTab';
+import { OrdersAndLineTab } from './components/OrdersAndLineTab';
+import { SystemDocsTab } from './components/SystemDocsTab';
+import { FacebookConnectModal } from './components/FacebookConnectModal';
+import { PageSettingsModal } from './components/PageSettingsModal';
+import { AiApiSettingsModal } from './components/AiApiSettingsModal';
+import { AiAdminCopilot } from './components/AiAdminCopilot';
+import { SecurityLockScreen } from './components/SecurityLockScreen';
+import {
+  ProductAmulet,
+  ProductChina,
+  ProductOtop,
+  ProductAgriculture,
+  Order,
+  Customer,
+  PageConfig,
+  ActivityLog
+} from './types';
+import {
+  INITIAL_PAGES,
+  INITIAL_AMULET,
+  INITIAL_CHINA,
+  INITIAL_OTOP,
+  INITIAL_AGRICULTURE,
+  INITIAL_CUSTOMERS,
+  INITIAL_ORDERS
+} from './data/initialDatabase';
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState<string>('pages_hub');
+  const [selectedPageId, setSelectedPageId] = useState<string>('AMULET_PAGE_ID');
+  const [isConnectModalOpen, setIsConnectModalOpen] = useState(false);
+  const [isPageSettingsOpen, setIsPageSettingsOpen] = useState(false);
+  const [isAiSettingsOpen, setIsAiSettingsOpen] = useState(false);
+  const [settingsPageId, setSettingsPageId] = useState<string>('AMULET_PAGE_ID');
+  const [theme, setTheme] = useState<'dark' | 'light'>('light');
+  const [isLocked, setIsLocked] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    return localStorage.getItem('fb_chatbot_unlocked') !== 'true';
+  });
+
+  // Browser cache is only an offline convenience. The server remains the source of truth.
+  const loadLocal = <T,>(key: string, fallback: T): T => {
+    if (typeof window === 'undefined') return fallback;
+    try {
+      const item = localStorage.getItem('fb_chatbot_' + key);
+      if (!item) return fallback;
+      return JSON.parse(item) as T;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const saveLocal = (key: string, data: any) => {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem('fb_chatbot_' + key, JSON.stringify(data));
+    } catch (e) {
+      console.warn('localStorage save error:', e);
+    }
+  };
+
+  const [pages, setPages] = useState<PageConfig[]>(() => loadLocal('pages', INITIAL_PAGES));
+  const [amulet, setAmulet] = useState<ProductAmulet[]>(() => loadLocal('amulet', INITIAL_AMULET));
+  const [china, setChina] = useState<ProductChina[]>(() => loadLocal('china', INITIAL_CHINA));
+  const [otop, setOtop] = useState<ProductOtop[]>(() => loadLocal('otop', INITIAL_OTOP));
+  const [agriculture, setAgriculture] = useState<ProductAgriculture[]>(() => loadLocal('agriculture', INITIAL_AGRICULTURE));
+  const [customers, setCustomers] = useState<Customer[]>(() => loadLocal('customers', INITIAL_CUSTOMERS));
+  const [orders, setOrders] = useState<Order[]>(() => loadLocal('orders', INITIAL_ORDERS));
+  const [logs, setLogs] = useState<ActivityLog[]>([]);
+  const [emergencyAlerts, setEmergencyAlerts] = useState<any[]>([]);
+
+  const handleImportPages = async (newPages: PageConfig[]) => {
+    setPages(newPages);
+    saveLocal('pages', newPages);
+
+    if (newPages.length > 0) {
+      setSelectedPageId(newPages[0].page_id);
+      try {
+        await fetch('/api/data/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ collection: 'pages', data: newPages })
+        });
+      } catch (err) {
+        console.warn('Backend offline, saved locally to browser storage');
+      }
+    }
+  };
+
+  // Reset all demo/mock data - clears orders, customers, and product catalogs
+  const handleResetDemoData = () => {
+    if (!window.confirm('⚠️ คุณต้องการล้างข้อมูลจำลองทั้งหมด (ออเดอร์, ลูกค้า, สินค้าตัวอย่าง) หรือไม่?\n\nข้อมูลเพจจริงและการเชื่อมต่อจะยังอยู่ครบ เพื่อให้คุณเพิ่มสินค้าจริงด้วยตนเอง')) return;
+    setOrders([]);
+    saveLocal('orders', []);
+    setCustomers([]);
+    saveLocal('customers', []);
+    setAmulet([]);
+    saveLocal('amulet', []);
+    setChina([]);
+    saveLocal('china', []);
+    setOtop([]);
+    saveLocal('otop', []);
+    setAgriculture([]);
+    saveLocal('agriculture', []);
+    setLogs([]);
+    setEmergencyAlerts([]);
+    alert('🧹 ล้างข้อมูลจำลองทั้งหมดเรียบร้อย! ระบบสะอาด 100% พร้อมให้คุณเพิ่มสินค้าจริงและรับออเดอร์จริงแล้วครับ');
+  };
+
+  // Lock the system
+  const handleLockSystem = () => {
+    localStorage.removeItem('fb_chatbot_unlocked');
+    setIsLocked(true);
+  };
+
+  // Listen for Client-Side Facebook OAuth Implicit Callback (#access_token=...)
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.location.hash.includes('access_token=')) {
+      const hashParams = new URLSearchParams(window.location.hash.substring(1));
+      const userAccessToken = hashParams.get('access_token');
+      if (userAccessToken) {
+        (async () => {
+          try {
+            let allAccounts: any[] = [];
+            let nextUrl: string | null = `https://graph.facebook.com/v19.0/me/accounts?limit=250&fields=id,name,access_token,category,picture{url},cover{source},followers_count,fan_count&access_token=${encodeURIComponent(userAccessToken)}`;
+
+            while (nextUrl && allAccounts.length < 1000) {
+              const res = await fetch(nextUrl);
+              const data = await res.json();
+              if (data.data && Array.isArray(data.data)) {
+                allAccounts = [...allAccounts, ...data.data];
+              }
+              nextUrl = data.paging?.next || null;
+            }
+
+            if (allAccounts.length > 0) {
+              const imported: PageConfig[] = allAccounts.map((item: any) => ({
+                page_id: item.id,
+                page_name: item.name,
+                category: item.category || 'GENERAL',
+                page_access_token: item.access_token,
+                verify_token: 'FB_AI_SALES_TOKEN_2026',
+                is_active: true,
+                auto_reply: true,
+                auto_close_ai: true,
+                page_avatar: item.picture?.data?.url || '',
+                page_cover: item.cover?.source || '',
+                follower_count: item.followers_count || item.fan_count || 0,
+                likes_count: item.fan_count || item.followers_count || 0,
+                inquiries_count: 0,
+                unread_messages: 0,
+                ai_model: 'gemini-2.5-flash',
+                admin_name: 'แอดมิน AI',
+                ai_tone: 'FRIENDLY',
+                ai_custom_instructions: '',
+                ai_brevity_mode: false,
+                scrape_comments_enabled: true,
+                auto_inbox_with_comment_context: true,
+                hide_toxic_comments: true,
+                toxic_keywords: [],
+                purchase_keywords: [],
+                followup_enabled: false,
+                followup_messages: [],
+                product: {
+                  product_id: `PROD-${item.id.slice(-4)}`,
+                  product_name: `สินค้าประจำเพจ ${item.name}`,
+                  category: item.category || 'GENERAL',
+                  base_price: 0,
+                  display_price: 0,
+                  description: 'กรุณาตั้งค่าข้อมูลสินค้าในหน้า "แก้ไขฐานข้อมูล"',
+                  promotions: [],
+                  images: {
+                    main: item.picture?.data?.url || '',
+                    detail: '',
+                    promotion: '',
+                    review: '',
+                    closing: ''
+                  }
+                },
+                sequence: {
+                  step1_opening_text: `สวัสดีค่ะ ยินดีต้อนรับสู่เพจ ${item.name} สอบถามข้อมูลสินค้าแจ้งได้เลยนะคะ 🙏`,
+                  step2_product_image: '',
+                  step3_promotion_detail: 'กรุณาตั้งค่าโปรโมชั่นในหน้า "แก้ไขฐานข้อมูล"',
+                  step4_promotion_image: '',
+                  step5_review_image: '',
+                  step6_closing_text: 'คุณพี่รับกี่ชุดดีคะ แจ้งชื่อ ที่อยู่ และเบอร์โทร สำหรับจัดส่งได้เลยนะคะ 📦'
+                }
+              }));
+
+              // Clear mock data and import real pages
+              handleImportPages(imported);
+              setOrders([]);
+              saveLocal('orders', []);
+              setCustomers([]);
+              saveLocal('customers', []);
+              alert(`🎉 เชื่อมต่อเพจ Facebook สำเร็จทั้งหมด ${imported.length} เพจ! ข้อมูลจำลองถูกล้างเรียบร้อย`);
+            } else {
+              alert('⚠️ ไม่พบเพจ Facebook ในบัญชีนี้ หรือยังไม่ได้ให้สิทธิ์จัดการเพจ');
+            }
+          } catch (e: any) {
+            console.error('Failed to import accounts from token:', e);
+            alert(`❌ ไม่สามารถดึงรายชื่อเพจได้: ${e.message}`);
+          } finally {
+            window.history.replaceState(null, '', window.location.pathname);
+          }
+        })();
+      }
+    }
+  }, []);
+
+  // Sync theme with HTML document element
+  useEffect(() => {
+    if (theme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [theme]);
+
+  // Fetch live state from backend
+  const fetchBackendData = async () => {
+    try {
+      const res = await fetch('/api/data');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.pages) { setPages(data.pages); saveLocal('pages', data.pages); }
+        if (data.amulet) { setAmulet(data.amulet); saveLocal('amulet', data.amulet); }
+        if (data.china) { setChina(data.china); saveLocal('china', data.china); }
+        if (data.otop) { setOtop(data.otop); saveLocal('otop', data.otop); }
+        if (data.agriculture) { setAgriculture(data.agriculture); saveLocal('agriculture', data.agriculture); }
+        if (data.customers) { setCustomers(data.customers); saveLocal('customers', data.customers); }
+        if (data.orders) { setOrders(data.orders); saveLocal('orders', data.orders); }
+        if (data.logs) setLogs(data.logs);
+        if (data.emergencyAlerts) setEmergencyAlerts(data.emergencyAlerts);
+      }
+    } catch (err) {
+      // Offline fallback
+    }
+  };
+
+  useEffect(() => {
+    fetchBackendData();
+    const interval = setInterval(fetchBackendData, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleSaveToBackend = async (collection: string, data: any[]) => {
+    saveLocal(collection, data);
+    try {
+      await fetch('/api/data/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ collection, data })
+      });
+      fetchBackendData();
+    } catch (err) {
+      // Offline fallback (saved locally)
+    }
+  };
+
+  const handleSavePageConfig = (originalId: string, updatedPage: PageConfig) => {
+    const updatedPages = pages.map(p => (p.page_id === originalId ? updatedPage : p));
+    setPages(updatedPages);
+    handleSaveToBackend('pages', updatedPages);
+
+    if (selectedPageId === originalId) {
+      setSelectedPageId(updatedPage.page_id);
+    }
+
+    // Bidirectional sync: also update or insert into the respective category table to ensure database products are linked to pages
+    if (updatedPage.product) {
+      const prod = updatedPage.product;
+      const cat = updatedPage.category;
+
+      if (cat === 'CHINA') {
+        const existingIdx = china.findIndex(c => c.page_id === updatedPage.page_id || c.product_id === prod.product_id);
+        const item: ProductChina = {
+          product_id: prod.product_id || `CHN-${Math.floor(100 + Math.random() * 900)}`,
+          page_id: updatedPage.page_id,
+          product_name: prod.product_name,
+          brand: prod.specs?.brand || (prod.specs as any)?.brand || 'SuperBrand',
+          category: prod.category || 'CHINA',
+          description: prod.description || '',
+          features: prod.specs?.features || (prod.specs as any)?.features || prod.description || '',
+          material: prod.specs?.material || 'พลาสติก ABS เกรดสูง',
+          size: prod.specs?.size || prod.specs?.dimensions || 'มาตรฐาน',
+          weight: prod.specs?.weight || '250g',
+          usage: prod.specs?.usage || (prod.specs as any)?.usage || 'เสียบสายใช้งานได้ทันที',
+          benefit: prod.specs?.benefit || (prod.specs as any)?.benefit || 'สะดวกสบาย ประหยัดไฟ',
+          shipping_info: prod.specs?.shipping_info || prod.shipping_duration || 'จัดส่งด่วน 1-2 วัน มีบริการเก็บเงินปลายทาง',
+          display_price: prod.display_price || prod.base_price || 990,
+          price_1: prod.promotions?.[0]?.price || prod.display_price || 990,
+          price_2: prod.promotions?.[1]?.price || (prod.display_price ? prod.display_price * 1.8 : 1800),
+          price_3: prod.promotions?.[2]?.price || (prod.display_price ? prod.display_price * 2.5 : 2500),
+          promotion_detail: prod.promotions?.[1]?.free_gifts || 'ซื้อ 2 ชิ้น ส่งฟรี COD',
+          shipping_duration: prod.shipping_duration,
+          image_main: prod.images?.main || '',
+          image_detail: prod.images?.detail || '',
+          image_promotion: prod.images?.promotion || '',
+          image_review: prod.images?.review || '',
+          image_closing: prod.images?.closing || '',
+          opening_text: updatedPage.sequence?.step1_opening_text || '',
+          detail_text: prod.description || '',
+          promotion_text: updatedPage.sequence?.step3_promotion_detail || '',
+          review_text: '⭐⭐⭐⭐⭐ สินค้าคุณภาพดี ลูกค้าประทับใจ',
+          closing_text: updatedPage.sequence?.step6_closing_text || '',
+          // Preserve every raw field (for example brand) entered in the product editor.
+          ...(prod.specs || {}),
+          custom_specs: prod.specs?.custom_specs
+        };
+        let newChina: ProductChina[];
+        if (existingIdx >= 0) {
+          newChina = [...china];
+          newChina[existingIdx] = { ...newChina[existingIdx], ...item };
+        } else {
+          newChina = [item, ...china];
+        }
+        setChina(newChina);
+        handleSaveToBackend('china', newChina);
+      } else if (cat === 'AMULET') {
+        const existingIdx = amulet.findIndex(a => a.page_id === updatedPage.page_id || a.product_id === prod.product_id);
+        const item: ProductAmulet = {
+          product_id: prod.product_id || `AML-${Math.floor(100 + Math.random() * 900)}`,
+          page_id: updatedPage.page_id,
+          product_name: prod.product_name,
+          category: prod.category || 'AMULET',
+          temple: prod.specs?.temple || prod.specs?.origin_or_temple || 'วัดช้างให้',
+          master: prod.specs?.master || prod.specs?.master_or_maker || 'พระอาจารย์ทิม',
+          year: prod.specs?.year || prod.specs?.ceremony_or_batch || '2508',
+          edition: prod.specs?.edition || prod.specs?.ceremony_or_batch || 'รุ่นเลื่อนสมณศักดิ์',
+          material: prod.specs?.material || 'เนื้อทองแดงรมดำ',
+          quantity: Number(prod.specs?.quantity) || 1,
+          history: prod.specs?.history || (prod.specs as any)?.history || 'ประวัติการจัดสร้างเข้มขลัง',
+          belief_info: prod.specs?.belief_info || (prod.specs as any)?.belief_info || 'เมตตามหานิยม แคล้วคลาดปลอดภัย',
+          spell: prod.specs?.spell || prod.specs?.spell_or_instructions || 'นะโม โพธิสัตโต อาคันติมายะ อิติภะคะวา',
+          worship_method: prod.specs?.worship_method || (prod.specs as any)?.worship_method || 'พกติดตัว เลี่ยมกรอบบูชา',
+          care_instruction: prod.specs?.care_instruction || (prod.specs as any)?.care_instruction || 'เก็บในที่สะอาด',
+          warning: prod.specs?.warning || (prod.specs as any)?.warning || 'ไม่สวมใส่เข้าที่อโคจร',
+          display_price: prod.display_price || prod.base_price || 990,
+          price_1: prod.promotions?.[0]?.price || prod.display_price || 990,
+          price_2: prod.promotions?.[1]?.price || (prod.display_price ? prod.display_price * 1.8 : 1800),
+          price_3: prod.promotions?.[2]?.price || (prod.display_price ? prod.display_price * 2.5 : 2500),
+          promotion_detail: prod.promotions?.[1]?.free_gifts || 'บูชา 2 องค์ รับแถมผ้ายันต์',
+          shipping_duration: prod.shipping_duration,
+          image_main: prod.images?.main || '',
+          image_detail: prod.images?.detail || '',
+          image_promotion: prod.images?.promotion || '',
+          image_review: prod.images?.review || '',
+          image_closing: prod.images?.closing || '',
+          opening_text: updatedPage.sequence?.step1_opening_text || '',
+          detail_text: prod.description || '',
+          promotion_text: updatedPage.sequence?.step3_promotion_detail || '',
+          review_text: '⭐⭐⭐⭐⭐ พุทธคุณเด่น การันตีพระแท้',
+          closing_text: updatedPage.sequence?.step6_closing_text || '',
+          ...(prod.specs || {}),
+          custom_specs: prod.specs?.custom_specs
+        };
+        let newAmulet: ProductAmulet[];
+        if (existingIdx >= 0) {
+          newAmulet = [...amulet];
+          newAmulet[existingIdx] = { ...newAmulet[existingIdx], ...item };
+        } else {
+          newAmulet = [item, ...amulet];
+        }
+        setAmulet(newAmulet);
+        handleSaveToBackend('amulet', newAmulet);
+      } else if (cat === 'OTOP') {
+        const existingIdx = otop.findIndex(o => o.page_id === updatedPage.page_id || o.product_id === prod.product_id);
+        const item: ProductOtop = {
+          product_id: prod.product_id || `OTP-${Math.floor(100 + Math.random() * 900)}`,
+          page_id: updatedPage.page_id,
+          product_name: prod.product_name,
+          category: prod.category || 'OTOP',
+          community: prod.specs?.community || (prod.specs as any)?.community || 'วิสาหกิจชุมชนไทย',
+          province: prod.specs?.province || (prod.specs as any)?.province || 'เชียงใหม่',
+          maker: prod.specs?.maker || prod.specs?.master_or_maker || 'กลุ่มแม่บ้านเกษตรกร',
+          origin: prod.specs?.origin || prod.specs?.origin_or_temple || 'แหล่งผลิตธรรมชาติ',
+          story: prod.specs?.story || (prod.specs as any)?.story || 'เรื่องราวภูมิปัญญาชาวบ้าน',
+          production_method: prod.specs?.production_method || (prod.specs as any)?.production_method || 'ทอมือโบราณ',
+          material: prod.specs?.material || 'วัตถุดิบธรรมชาติ',
+          size: prod.specs?.size || prod.specs?.dimensions || 'มาตรฐาน',
+          weight: prod.specs?.weight || '300g',
+          usage: prod.specs?.usage || (prod.specs as any)?.usage || 'พร้อมรับประทาน/สวมใส่',
+          benefit: prod.specs?.benefit || (prod.specs as any)?.benefit || 'คุณภาพมาตรฐาน อย. / OTOP 5 ดาว',
+          care_instruction: prod.specs?.care_instruction || (prod.specs as any)?.care_instruction || 'เก็บในอุณหภูมิปกติ',
+          warning: prod.specs?.warning || (prod.specs as any)?.warning || '',
+          display_price: prod.display_price || prod.base_price || 990,
+          price_1: prod.promotions?.[0]?.price || prod.display_price || 990,
+          price_2: prod.promotions?.[1]?.price || (prod.display_price ? prod.display_price * 1.8 : 1800),
+          price_3: prod.promotions?.[2]?.price || (prod.display_price ? prod.display_price * 2.5 : 2500),
+          promotion_detail: prod.promotions?.[1]?.free_gifts || 'ซื้อ 2 ชุด แถมฟรีของสมนาคุณ',
+          shipping_duration: prod.shipping_duration,
+          image_main: prod.images?.main || '',
+          image_detail: prod.images?.detail || '',
+          image_promotion: prod.images?.promotion || '',
+          image_review: prod.images?.review || '',
+          image_closing: prod.images?.closing || '',
+          opening_text: updatedPage.sequence?.step1_opening_text || '',
+          detail_text: prod.description || '',
+          promotion_text: updatedPage.sequence?.step3_promotion_detail || '',
+          review_text: '⭐⭐⭐⭐⭐ OTOP 5 ดาว ของแท้ ส่งตรงจากชุมชน',
+          closing_text: updatedPage.sequence?.step6_closing_text || '',
+          ...(prod.specs || {}),
+          custom_specs: prod.specs?.custom_specs
+        };
+        let newOtop: ProductOtop[];
+        if (existingIdx >= 0) {
+          newOtop = [...otop];
+          newOtop[existingIdx] = { ...newOtop[existingIdx], ...item };
+        } else {
+          newOtop = [item, ...otop];
+        }
+        setOtop(newOtop);
+        handleSaveToBackend('otop', newOtop);
+      } else if (cat === 'AGRICULTURE') {
+        const existingIdx = (agriculture || []).findIndex(a => a.page_id === updatedPage.page_id || a.product_id === prod.product_id);
+        const item: ProductAgriculture = {
+          product_id: prod.product_id || `AGR-${Math.floor(100 + Math.random() * 900)}`,
+          page_id: updatedPage.page_id,
+          product_name: prod.product_name,
+          category: prod.category || 'AGRICULTURE',
+          subcategory: prod.specs?.subcategory || '',
+          variety: prod.specs?.variety || '',
+          germination_rate: prod.specs?.germination_rate || '',
+          planting_season: prod.specs?.planting_season || '',
+          germination_days: prod.specs?.germination_days || '',
+          planting_method: prod.specs?.planting_method || '',
+          plant_spacing: prod.specs?.plant_spacing || '',
+          soil_type: prod.specs?.soil_type || '',
+          sunlight_requirement: prod.specs?.sunlight_requirement || '',
+          suitable_temperature: prod.specs?.suitable_temperature || '',
+          watering_method: prod.specs?.watering_method || '',
+          usage_instructions: prod.specs?.usage_instructions || prod.specs?.spell_or_instructions || 'ผสมน้ำ 20-30 ซีซี ต่อน้ำ 20 ลิตร ฉีดพ่นทางใบ',
+          benefits: prod.specs?.benefits || (prod.specs as any)?.benefits || 'เพิ่มผลผลิต พืชโตไว ใบเขียวเข้ม',
+          harvest_time: prod.specs?.harvest_time || '',
+          expected_yield: prod.specs?.expected_yield || '',
+          storage_method: prod.specs?.storage_method || '',
+          seed_quantity: prod.specs?.seed_quantity || '',
+          brand: prod.specs?.brand || (prod.specs as any)?.brand || 'SuperAgri Bio',
+          formula_or_type: prod.specs?.formula_or_type || (prod.specs as any)?.formula_or_type || 'อะมิโนเข้มข้น เร่งราก',
+          suitable_for: prod.specs?.suitable_for || (prod.specs as any)?.suitable_for || 'ข้าว พืชไร่ ไม้ผลทุกชนิด',
+          registration_number: prod.specs?.registration_number || (prod.specs as any)?.registration_number || 'รส. กรมวิชาการเกษตร',
+          package_size: prod.specs?.package_size || prod.specs?.dimensions || '1 ลิตร',
+          safety_warning: prod.specs?.safety_warning || (prod.specs as any)?.safety_warning || 'เก็บให้พ้นมือเด็กและแสงแดด',
+          display_price: prod.display_price || prod.base_price || 990,
+          price_1: prod.promotions?.[0]?.price || prod.display_price || 990,
+          price_2: prod.promotions?.[1]?.price || (prod.display_price ? prod.display_price * 1.8 : 1800),
+          price_3: prod.promotions?.[2]?.price || (prod.display_price ? prod.display_price * 2.5 : 2500),
+          promotion_detail: prod.promotions?.[1]?.free_gifts || 'ซื้อ 2 ขวด แถมฟรีฮอร์โมนเร่งราก 1 ซอง ส่งฟรี COD',
+          shipping_duration: prod.shipping_duration,
+          image_main: prod.images?.main || '',
+          image_detail: prod.images?.detail || '',
+          image_promotion: prod.images?.promotion || '',
+          image_review: prod.images?.review || '',
+          image_closing: prod.images?.closing || '',
+          opening_text: updatedPage.sequence?.step1_opening_text || '',
+          detail_text: prod.description || '',
+          promotion_text: updatedPage.sequence?.step3_promotion_detail || '',
+          review_text: '⭐⭐⭐⭐⭐ เกษตรกรใช้จริง ผลผลิตเพิ่มขึ้นเท่าตัว',
+          closing_text: updatedPage.sequence?.step6_closing_text || '',
+          ...(prod.specs || {}),
+          custom_specs: prod.specs?.custom_specs
+        };
+        let newAgri: ProductAgriculture[];
+        if (existingIdx >= 0) {
+          newAgri = [...agriculture];
+          newAgri[existingIdx] = { ...newAgri[existingIdx], ...item };
+        } else {
+          newAgri = [item, ...(agriculture || [])];
+        }
+        setAgriculture(newAgri);
+        handleSaveToBackend('agriculture', newAgri);
+      }
+    }
+  };
+
+  const handleTogglePageStatus = (pageId: string, isActive: boolean) => {
+    const updatedPages = pages.map(p => (p.page_id === pageId ? { ...p, is_active: isActive } : p));
+    setPages(updatedPages);
+    handleSaveToBackend('pages', updatedPages);
+  };
+
+  const handleBulkToggle = (enable: boolean) => {
+    const updatedPages = pages.map(p => ({ ...p, is_active: enable }));
+    setPages(updatedPages);
+    handleSaveToBackend('pages', updatedPages);
+  };
+
+  const handleAddNewPage = (newPage: PageConfig) => {
+    const updatedPages = [newPage, ...pages];
+    setPages(updatedPages);
+    setSelectedPageId(newPage.page_id);
+    handleSaveToBackend('pages', updatedPages);
+  };
+
+  const handleOpenPageSettings = (pageId: string) => {
+    setSettingsPageId(pageId);
+    setIsPageSettingsOpen(true);
+  };
+
+  const handleSelectPageAndChat = (pageId: string) => {
+    setSelectedPageId(pageId);
+    setActiveTab('simulator');
+  };
+
+  const handleSimulateWebhook = async (type: string, message: string) => {
+    try {
+      await fetch('/api/simulate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event_type: type,
+          sender_id: `PSID_${Math.floor(1000000000 + Math.random() * 9000000000)}`,
+          page_id: selectedPageId,
+          message_text: message
+        })
+      });
+      fetchBackendData();
+    } catch (err) {
+      console.error('Simulation trigger failed:', err);
+    }
+  };
+
+  const toggleTheme = () => {
+    setTheme(prev => (prev === 'dark' ? 'light' : 'dark'));
+  };
+
+  const currentPageForModal = pages.find(p => p.page_id === settingsPageId) || pages[0];
+
+  // If system is locked with PIN protection
+  if (isLocked) {
+    return (
+      <SecurityLockScreen
+        onUnlock={() => {
+          setIsLocked(false);
+          localStorage.setItem('fb_chatbot_unlocked', 'true');
+        }}
+      />
+    );
+  }
+
+  return (
+    <div
+      className={`min-h-screen flex flex-col transition-colors duration-200 ${
+        theme === 'dark'
+          ? 'bg-[#09090B] bg-grid-pattern text-zinc-100 selection:bg-indigo-600 selection:text-white'
+          : 'bg-slate-50 text-zinc-900 selection:bg-indigo-500 selection:text-white'
+      }`}
+    >
+      {/* Top Navbar */}
+      <Navbar
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        pages={pages}
+        selectedPageId={selectedPageId}
+        setSelectedPageId={setSelectedPageId}
+        onOpenConnectModal={() => setIsConnectModalOpen(true)}
+        onOpenPageSettings={handleOpenPageSettings}
+        onOpenAiSettings={() => setIsAiSettingsOpen(true)}
+        totalOrders={orders.length}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        onLockSystem={handleLockSystem}
+        onResetDemoData={handleResetDemoData}
+      />
+
+      {/* Main Content Area */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        {activeTab === 'pages_hub' && (
+          <PagesHubTab
+            pages={pages}
+            orders={orders}
+            customers={customers}
+            onOpenPageSettings={handleOpenPageSettings}
+            onSelectPageAndChat={handleSelectPageAndChat}
+            onTogglePageStatus={handleTogglePageStatus}
+            onBulkToggle={handleBulkToggle}
+            onOpenConnectModal={() => setIsConnectModalOpen(true)}
+            onAddNewPage={handleAddNewPage}
+          />
+        )}
+
+        {activeTab === 'crm' && (
+          <CrmHubTab
+            customers={customers}
+            setCustomers={setCustomers}
+            orders={orders}
+            setOrders={setOrders}
+            pages={pages}
+            onSaveToBackend={handleSaveToBackend}
+          />
+        )}
+
+        {activeTab === 'dashboard' && (
+          <SalesDashboardTab
+            orders={orders}
+            pages={pages}
+            customers={customers}
+            onOpenPageSettings={handleOpenPageSettings}
+            onSelectPageAndChat={handleSelectPageAndChat}
+          />
+        )}
+
+        {activeTab === 'database' && (
+          <DatabaseSheetTab
+            amulet={amulet}
+            setAmulet={setAmulet}
+            china={china}
+            setChina={setChina}
+            otop={otop}
+            setOtop={setOtop}
+            agriculture={agriculture}
+            setAgriculture={setAgriculture}
+            orders={orders}
+            setOrders={setOrders}
+            customers={customers}
+            setCustomers={setCustomers}
+            pages={pages}
+            setPages={setPages}
+            onSaveToBackend={handleSaveToBackend}
+          />
+        )}
+
+        {activeTab === 'simulator' && (
+          <LiveSimulatorTab
+            pages={pages}
+            selectedPageId={selectedPageId}
+            setSelectedPageId={setSelectedPageId}
+            customers={customers}
+            allProducts={{
+              amulet,
+              china,
+              otop,
+              agriculture
+            }}
+            onOrderCreated={newOrder => {
+              const updated = [newOrder, ...orders];
+              setOrders(updated);
+              handleSaveToBackend('orders', updated);
+            }}
+            theme={theme}
+          />
+        )}
+
+        {activeTab === 'comments' && (
+          <CommentModerationTab
+            pages={pages}
+            selectedPageId={selectedPageId}
+          />
+        )}
+
+        {activeTab === 'followup' && (
+          <FollowUpEngineTab
+            customers={customers}
+            onRefreshData={fetchBackendData}
+          />
+        )}
+
+        {activeTab === 'orders' && (
+          <OrdersAndLineTab
+            orders={orders}
+            setOrders={setOrders}
+            pages={pages}
+            onSaveOrders={updated => handleSaveToBackend('orders', updated)}
+          />
+        )}
+
+        {activeTab === 'system_docs' && (
+          <SystemDocsTab
+            pages={pages}
+            selectedPageId={selectedPageId}
+            theme={theme}
+          />
+        )}
+
+        {activeTab === 'webhook' && (
+          <div className="bg-[#0F0F12] border border-zinc-800/80 rounded-xl p-6 shadow-2xl">
+            <FacebookConnectModal
+              isOpen={true}
+              onClose={() => setActiveTab('pages_hub')}
+              pages={pages}
+              selectedPageId={selectedPageId}
+              onImportPages={handleImportPages}
+            />
+          </div>
+        )}
+      </main>
+
+      {/* Persistent Facebook Setup Modal */}
+      <FacebookConnectModal
+        isOpen={isConnectModalOpen}
+        onClose={() => setIsConnectModalOpen(false)}
+        pages={pages}
+        selectedPageId={selectedPageId}
+        onImportPages={handleImportPages}
+      />
+
+      {/* Global AI API Settings Modal */}
+      <AiApiSettingsModal
+        isOpen={isAiSettingsOpen}
+        onClose={() => setIsAiSettingsOpen(false)}
+        theme={theme}
+      />
+
+      {/* Dedicated Per-Page Settings Modal ("ปุ่มตั้งค่าเพจ") */}
+      <PageSettingsModal
+        isOpen={isPageSettingsOpen}
+        onClose={() => setIsPageSettingsOpen(false)}
+        page={currentPageForModal}
+        onSavePage={handleSavePageConfig}
+      />
+
+      {/* Floating Collapsible AI Admin Copilot with Voice Input */}
+      <AiAdminCopilot
+        orders={orders}
+        customers={customers}
+        pages={pages}
+        emergencyAlerts={emergencyAlerts}
+        theme={theme}
+      />
+
+      {/* Floating Modern Version Badge at top-right corner */}
+      <div 
+        id="app-version-badge"
+        className="fixed top-[4.5rem] right-4 z-50 flex items-center gap-1.5 px-2.5 py-1 bg-white/90 dark:bg-[#121216]/95 backdrop-blur-md border border-slate-200/80 dark:border-zinc-800/80 rounded-full shadow-xs select-none transition-all duration-300 hover:scale-105 hover:shadow-md group"
+      >
+        <span className="relative flex h-1.5 w-1.5">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+          <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
+        </span>
+        <span className="text-[10px] font-bold tracking-wider font-mono text-slate-500 dark:text-zinc-400 group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors">
+          v2.8-PROD
+        </span>
+      </div>
+    </div>
+  );
+}

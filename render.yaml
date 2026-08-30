@@ -1,0 +1,51 @@
+# Render Blueprint — Vorakamol SuperAI Chatbot
+# Docs: https://render.com/docs/blueprint-spec
+#
+# This file provisions a single Node Web Service that runs BOTH:
+#   - the React (Vite) dashboard, served statically from /dist
+#   - the Express API + Facebook Webhook, from the bundled dist/server.cjs
+#
+# Usage: push this repo to GitHub → in Render Dashboard choose "New +" →
+#        "Blueprint" → connect the repo. Render reads this file automatically.
+
+services:
+  - type: web
+    name: vorakamol-superai-chatbot
+    runtime: node
+    plan: free
+    region: singapore # closest region to Thailand (lower latency)
+    branch: main
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Pin Node runtime (matches @types/node ^22 in package.json)
+      - key: NODE_VERSION
+        value: 22.12.0
+      # Required so the server serves the built /dist assets instead of Vite dev middleware
+      - key: NODE_ENV
+        value: production
+      # Where the in-memory store persists its JSON snapshot.
+      # NOTE: the free-tier filesystem is EPHEMERAL (wiped on redeploy/restart).
+      # For durable data, attach a Render Disk (paid plans) at /var/data and
+      # change this to /var/data/superai-v2.8.json
+      - key: DATA_FILE
+        value: data/superai-v2.8.json
+      # --- Secrets: fill these in the Render Dashboard after first deploy ---
+      # (sync: false = Render will prompt you for the value, never commit it)
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FACEBOOK_APP_ID
+        sync: false
+      - key: FACEBOOK_APP_SECRET
+        sync: false
+      - key: FACEBOOK_VERIFY_TOKEN
+        sync: false
+      - key: META_GRAPH_API_VERSION
+        value: v24.0
+      # Used by server.ts to AES-256-GCM encrypt stored tokens.
+      # generateValue: true → Render creates a strong random secret for you.
+      - key: ENCRYPTION_SECRET_KEY
+        generateValue: true
+      # PORT is injected automatically by Render — do NOT set it here.

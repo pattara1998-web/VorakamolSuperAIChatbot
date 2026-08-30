@@ -1,0 +1,2528 @@
+import express, { Request, Response } from 'express';
+import path from 'path';
+import fs from 'fs';
+import crypto from 'crypto';
+import dotenv from 'dotenv';
+import { GoogleGenAI, Type } from '@google/genai';
+import {
+  INITIAL_PAGES,
+  INITIAL_AMULET,
+  INITIAL_CHINA,
+  INITIAL_OTOP,
+  INITIAL_AGRICULTURE,
+  INITIAL_CUSTOMERS,
+  INITIAL_ORDERS
+} from './src/data/initialDatabase.ts';
+import {
+  ProductAmulet,
+  ProductChina,
+  ProductOtop,
+  ProductAgriculture,
+  Order,
+  Customer,
+  PageConfig,
+  ProductCategory,
+  ActivityLog,
+  EmergencyAlert
+} from './src/types.ts';
+
+dotenv.config();
+
+// In-Memory Durable Store for Database tables, logs, and emergency alerts
+interface DatabaseStore {
+  pages: PageConfig[];
+  amulet: ProductAmulet[];
+  china: ProductChina[];
+  otop: ProductOtop[];
+  agriculture: ProductAgriculture[];
+  customers: Customer[];
+  orders: Order[];
+  logs: ActivityLog[];
+  emergencyAlerts: EmergencyAlert[];
+  settings: {
+    geminiApiKey: string;
+    geminiApiKeyUpdatedAt?: string;
+  };
+}
+
+const db: DatabaseStore = {
+  pages: [...INITIAL_PAGES],
+  amulet: [...INITIAL_AMULET],
+  china: [...INITIAL_CHINA],
+  otop: [...INITIAL_OTOP],
+  agriculture: [...INITIAL_AGRICULTURE],
+  customers: [...INITIAL_CUSTOMERS],
+  orders: [...INITIAL_ORDERS],
+  settings: {
+    geminiApiKey: process.env.GEMINI_API_KEY || ''
+  },
+  logs: [
+    {
+      id: 'log-init-1',
+      timestamp: new Date().toISOString(),
+      type: 'INFO',
+      sender_id: 'SYSTEM',
+      page_id: 'ALL',
+      content: 'ระบบ Facebook AI Auto-Sales Hub & Google Sheets CRM เริ่มทำงาน พร้อมเชื่อมต่อ Webhook, Telegram, LINE, และ Crisis Alert System',
+      status: 'SUCCESS'
+    } as any
+  ],
+  emergencyAlerts: []
+};
+
+let deliverTelegram: ((page: PageConfig, text: string) => Promise<{ success: boolean; [key: string]: any }>) | null = null;
+let deliverLine: ((page: PageConfig, text: string) => Promise<{ success: boolean; [key: string]: any }>) | null = null;
+
+// Operational data must live beyond a browser session or server restart.
+// Mount DATA_FILE to durable storage when hosting on a serverless platform.
+const DATA_FILE = process.env.DATA_FILE || path.join(process.cwd(), 'data', 'superai-v2.8.json');
+const META_GRAPH_API_VERSION = process.env.META_GRAPH_API_VERSION || 'v24.0';
+const STORE_SECRET = process.env.ENCRYPTION_SECRET_KEY || process.env.FACEBOOK_APP_SECRET || '';
+function encryptStoredSecret(value: string) {
+  if (!value || value.startsWith('store:') || !STORE_SECRET) return value;
+  const iv = crypto.randomBytes(12);
+  const key = crypto.createHash('sha256').update(STORE_SECRET).digest();
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  return `store:${iv.toString('hex')}:${cipher.getAuthTag().toString('hex')}:${encrypted.toString('hex')}`;
+}
+function decryptStoredSecret(value: string) {
+  if (!value?.startsWith('store:') || !STORE_SECRET) return value;
+  try {
+    const [, ivHex, tagHex, encryptedHex] = value.split(':');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', crypto.createHash('sha256').update(STORE_SECRET).digest(), Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    return Buffer.concat([decipher.update(Buffer.from(encryptedHex, 'hex')), decipher.final()]).toString('utf8');
+  } catch {
+    return '';
+  }
+}
+function loadPersistedData() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) as Partial<DatabaseStore>;
+    for (const key of ['pages', 'amulet', 'china', 'otop', 'agriculture', 'customers', 'orders', 'logs', 'emergencyAlerts'] as const) {
+      if (Array.isArray(saved[key])) (db as any)[key] = saved[key];
+    }
+    if (saved.settings) db.settings = { ...db.settings, ...saved.settings, geminiApiKey: decryptStoredSecret(saved.settings.geminiApiKey || '') };
+  } catch (error) {
+    console.error('[Store] Could not load persisted data:', error);
+  }
+}
+function persistData() {
+  try {
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    const persistable = { ...db, settings: { ...db.settings, geminiApiKey: encryptStoredSecret(db.settings.geminiApiKey) } };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(persistable), 'utf8');
+  } catch (error) {
+    console.error('[Store] Could not persist data. Configure a writable DATA_FILE for production:', error);
+  }
+}
+loadPersistedData();
+
+const PRODUCT_CORE_FIELDS = new Set([
+  'product_id', 'page_id', 'product_name', 'category', 'display_price', 'price_1', 'price_2', 'price_3',
+  'promotion_detail', 'shipping_duration', 'image_main', 'image_detail', 'image_promotion', 'image_review',
+  'image_closing', 'opening_text', 'detail_text', 'promotion_text', 'review_text', 'closing_text', 'custom_specs'
+]);
+function syncPagesFromCatalog(collection: 'amulet' | 'china' | 'otop' | 'agriculture') {
+  for (const record of db[collection] as any[]) {
+    const page = db.pages.find(p => p.page_id === record.page_id);
+    if (!page) continue;
+    const specs = Object.fromEntries(Object.entries(record).filter(([key, value]) => !PRODUCT_CORE_FIELDS.has(key) && value !== undefined && value !== ''));
+    page.product = {
+      ...page.product,
+      product_id: record.product_id || page.product?.product_id,
+      product_name: record.product_name || page.product?.product_name,
+      category: record.category || page.category,
+      base_price: Number(record.price_1 ?? page.product?.base_price ?? record.display_price ?? 0),
+      display_price: Number(record.display_price ?? page.product?.display_price ?? 0),
+      description: record.description || record.detail_text || page.product?.description || '',
+      shipping_duration: record.shipping_duration || page.product?.shipping_duration,
+      specs: { ...(page.product?.specs || {}), ...specs, custom_specs: record.custom_specs || page.product?.specs?.custom_specs },
+      images: {
+        main: record.image_main || page.product?.images?.main || '', detail: record.image_detail || page.product?.images?.detail || '',
+        promotion: record.image_promotion || page.product?.images?.promotion || '', review: record.image_review || page.product?.images?.review || '',
+        closing: record.image_closing || page.product?.images?.closing || ''
+      },
+      promotions: page.product?.promotions?.length ? page.product.promotions : [
+        { id: 'tier-1', name: 'โปรโมชั่น 1 ชิ้น', quantity: 1, price: Number(record.price_1 || record.display_price || 0), description: '' },
+        { id: 'tier-2', name: 'โปรโมชั่น 2 ชิ้น', quantity: 2, price: Number(record.price_2 || 0), description: record.promotion_detail || '' },
+        { id: 'tier-3', name: 'โปรโมชั่น 3 ชิ้น', quantity: 3, price: Number(record.price_3 || 0), description: '' }
+      ]
+    };
+  }
+}
+function syncCatalogFromPages() {
+  const collections: Record<string, 'amulet' | 'china' | 'otop' | 'agriculture'> = { AMULET: 'amulet', CHINA: 'china', OTOP: 'otop', AGRICULTURE: 'agriculture' };
+  for (const page of db.pages) {
+    const collection = collections[page.category];
+    if (!collection || !page.product) continue;
+    const catalog = db[collection] as any[];
+    const index = catalog.findIndex(item => item.page_id === page.page_id || item.product_id === page.product.product_id);
+    const current = index >= 0 ? catalog[index] : {};
+    const next = {
+      ...current,
+      ...(page.product.specs || {}),
+      product_id: page.product.product_id || current.product_id || `PROD-${page.page_id}`,
+      page_id: page.page_id,
+      product_name: page.product.product_name,
+      category: page.product.category || page.category,
+      display_price: page.product.display_price,
+      price_1: page.product.promotions?.[0]?.price ?? current.price_1 ?? page.product.display_price,
+      price_2: page.product.promotions?.[1]?.price ?? current.price_2 ?? 0,
+      price_3: page.product.promotions?.[2]?.price ?? current.price_3 ?? 0,
+      promotion_detail: page.product.promotions?.[1]?.description || current.promotion_detail || '',
+      shipping_duration: page.product.shipping_duration || current.shipping_duration,
+      image_main: page.product.images?.main || current.image_main || '', image_detail: page.product.images?.detail || current.image_detail || '',
+      image_promotion: page.product.images?.promotion || current.image_promotion || '', image_review: page.product.images?.review || current.image_review || '', image_closing: page.product.images?.closing || current.image_closing || '',
+      opening_text: page.sequence?.step1_opening_text || current.opening_text || '', detail_text: page.product.description || current.detail_text || '',
+      promotion_text: page.sequence?.step3_promotion_detail || current.promotion_text || '', closing_text: page.sequence?.step6_closing_text || current.closing_text || ''
+    };
+    if (index >= 0) catalog[index] = next; else catalog.unshift(next);
+  }
+}
+
+// Helper: Add Activity Log
+function addLog(
+  type: ActivityLog['type'],
+  sender_id: string,
+  page_id: string,
+  content: string,
+  status: ActivityLog['status'] = 'SUCCESS',
+  details?: Record<string, any>
+) {
+  const log: ActivityLog = {
+    id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+    timestamp: new Date().toISOString(),
+    type,
+    sender_id,
+    page_id,
+    content,
+    status,
+    details
+  };
+  db.logs.unshift(log);
+  if (db.logs.length > 250) {
+    db.logs.pop();
+  }
+  return log;
+}
+
+// Crisis Dispatcher Helper (Telegram & LINE)
+async function triggerCrisisAlert(alert: {
+  page_id: string;
+  page_name: string;
+  threat_type: 'LEGAL_THREAT' | 'SAKOB_POLICE_THREAT' | 'SEVERE_COMPLAINT' | 'PAGE_DISCONNECTED' | 'SYSTEM_OUTAGE';
+  customer_name?: string;
+  message_text: string;
+  psid?: string;
+  keywords?: string[];
+}) {
+  const emergencyItem: EmergencyAlert = {
+    id: `EMG-${Date.now()}`,
+    timestamp: new Date().toISOString(),
+    type: alert.threat_type,
+    severity: 'CRITICAL',
+    source: 'CHAT_SENTINEL',
+    page_id: alert.page_id,
+    sender_id: alert.psid,
+    customer_name: alert.customer_name || 'ไม่ระบุชื่อ',
+    threat_text: alert.message_text,
+    detected_keywords: alert.keywords || ['สคบ', 'แจ้งความ', 'ฟ้อง'],
+    is_resolved: false,
+    notified_channels: ['TELEGRAM', 'LINE']
+  };
+
+  db.emergencyAlerts.unshift(emergencyItem);
+
+  const page = db.pages.find(p => p.page_id === alert.page_id) || db.pages[0];
+
+  const alertMessage = `🚨 [เตือนภัยวิกฤตด่วน / CRISIS ALERT]\nเพจ: ${alert.page_name}\nประเภท: ${alert.threat_type === 'SAKOB_POLICE_THREAT' || alert.threat_type === 'LEGAL_THREAT' ? 'ลูกค้าขู่ร้องเรียน / สคบ. / แจ้งความ' : 'ระบบหรือเพจขัดข้อง'}\nลูกค้า: ${alert.customer_name || 'ลูกค้าเพจ'}\nข้อความ: "${alert.message_text}"\nเวลา: ${new Date().toLocaleTimeString('th-TH')}\n⚠️ กรุณาให้ผู้จัดการหรือแอดมินคนจริงติดต่อกลับด่วนที่สุด!`;
+
+  // Log Crisis
+  addLog(
+    'INFO',
+    alert.psid || 'SYSTEM',
+    alert.page_id,
+    `🚨 [CRISIS DISPATCH] ตรวจพบเหตุด่วน/ขู่แจ้งความ สคบ: "${alert.message_text}" -> ส่งแจ้งเตือนฉุกเฉินไปยัง Telegram & LINE ทันที`,
+    'WARNING',
+    emergencyItem
+  );
+
+  // Send to Telegram
+  if (page.telegram_bot_token && page.telegram_chat_id && deliverTelegram) {
+    const sent = await deliverTelegram(page, alertMessage);
+    addLog(
+      'INFO',
+      'TELEGRAM_BOT',
+      alert.page_id,
+      sent.success ? `📡 [Telegram Crisis Alert] ส่งข้อความด่วนไปยัง Telegram Group (${page.telegram_chat_id}) สำเร็จ` : '❌ [Telegram Crisis Alert] ส่งไม่สำเร็จ',
+      sent.success ? 'SUCCESS' : 'ERROR'
+    );
+  }
+
+  // Send to LINE
+  if (page.line_notify_token && page.line_group_id && deliverLine) {
+    const sent = await deliverLine(page, alertMessage);
+    addLog(
+      'LINE_ALERT',
+      'LINE_BOT',
+      alert.page_id,
+      sent.success ? `📲 [LINE Crisis Alert] ส่งแจ้งเตือนด่วนไปยัง LINE Group (${page.line_group_id}) สำเร็จ` : '❌ [LINE Crisis Alert] ส่งไม่สำเร็จ',
+      sent.success ? 'SUCCESS' : 'ERROR'
+    );
+  }
+
+  return emergencyItem;
+}
+
+// Order Summary Dispatcher Helper (Telegram & LINE)
+async function dispatchOrderSummary(order: Order, page: PageConfig) {
+  const channel = page.notification_channel || 'BOTH';
+
+  // Format using cod_summary_template if provided, else use standard format
+  let formattedSummary = '';
+  if (page.cod_summary_template) {
+    formattedSummary = page.cod_summary_template
+      .replace('{customer_name}', order.customer_name)
+      .replace('{shipping_address}', order.shipping_address)
+      .replace('{phone_number}', order.phone_number)
+      .replace('{items}', order.items)
+      .replace('{total_amount}', `${order.total_amount.toLocaleString()}`);
+  } else {
+    formattedSummary = `${order.customer_name}\n${order.shipping_address}\n${order.phone_number}\n***${order.items}`;
+  }
+
+  const dispatchContent = `📦 [คำสั่งซื้อใหม่ - เก็บเงินปลายทาง]\nเพจ: ${page.page_name}\n----------------------------------\n${formattedSummary}\n----------------------------------\nยอดเรียกเก็บ: ฿${order.total_amount.toLocaleString()}\nสถานะ: ส่งสรุปยอดเรียบร้อย ✅`;
+
+  // Send to Telegram if enabled
+  if ((channel === 'TELEGRAM' || channel === 'BOTH') && deliverTelegram) {
+    const sent = await deliverTelegram(page, dispatchContent);
+    addLog(
+      'INFO',
+      'TELEGRAM_BOT',
+      page.page_id,
+      sent.success ? `✈️ ส่งสรุปยอด COD ไปยัง Telegram (${page.telegram_chat_id || 'CHANNEL'}):\n${formattedSummary.replace(/\n/g, ' | ')}` : '❌ ส่งสรุปยอด COD ไปยัง Telegram ไม่สำเร็จ',
+      sent.success ? 'SUCCESS' : 'ERROR',
+      { order_id: order.order_id, target: 'TELEGRAM' }
+    );
+  }
+
+  // Send to LINE if enabled
+  if ((channel === 'LINE' || channel === 'BOTH') && deliverLine) {
+    const sent = await deliverLine(page, dispatchContent);
+    addLog(
+      'LINE_ALERT',
+      'LINE_BOT',
+      page.page_id,
+      sent.success ? `📲 ส่งสรุปยอด COD ไปยังกลุ่ม LINE (${page.line_group_id || 'DEFAULT'}):\n${formattedSummary.replace(/\n/g, ' | ')}` : '❌ ส่งสรุปยอด COD ไปยัง LINE ไม่สำเร็จ',
+      sent.success ? 'SUCCESS' : 'ERROR',
+      { order_id: order.order_id, target: 'LINE' }
+    );
+  }
+
+  return formattedSummary;
+}
+
+// Lazy Gemini AI client
+let aiClient: GoogleGenAI | null = null;
+let currentApiKey = '';
+
+function getGemini(): GoogleGenAI {
+  const apiKey = db.settings.geminiApiKey || process.env.GEMINI_API_KEY || '';
+  if (!apiKey) throw new Error('AI_NOT_CONFIGURED');
+  
+  if (!aiClient || currentApiKey !== apiKey) {
+    currentApiKey = apiKey;
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build'
+        }
+      }
+    });
+  }
+  return aiClient;
+}
+
+const app = express();
+// Render (and most PaaS) injects a dynamic PORT env var; fall back to 3000 for local dev.
+const PORT = Number(process.env.PORT) || 3000;
+
+// JSON Body Parser with raw body capture for webhook signature verification
+app.use(express.json({ limit: '25mb', verify: (req: any, _res, buffer) => { req.rawBody = Buffer.from(buffer); } }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+
+async function startServer() {
+
+  // CORS middleware for iframe & cross-origin safety
+  app.use((req, res, next) => {
+    const allowedOrigin = process.env.APP_URL || req.headers.origin || '';
+    if (req.headers.origin && process.env.APP_URL && req.headers.origin !== process.env.APP_URL) {
+      return res.status(403).json({ error: 'ORIGIN_NOT_ALLOWED' });
+    }
+    if (allowedOrigin) res.header('Access-Control-Allow-Origin', allowedOrigin);
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(200);
+    }
+    next();
+  });
+
+  // Health check endpoint
+  app.get('/api/health', (req: Request, res: Response) => {
+    res.json({
+      status: 'ok',
+      uptime: process.uptime(),
+      connected_pages: db.pages.filter(p => p.is_active).length,
+      total_products: db.amulet.length + db.china.length + db.otop.length + db.agriculture.length,
+      total_orders: db.orders.length,
+      total_customers: db.customers.length,
+      active_emergencies: db.emergencyAlerts.filter(e => !e.is_resolved).length,
+      ai_configured: Boolean(db.settings.geminiApiKey || process.env.GEMINI_API_KEY)
+    });
+  });
+
+  app.get('/api/system/readiness', (req: Request, res: Response) => {
+    const hasAi = Boolean(db.settings.geminiApiKey || process.env.GEMINI_API_KEY);
+    const hasMetaCredentials = Boolean(process.env.META_APP_ID || process.env.FACEBOOK_APP_ID) && Boolean(process.env.META_APP_SECRET || process.env.FACEBOOK_APP_SECRET);
+    const pages = db.pages.map(page => {
+      const token = decryptToken(page.page_access_token || '');
+      const catalog = page.category === 'AMULET' ? db.amulet : page.category === 'CHINA' ? db.china : page.category === 'OTOP' ? db.otop : db.agriculture;
+      const productConfigured = Boolean(page.product?.product_name && (catalog as any[]).some(product => product.page_id === page.page_id));
+      return {
+        page_id: page.page_id, page_name: page.page_name, active: page.is_active && page.auto_reply,
+        token_configured: Boolean(token && token.startsWith('EAA')),
+        product_configured: productConfigured,
+        ready: Boolean(hasAi && hasMetaCredentials && page.is_active && page.auto_reply && token?.startsWith('EAA') && productConfigured)
+      };
+    });
+    const issues = [
+      !hasAi && 'ยังไม่ได้ตั้งค่า Gemini API key',
+      !hasMetaCredentials && 'ยังไม่ได้ตั้งค่า Meta App ID/Secret บนเซิร์ฟเวอร์',
+      !STORE_SECRET && 'ยังไม่ได้ตั้งค่า ENCRYPTION_SECRET_KEY สำหรับเก็บ token และ API key อย่างปลอดภัย',
+      ...pages.filter(page => !page.ready).map(page => `เพจ ${page.page_name} ยังไม่พร้อมรับ-ส่งข้อความจริง`)
+    ].filter(Boolean);
+    res.json({ ready: issues.length === 0, ai_configured: hasAi, meta_configured: hasMetaCredentials, encrypted_storage_configured: Boolean(STORE_SECRET), pages, issues });
+  });
+
+  // Settings endpoints
+  app.get('/api/settings', (req: Request, res: Response) => {
+    // Only return true/false if key exists to prevent exposing the key
+    res.json({
+      geminiApiKeyConfigured: !!(db.settings.geminiApiKey || process.env.GEMINI_API_KEY),
+      geminiApiKeyUpdatedAt: db.settings.geminiApiKeyUpdatedAt || null
+    });
+  });
+
+  app.post('/api/settings/gemini', async (req: Request, res: Response) => {
+    const { apiKey } = req.body;
+    if (typeof apiKey === 'string' && apiKey.trim().length >= 10) {
+      try {
+        const validator = new GoogleGenAI({ apiKey: apiKey.trim() });
+        await validator.models.generateContent({ model: 'gemini-2.5-flash', contents: 'Reply only: OK', config: { maxOutputTokens: 2 } });
+        db.settings.geminiApiKey = apiKey.trim();
+        db.settings.geminiApiKeyUpdatedAt = new Date().toISOString();
+        persistData();
+        res.json({ success: true, message: 'Gemini API Key validated and saved.' });
+      } catch (error: any) {
+        res.status(400).json({ success: false, message: `ไม่สามารถยืนยัน Gemini API key ได้: ${error.message || 'โปรดตรวจสอบคีย์และโควต้า'}` });
+      }
+    } else {
+      res.status(400).json({ success: false, message: 'Invalid API Key.' });
+    }
+  });
+
+  // AES-256-GCM Token Encryption and Decryption Helpers
+  const ENCRYPTION_SECRET = process.env.ENCRYPTION_SECRET_KEY || process.env.FACEBOOK_APP_SECRET || 'fb_ai_sales_master_secret_key_32_bytes!';
+
+  function getEncryptionKey(): Buffer {
+    return crypto.createHash('sha256').update(ENCRYPTION_SECRET).digest();
+  }
+
+  function encryptToken(token: string): string {
+    if (!token || !token.trim()) return '';
+    if (token.startsWith('enc:')) return token; // Already encrypted
+    try {
+      const iv = crypto.randomBytes(16);
+      const cipher = crypto.createCipheriv('aes-256-gcm', getEncryptionKey(), iv);
+      let encrypted = cipher.update(token, 'utf8', 'hex');
+      encrypted += cipher.final('hex');
+      const authTag = cipher.getAuthTag().toString('hex');
+      return `enc:${iv.toString('hex')}:${authTag}:${encrypted}`;
+    } catch (err) {
+      console.error('Token encryption failed:', err);
+      return token;
+    }
+  }
+
+  function decryptToken(encryptedToken: string): string {
+    if (!encryptedToken || !encryptedToken.trim()) return '';
+    if (!encryptedToken.startsWith('enc:')) return encryptedToken; // Plain token
+    try {
+      const parts = encryptedToken.slice(4).split(':');
+      if (parts.length !== 3) return encryptedToken;
+      const [ivHex, authTagHex, encDataHex] = parts;
+      const decipher = crypto.createDecipheriv('aes-256-gcm', getEncryptionKey(), Buffer.from(ivHex, 'hex'));
+      decipher.setAuthTag(Buffer.from(authTagHex, 'hex'));
+      let decrypted = decipher.update(encDataHex, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      return decrypted;
+    } catch (err) {
+      console.error('Token decryption failed:', err);
+      return encryptedToken;
+    }
+  }
+
+  function maskToken(token: string): string {
+    if (!token) return '';
+    const raw = decryptToken(token);
+    if (raw.startsWith('EAA') && raw.length > 15) {
+      return `${raw.substring(0, 7)}••••••••••••••••${raw.slice(-4)}`;
+    }
+    return '••••••••••••••••';
+  }
+
+  // Helper to send Facebook Messenger Private Message using Graph API
+  async function sendFacebookMessage(accessToken: string, recipientId: string, text: string) {
+    const rawToken = decryptToken(accessToken);
+    if (!rawToken || !rawToken.startsWith('EAA')) {
+      addLog('INFO', 'FACEBOOK_API', recipientId, '⛔ ไม่ส่งข้อความ: เพจยังไม่มี Page Access Token จริง', 'ERROR');
+      return { success: false, simulated: true, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
+    }
+    try {
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipient: { id: recipientId },
+          message: { text }
+        })
+      });
+      const data = await res.json();
+      console.log('[FB Send] Graph API Response:', data);
+      if (data.error) {
+        addLog('INFO', 'FACEBOOK_API', recipientId, `❌ ส่ง Facebook Message ไม่สำเร็จ (${data.error.code}): ${data.error.message}`, 'ERROR', data.error);
+        return { success: false, error: data.error };
+      }
+      addLog('INFO', 'FACEBOOK_API', recipientId, `✅ ส่งข้อความ Messenger ถึงผู้ใช้จริงสำเร็จ (Message ID: ${data.message_id || 'OK'})`, 'SUCCESS');
+      return { success: true, messageId: data.message_id };
+    } catch (err: any) {
+      console.error('[FB Send] Error sending message via Graph API:', err);
+      addLog('INFO', 'FACEBOOK_API', recipientId, `❌ Network Error ส่ง Facebook Message: ${err.message}`, 'ERROR');
+      return { success: false, error: err.message };
+    }
+  }
+
+  async function sendFacebookImage(accessToken: string, recipientId: string, imageUrl: string) {
+    const rawToken = decryptToken(accessToken);
+    if (!rawToken?.startsWith('EAA') || !imageUrl) return { success: false, error: 'PAGE_ACCESS_TOKEN_OR_IMAGE_NOT_CONFIGURED' };
+    try {
+      const response = await fetch(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: { id: recipientId }, message: { attachment: { type: 'image', payload: { url: imageUrl, is_reusable: true } } } })
+      });
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error?.message || 'Send image failed');
+      return { success: true, messageId: data.message_id };
+    } catch (error: any) {
+      addLog('INFO', 'FACEBOOK_API', recipientId, `❌ ส่งรูปประกอบไม่สำเร็จ: ${error.message}`, 'ERROR');
+      return { success: false, error: error.message };
+    }
+  }
+
+  async function sendConfiguredSequenceStep(page: PageConfig, recipientId: string, stepNumber: number) {
+    const step = page.sales_sequence_steps?.find(item => item.step_number === stepNumber);
+    if (!step) return { sent: false };
+    if (step.type !== 'IMAGE' && step.text_content?.trim()) {
+      await sendFacebookMessage(page.page_access_token || '', recipientId, step.text_content.trim());
+    }
+    if (step.type !== 'TEXT' && step.image_url?.trim()) {
+      await sendFacebookImage(page.page_access_token || '', recipientId, step.image_url.trim());
+    }
+    return { sent: true };
+  }
+
+  // Helper to reply to a Facebook Comment using Graph API
+  async function sendFacebookCommentReply(accessToken: string, commentId: string, text: string) {
+    const rawToken = decryptToken(accessToken);
+    if (!rawToken || !rawToken.startsWith('EAA')) {
+      addLog('COMMENT', 'FACEBOOK_API', commentId, '⛔ ไม่ตอบคอมเมนต์: เพจยังไม่มี Page Access Token จริง', 'ERROR');
+      return { success: false, simulated: true, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
+    }
+    try {
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${commentId}/comments?access_token=${encodeURIComponent(rawToken)}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: text
+        })
+      });
+      const data = await res.json();
+      console.log('[FB Comment Send] Graph API Response:', data);
+      if (data.error) {
+        addLog('INFO', 'FACEBOOK_API', commentId, `❌ ตอบกลับคอมเมนต์ไม่สำเร็จ (${data.error.code}): ${data.error.message}`, 'ERROR', data.error);
+        return { success: false, error: data.error };
+      }
+      addLog('INFO', 'FACEBOOK_API', commentId, `✅ ตอบกลับคอมเมนต์จริงสำเร็จ (ID: ${data.id || commentId})`, 'SUCCESS');
+      return { success: true, id: data.id };
+    } catch (err: any) {
+      console.error('[FB Comment Send] Error replying to comment via Graph API:', err);
+      addLog('INFO', 'FACEBOOK_API', commentId, `❌ Network Error ตอบกลับคอมเมนต์: ${err.message}`, 'ERROR');
+      return { success: false, error: err.message };
+    }
+  }
+
+  // Helper to hide a toxic comment using Graph API
+  async function hideFacebookComment(accessToken: string, commentId: string) {
+    const rawToken = decryptToken(accessToken);
+    if (!rawToken || !rawToken.startsWith('EAA')) {
+      addLog('COMMENT_HIDDEN', 'FACEBOOK_API', commentId, '⛔ ไม่ซ่อนคอมเมนต์: เพจยังไม่มี Page Access Token จริง', 'ERROR');
+      return { success: false, simulated: true, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
+    }
+    try {
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${commentId}?access_token=${encodeURIComponent(rawToken)}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          is_hidden: true
+        })
+      });
+      const data = await res.json();
+      console.log('[FB Comment Hide] Graph API Response:', data);
+      if (data.error) {
+        addLog('INFO', 'FACEBOOK_API', commentId, `❌ ซ่อนคอมเมนต์ไม่สำเร็จ (${data.error.code}): ${data.error.message}`, 'ERROR', data.error);
+        return { success: false, error: data.error };
+      }
+      addLog('INFO', 'FACEBOOK_API', commentId, `🛡️ ซ่อนคอมเมนต์คำต้องห้ามสำเร็จบน Facebook จริง`, 'SUCCESS');
+      return { success: true };
+    } catch (err: any) {
+      console.error('[FB Comment Hide] Error hiding comment via Graph API:', err);
+      addLog('INFO', 'FACEBOOK_API', commentId, `❌ Network Error ซ่อนคอมเมนต์: ${err.message}`, 'ERROR');
+      return { success: false, error: err.message };
+    }
+  }
+
+  async function sendTelegramNotification(page: PageConfig, text: string) {
+    const token = decryptToken(page.telegram_bot_token || '');
+    const chatId = page.telegram_chat_id || '';
+    if (!token || !chatId) return { success: false, skipped: true, error: 'TELEGRAM_NOT_CONFIGURED' };
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text })
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.description || 'Telegram request failed');
+      return { success: true };
+    } catch (error: any) {
+      addLog('INFO', 'TELEGRAM_BOT', page.page_id, `❌ ส่ง Telegram ไม่สำเร็จ: ${error.message}`, 'ERROR');
+      return { success: false, error: error.message };
+    }
+  }
+
+  async function sendLineNotification(page: PageConfig, text: string) {
+    const channelAccessToken = decryptToken(page.line_notify_token || '');
+    const target = page.line_group_id || '';
+    if (!channelAccessToken || !target) return { success: false, skipped: true, error: 'LINE_NOT_CONFIGURED' };
+    try {
+      const response = await fetch('https://api.line.me/v2/bot/message/push', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${channelAccessToken}` },
+        body: JSON.stringify({ to: target, messages: [{ type: 'text', text: text.slice(0, 5000) }] })
+      });
+      if (!response.ok) throw new Error(`LINE API HTTP ${response.status}`);
+      return { success: true };
+    } catch (error: any) {
+      addLog('LINE_ALERT', 'LINE_BOT', page.page_id, `❌ ส่ง LINE ไม่สำเร็จ: ${error.message}`, 'ERROR');
+      return { success: false, error: error.message };
+    }
+  }
+
+  deliverTelegram = sendTelegramNotification;
+  deliverLine = sendLineNotification;
+
+  // Real Page Live Health & Connection Verification Endpoint (GET & POST /api/facebook/verify-page)
+  app.all(['/api/facebook/verify-page', '/api/facebook/check-status'], async (req: Request, res: Response) => {
+    const pageId = (req.query.page_id as string) || req.body?.page_id || (db.pages[0] ? db.pages[0].page_id : '');
+    const page = db.pages.find(p => p.page_id === pageId) || db.pages[0];
+
+    if (!page) {
+      return res.status(404).json({
+        success: false,
+        status: 'PAGE_NOT_FOUND',
+        message: 'ไม่พบข้อมูลเพจในระบบ'
+      });
+    }
+
+    const rawToken = decryptToken(page.page_access_token);
+    if (!rawToken || !rawToken.startsWith('EAA')) {
+      return res.json({
+        success: false,
+        page_id: page.page_id,
+        page_name: page.page_name,
+        is_token_valid: false,
+        is_webhook_subscribed: false,
+        is_mock_token: true,
+        status: 'MOCK_TOKEN',
+        message: 'เพจนี้ใช้ Mock Token จำลอง — กรุณากด "เชื่อมต่อ Facebook" หรือระบุ Token จริงเพื่อใช้งานระบบถ่ายทอดข้อความสด',
+        category: page.category,
+        product: page.product?.product_name || 'สินค้าประจำเพจ'
+      });
+    }
+
+    try {
+      // 1. Verify Page & Access Token via Graph API
+      const pageInfoUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(page.page_id)}?fields=id,name,is_published,category,followers_count,fan_count&access_token=${encodeURIComponent(rawToken)}`;
+      const pageInfoRes = await fetch(pageInfoUrl);
+      const pageInfoData = await pageInfoRes.json();
+
+      if (pageInfoData.error) {
+        const errCode = pageInfoData.error.code;
+        const errMsg = pageInfoData.error.message;
+        let diagnosticHelp = 'กรุณาตรวจสอบสิทธิ์ของเพจ';
+
+        if (errCode === 190) {
+          diagnosticHelp = 'Page Access Token หมดอายุหรือถูกยกเลิก กรุณาเชื่อมต่อ Facebook ใหม่อีกครั้ง';
+        } else if (errCode === 200 || errCode === 210) {
+          diagnosticHelp = 'บัญชี Facebook ขาดสิทธิ์การเข้าถึงเพจนี้ (ต้องการสิทธิ์ pages_messaging, pages_show_list)';
+        }
+
+        return res.json({
+          success: false,
+          page_id: page.page_id,
+          page_name: page.page_name,
+          is_token_valid: false,
+          is_webhook_subscribed: false,
+          error_code: errCode,
+          error_message: errMsg,
+          diagnostic_help: diagnosticHelp,
+          status: 'TOKEN_INVALID',
+          message: `ตรวจพบข้อผิดพลาดจาก Meta: ${errMsg}`
+        });
+      }
+
+      // 2. Check and enforce Webhook Subscription status
+      let isSubscribed = false;
+      let subscribedFields: string[] = [];
+      try {
+        const subCheckUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(page.page_id)}/subscribed_apps?access_token=${encodeURIComponent(rawToken)}`;
+        const subCheckRes = await fetch(subCheckUrl);
+        const subCheckData = await subCheckRes.json();
+
+        if (subCheckData.data && Array.isArray(subCheckData.data) && subCheckData.data.length > 0) {
+          isSubscribed = true;
+          subscribedFields = subCheckData.data[0]?.subscribed_fields || ['messages', 'messaging_postbacks', 'feed'];
+        } else {
+          // Auto subscribe now if not yet subscribed
+          const autoSubUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(page.page_id)}/subscribed_apps?subscribed_fields=messages,messaging_postbacks,feed&access_token=${encodeURIComponent(rawToken)}`;
+          const subRes = await fetch(autoSubUrl, { method: 'POST' });
+          const subData = await subRes.json();
+          if (subData.success) {
+            isSubscribed = true;
+            subscribedFields = ['messages', 'messaging_postbacks', 'feed'];
+          }
+        }
+      } catch (subErr) {
+        console.warn('Webhook subscription check note:', subErr);
+      }
+
+      // Update page profile with latest real Facebook data
+      if (pageInfoData.name) {
+        page.page_name = pageInfoData.name;
+      }
+      if (pageInfoData.followers_count || pageInfoData.fan_count) {
+        page.follower_count = pageInfoData.followers_count || pageInfoData.fan_count;
+        page.likes_count = pageInfoData.fan_count || page.follower_count;
+      }
+
+      return res.json({
+        success: true,
+        page_id: page.page_id,
+        page_name: page.page_name,
+        is_token_valid: true,
+        is_webhook_subscribed: isSubscribed,
+        subscribed_fields: subscribedFields,
+        followers_count: page.follower_count,
+        status: isSubscribed ? 'CONNECTED_AND_ACTIVE' : 'CONNECTED_NO_WEBHOOK',
+        message: isSubscribed
+          ? `🟢 เชื่อมต่อเพจ "${page.page_name}" และ Webhook สมบูรณ์ 100% พร้อมรับ-ส่งข้อความ Messenger จริง`
+          : `🟡 เชื่อมต่อเพจ "${page.page_name}" สำเร็จ แต่ยังไม่ได้ผูก Webhook Subscribed Apps`
+      });
+
+    } catch (err: any) {
+      console.error('[FB Verify Page Error]:', err);
+      return res.status(500).json({
+        success: false,
+        status: 'NETWORK_ERROR',
+        error_message: err.message,
+        message: `ไม่สามารถเชื่อมต่อไปยัง Meta Graph API ได้: ${err.message}`
+      });
+    }
+  });
+
+  // ==========================================
+  // Facebook Meta OAuth & Webhook Endpoints
+  // ==========================================
+
+  // 1. Meta OAuth Connect Endpoint (GET /api/facebook/connect & /facebook/connect)
+  const handleFacebookConnect = (req: Request, res: Response) => {
+    try {
+      const appId = process.env.META_APP_ID || process.env.FACEBOOK_APP_ID;
+      const appSecret = process.env.META_APP_SECRET || process.env.FACEBOOK_APP_SECRET;
+      if (!appId || !appSecret) {
+        return res.status(503).json({ error: 'META_APP_NOT_CONFIGURED', message: 'ผู้ดูแลระบบยังไม่ได้ตั้งค่า META_APP_ID และ META_APP_SECRET บนเซิร์ฟเวอร์' });
+      }
+      
+      // Determine the base origin accurately
+      let baseOrigin = (req.query.redirect_origin as string) || '';
+      if (!baseOrigin) {
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+        const host = req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000';
+        baseOrigin = `${protocol}://${host}`;
+      }
+      baseOrigin = baseOrigin.replace(/\/$/, '');
+
+      // Support explicit META_REDIRECT_URI / FACEBOOK_REDIRECT_URI or default to /api/facebook/callback
+      const callbackUrl = process.env.META_REDIRECT_URI || process.env.FACEBOOK_REDIRECT_URI || `${baseOrigin}/api/facebook/callback`;
+      
+      // Cryptographic CSRF state token with HMAC-SHA256 signature and expiration
+      const nonce = crypto.randomBytes(16).toString('hex');
+      const timestamp = Date.now();
+      const sig = crypto.createHmac('sha256', ENCRYPTION_SECRET).update(`${baseOrigin}:${appId}:${nonce}:${timestamp}`).digest('hex');
+      
+      const stateObj = {
+        origin: baseOrigin,
+        callback_url: callbackUrl,
+        app_id: appId,
+        nonce,
+        timestamp,
+        sig
+      };
+      const state = Buffer.from(JSON.stringify(stateObj)).toString('base64url');
+      
+      const scopes = [
+        'pages_show_list',
+        'pages_manage_metadata',
+        'pages_read_engagement',
+        'pages_messaging',
+        'pages_manage_posts'
+      ].join(',');
+
+      const authUrl = `https://www.facebook.com/${META_GRAPH_API_VERSION}/dialog/oauth?client_id=${encodeURIComponent(appId)}&redirect_uri=${encodeURIComponent(callbackUrl)}&scope=${encodeURIComponent(scopes)}&state=${state}&response_type=code`;
+
+      console.log(`[FB OAuth Connect] Auth URL generated for App ${appId} with callback ${callbackUrl}`);
+      addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', `🚀 เริ่มต้นกระบวนการเชื่อมต่อ Facebook OAuth (App ID: ${appId}) Callback: ${callbackUrl}`, 'INFO');
+
+      // If client requested JSON URL (for popup-based flow)
+      if (req.query.json === '1' || req.headers.accept?.includes('application/json')) {
+        return res.json({
+          success: true,
+          url: authUrl,
+          app_id: appId,
+          callback_url: callbackUrl
+        });
+      }
+
+      res.redirect(authUrl);
+    } catch (err: any) {
+      console.error('[FB OAuth Connect Error]:', err);
+      res.status(500).json({
+        error: 'FACEBOOK_CONNECT_FAILED',
+        message: `ไม่สามารถเริ่มต้นการเชื่อมต่อ Facebook ได้: ${err.message}`
+      });
+    }
+  };
+
+  app.get('/api/facebook/connect', handleFacebookConnect);
+  app.get('/facebook/connect', handleFacebookConnect);
+
+  // 2. Meta OAuth Callback Handler (GET /api/facebook/callback & /facebook/callback)
+  const handleFacebookCallback = async (req: Request, res: Response) => {
+    const { code, state, error, error_description } = req.query;
+
+    // Helper to send popup communication HTML (Zero tokens exposed)
+    const renderPopupResponse = (isSuccess: boolean, message: string, payloadData: any = {}) => {
+      const safeOrigin = payloadData.origin || '*';
+      return res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Facebook Authorization Status</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #0f172a; color: white; text-align: center; }
+    .card { background: #1e293b; padding: 2rem; border-radius: 1rem; box-shadow: 0 10px 25px rgba(0,0,0,0.3); max-width: 440px; width: 90%; text-align: left; }
+    .header { text-align: center; margin-bottom: 1.25rem; }
+    .spinner { border: 3px solid rgba(255,255,255,0.1); border-top: 3px solid #3b82f6; border-radius: 50%; width: 36px; height: 36px; animation: spin 1s linear infinite; margin: 0 auto 1rem; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .icon { font-size: 2.5rem; margin-bottom: 0.5rem; text-align: center; }
+    .title { font-size: 1.15rem; font-weight: 700; margin-bottom: 0.5rem; text-align: center; }
+    .msg { color: #94a3b8; font-size: 0.875rem; line-height: 1.5; margin-bottom: 1rem; text-align: center; }
+    .btn { display: block; width: 100%; box-sizing: border-box; background: #2563eb; color: white; border: none; padding: 0.75rem; border-radius: 0.75rem; font-weight: 600; cursor: pointer; text-decoration: none; text-align: center; margin-top: 1rem; font-size: 0.875rem; }
+    .btn:hover { background: #1d4ed8; }
+    .diagnostic { background: #0f172a; padding: 0.75rem; border-radius: 0.5rem; font-family: monospace; font-size: 0.75rem; color: #f87171; overflow-x: auto; word-break: break-all; margin-top: 0.75rem; border: 1px solid #334155; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="icon">${isSuccess ? '🎉' : '⚠️'}</div>
+      <div class="title">${isSuccess ? 'เชื่อมต่อ Facebook สำเร็จ!' : 'การเชื่อมต่อไม่สำเร็จ'}</div>
+      <div class="msg">${message}</div>
+    </div>
+    ${!isSuccess && payloadData.error ? `<div class="diagnostic">สาเหตุ: ${payloadData.error}</div>` : ''}
+    <button class="btn" onclick="handleFinish()">กลับสู่ระบบจัดการเพจ</button>
+  </div>
+  <script>
+    const isSuccess = ${JSON.stringify(isSuccess)};
+    const payload = ${JSON.stringify({
+      type: isSuccess ? 'FB_AUTH_SUCCESS' : 'FB_AUTH_ERROR',
+      success: isSuccess,
+      message,
+      ...payloadData
+    })};
+    const targetOrigin = ${JSON.stringify(safeOrigin)};
+
+    function notifyParent() {
+      if (window.opener && !window.opener.closed) {
+        try {
+          window.opener.postMessage(payload, targetOrigin);
+          setTimeout(() => { window.close(); }, 1200);
+        } catch (e) {
+          console.warn('Could not postMessage to opener:', e);
+        }
+      }
+    }
+
+    function handleFinish() {
+      if (window.opener && !window.opener.closed) {
+        window.close();
+      } else {
+        window.location.href = (targetOrigin !== '*' ? targetOrigin : '/') + '?fb_connected=' + (isSuccess ? '1' : '0') + '&count=' + (payload.count || 0);
+      }
+    }
+
+    notifyParent();
+  </script>
+</body>
+</html>`);
+    };
+
+    // Default origin fallback from request headers
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+    const host = req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000';
+    let origin = `${protocol}://${host}`.replace(/\/$/, '');
+
+    // 1. Strict CSRF State Validation
+    if (!state || typeof state !== 'string') {
+      addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', '❌ ปฏิเสธการเชื่อมต่อ: ตรวจพบคำขอที่ไม่ปลอดภัยหรือขาด CSRF State Parameter', 'ERROR');
+      return renderPopupResponse(false, 'การยืนยันตัวตนล้มเหลว (CSRF State ไม่ถูกต้องหรือขาดหาย)', { origin, error: 'missing_csrf_state' });
+    }
+
+    let stateData: { origin?: string; callback_url?: string; app_id?: string; nonce?: string; timestamp?: number; sig?: string } = {};
+    try {
+      stateData = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
+    } catch (parseErr) {
+      addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', '❌ ปฏิเสธการเชื่อมต่อ: CSRF State Data ถูกดัดแปลงหรือไม่ถูกต้อง', 'ERROR');
+      return renderPopupResponse(false, 'การยืนยันตัวตนล้มเหลว (State Format Invalid)', { origin, error: 'invalid_csrf_format' });
+    }
+
+    const { origin: stateOrigin, callback_url: stateCallbackUrl, app_id: stateAppId, nonce, timestamp, sig } = stateData;
+    if (stateOrigin) {
+      origin = stateOrigin.replace(/\/$/, '');
+    }
+
+    // Check expiration (TTL: 15 minutes)
+    const MAX_STATE_AGE_MS = 15 * 60 * 1000;
+    if (!timestamp || Date.now() - timestamp > MAX_STATE_AGE_MS) {
+      addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', '❌ ปฏิเสธการเชื่อมต่อ: เซสชันยืนยันตัวตนหมดอายุ (กรุณากดเชื่อมต่อใหม่อีกครั้ง)', 'WARNING');
+      return renderPopupResponse(false, 'เซสชันการเชื่อมต่อหมดอายุ (เกิน 15 นาที) กรุณากดเชื่อมต่อใหม่', { origin, error: 'state_expired' });
+    }
+
+    // Verify cryptographic HMAC signature
+    const stateTargetAppId = stateAppId || process.env.META_APP_ID || process.env.FACEBOOK_APP_ID || '';
+    const expectedSig = crypto.createHmac('sha256', ENCRYPTION_SECRET).update(`${origin}:${stateTargetAppId}:${nonce}:${timestamp}`).digest('hex');
+    
+    if (!sig || sig !== expectedSig) {
+      addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', '🚨 ตรวจพบความพยายามโจมตี CSRF: ลายเซ็น State HMAC ไม่ตรงกับเซิร์ฟเวอร์', 'ERROR');
+      return renderPopupResponse(false, 'การตรวจสอบความปลอดภัยล้มเหลว (CSRF Signature Mismatch)', { origin, error: 'csrf_verification_failed' });
+    }
+
+    // 2. Check for OAuth Error returned by Meta
+    if (error) {
+      console.error('[FB OAuth Callback] Error returned by Facebook:', error, error_description);
+      const errMsg = (error_description as string) || (error as string) || 'Facebook login was cancelled';
+      addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', `❌ การยืนยันตัวตน Facebook ล้มเหลว: ${errMsg}`, 'ERROR');
+      return renderPopupResponse(false, errMsg, { origin, error: errMsg });
+    }
+
+    if (!code) {
+      return renderPopupResponse(false, 'ไม่พบ Authorization Code จาก Facebook', { origin, error: 'Missing authorization code' });
+    }
+
+    const appId = stateTargetAppId;
+    const appSecret = process.env.META_APP_SECRET || process.env.FACEBOOK_APP_SECRET || '';
+    const callbackUrl = stateCallbackUrl || process.env.META_REDIRECT_URI || process.env.FACEBOOK_REDIRECT_URI || `${origin}/api/facebook/callback`;
+
+    try {
+      // 3. Exchange authorization code for User Access Token
+      const tokenExchangeUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/oauth/access_token?client_id=${encodeURIComponent(appId)}&redirect_uri=${encodeURIComponent(callbackUrl)}&client_secret=${encodeURIComponent(appSecret)}&code=${encodeURIComponent(code as string)}`;
+      
+      const tokenRes = await fetch(tokenExchangeUrl);
+      const tokenData = await tokenRes.json();
+
+      if (tokenData.error) {
+        console.error('[FB OAuth Callback] Token exchange failed:', tokenData.error);
+        const errMsg = tokenData.error.message || 'Token exchange failed';
+        addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', `❌ แลกเปลี่ยน Token ล้มเหลว: ${errMsg}`, 'ERROR');
+        return renderPopupResponse(false, `Meta Token Error: ${errMsg}`, { origin, error: errMsg });
+      }
+
+      let userAccessToken = tokenData.access_token;
+
+      // 4. Upgrade to long-lived User Access Token if appSecret is available
+      if (appSecret && userAccessToken) {
+        try {
+          const longLivedUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/oauth/access_token?grant_type=fb_exchange_token&client_id=${encodeURIComponent(appId)}&client_secret=${encodeURIComponent(appSecret)}&fb_exchange_token=${encodeURIComponent(userAccessToken)}`;
+          const longLivedRes = await fetch(longLivedUrl);
+          const longLivedData = await longLivedRes.json();
+          if (longLivedData.access_token) {
+            userAccessToken = longLivedData.access_token;
+            console.log('[FB OAuth Callback] Upgraded to long-lived user token successfully.');
+          }
+        } catch (llErr) {
+          console.warn('[FB OAuth Callback] Long-lived token upgrade note:', llErr);
+        }
+      }
+
+      // 5. Fetch managed Facebook Pages with Meta Graph API
+      const accountsUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?access_token=${encodeURIComponent(userAccessToken)}&fields=id,name,picture{url},category,access_token,followers_count,fan_count`;
+      const accountsRes = await fetch(accountsUrl);
+      const accountsData = await accountsRes.json();
+
+      if (accountsData.error) {
+        console.error('[FB OAuth Callback] Accounts fetch failed:', accountsData.error);
+        const errMsg = accountsData.error.message || 'Cannot fetch managed pages';
+        return renderPopupResponse(false, `ไม่สามารถดึงข้อมูลเพจ: ${errMsg}`, { origin, error: errMsg });
+      }
+
+      const rawPages = accountsData.data || [];
+      if (rawPages.length === 0) {
+        addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', '⚠️ บัญชีนี้ไม่มีเพจที่คุณเป็นผู้ดูแล หรือยังไม่ได้ให้สิทธิ์ pages_show_list', 'WARNING');
+        return renderPopupResponse(true, 'เชื่อมต่อบัญชีสำเร็จ แต่ไม่พบเพจที่คุณเป็นผู้ดูแลในบัญชีนี้', { origin, count: 0, warning: 'no_pages' });
+      }
+
+      const basePage = INITIAL_PAGES[0];
+      const syncedPages: PageConfig[] = [];
+
+      // 6. Securely Store Pages in Database with AES-256-GCM Encryption
+      for (const fbPage of rawPages) {
+        const existing = db.pages.find(p => p.page_id === fbPage.id);
+        const cat: ProductCategory = existing?.category || (fbPage.category?.toUpperCase().includes('RELIG') ? 'AMULET' : fbPage.category?.toUpperCase().includes('AGRI') ? 'AGRICULTURE' : 'CHINA');
+        
+        // Auto-subscribe page to webhook app
+        if (fbPage.access_token) {
+          try {
+            const subUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${fbPage.id}/subscribed_apps?subscribed_fields=messages,messaging_postbacks,feed&access_token=${encodeURIComponent(fbPage.access_token)}`;
+            await fetch(subUrl, { method: 'POST' });
+            console.log(`[FB OAuth Callback] Page ${fbPage.name} subscribed to Webhook successfully.`);
+          } catch (subErr) {
+            console.warn(`[FB OAuth Callback] Webhook subscription note for page ${fbPage.name}:`, subErr);
+          }
+        }
+
+        // Encrypt Page Token before saving in database
+        const encryptedPageToken = encryptToken(fbPage.access_token || '');
+
+        const newPageConfig: PageConfig = {
+          ...(existing || basePage),
+          page_id: fbPage.id,
+          page_name: fbPage.name,
+          page_access_token: encryptedPageToken,
+          verify_token: existing?.verify_token || 'FB_AI_SALES_TOKEN_2026',
+          is_active: existing?.is_active ?? true,
+          auto_reply: existing?.auto_reply ?? true,
+          auto_close_ai: existing?.auto_close_ai ?? true,
+          ai_model: existing?.ai_model || 'gemini-3.7-flash',
+          category: cat,
+          page_avatar: fbPage.picture?.data?.url || existing?.page_avatar || basePage.page_avatar,
+          page_cover: existing?.page_cover || basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
+          follower_count: fbPage.followers_count || fbPage.fan_count || existing?.follower_count || 15000,
+          likes_count: fbPage.fan_count || existing?.likes_count || 12000,
+          inquiries_count: existing?.inquiries_count || 0,
+          admin_name: existing?.admin_name || 'แอดมิน AI',
+          ai_tone: existing?.ai_tone || 'FRIENDLY',
+          ai_custom_instructions: existing?.ai_custom_instructions || 'ตอบลูกค้าด้วยความสุภาพ แนะนำโปรโมชั่นและเก็บเงินปลายทางทันที',
+          ai_brevity_mode: existing?.ai_brevity_mode ?? true
+        };
+
+        const idx = db.pages.findIndex(p => p.page_id === fbPage.id);
+        if (idx >= 0) {
+          db.pages[idx] = newPageConfig;
+        } else {
+          db.pages.push(newPageConfig);
+        }
+        syncedPages.push(newPageConfig);
+      }
+
+      addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', `🎉 เชื่อมต่อบัญชี Facebook และซิงค์เพจจริงสำเร็จ ${syncedPages.length} เพจ (Token เข้ารหัสปลอดภัย AES-256 ในฐานข้อมูล)`, 'SUCCESS', {
+        pagesCount: syncedPages.length,
+        pageNames: syncedPages.map(p => p.page_name)
+      });
+
+      // 7. Sanitize pages before sending to frontend: ZERO tokens exposed
+      const sanitizedPagesForFrontend = syncedPages.map(p => ({
+        ...p,
+        page_access_token: maskToken(p.page_access_token)
+      }));
+
+      return renderPopupResponse(true, `ซิงค์ ${syncedPages.length} เพจเข้าสู่ระบบเรียบร้อยแล้ว Webhook & AI พร้อมทำงาน`, {
+        origin,
+        count: syncedPages.length,
+        pages: sanitizedPagesForFrontend
+      });
+    } catch (err: any) {
+      console.error('[FB OAuth Callback] Exception:', err);
+      const errMsg = err.message || 'Internal error in OAuth callback';
+      addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', `❌ เกิดข้อผิดพลาดในการประมวลผล Facebook Callback: ${errMsg}`, 'ERROR');
+      return renderPopupResponse(false, `ข้อผิดพลาด: ${errMsg}`, { origin, error: errMsg });
+    }
+  };
+
+  app.get('/api/facebook/callback', handleFacebookCallback);
+  app.get('/facebook/callback', handleFacebookCallback);
+
+  // Facebook Graph API Sync Pages Endpoint (POST /api/facebook/sync-pages)
+  app.post('/api/facebook/sync-pages', async (req: Request, res: Response) => {
+    try {
+      const { userAccessToken, pageAccessToken, singlePageId } = req.body;
+
+      if (!userAccessToken && !pageAccessToken) {
+        return res.status(400).json({ error: 'กรุณาระบุ User Access Token หรือ Page Access Token' });
+      }
+
+      // If single page token & ID provided
+      if (pageAccessToken && singlePageId) {
+        const rawToken = decryptToken(pageAccessToken);
+        const pageGraphUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${singlePageId}?access_token=${encodeURIComponent(rawToken)}&fields=id,name,picture{url},category,followers_count,fan_count`;
+        const resp = await fetch(pageGraphUrl);
+        const data = await resp.json();
+        if (data.error) {
+          return res.status(400).json({ error: data.error.message || 'ไม่สามารถเชื่อมต่อเพจด้วย Page Access Token นี้ได้' });
+        }
+
+        // Auto-subscribe page to webhook app
+        if (rawToken.startsWith('EAA')) {
+          try {
+            const subUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${singlePageId}/subscribed_apps?subscribed_fields=messages,messaging_postbacks,feed&access_token=${encodeURIComponent(rawToken)}`;
+            await fetch(subUrl, { method: 'POST' });
+            console.log(`[FB Sync] Subscribed page ${singlePageId} to Webhooks.`);
+          } catch (subErr) {
+            console.warn('[FB Sync] Subscribed app note:', subErr);
+          }
+        }
+
+        const detectedCategory: ProductCategory = data.category?.toUpperCase().includes('RELIG') ? 'AMULET' : data.category?.toUpperCase().includes('AGRI') ? 'AGRICULTURE' : 'CHINA';
+        const basePage = INITIAL_PAGES[0];
+        const encryptedPageToken = encryptToken(rawToken);
+
+        const newPage: PageConfig = {
+          ...basePage,
+          page_id: data.id,
+          page_name: data.name,
+          page_access_token: encryptedPageToken,
+          verify_token: 'FB_AI_SALES_TOKEN_2026',
+          is_active: true,
+          auto_reply: true,
+          auto_close_ai: true,
+          ai_model: 'gemini-3.7-flash',
+          category: detectedCategory,
+          page_avatar: data.picture?.data?.url || basePage.page_avatar,
+          page_cover: basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
+          follower_count: data.followers_count || data.fan_count || 12000,
+          likes_count: data.fan_count || 10000,
+          inquiries_count: 0,
+          admin_name: 'แอดมิน AI',
+          ai_tone: 'FRIENDLY',
+          ai_custom_instructions: 'ตอบลูกค้าด้วยความสุภาพ แนะนำโปรโมชั่นและเก็บเงินปลายทางทันที',
+          ai_brevity_mode: true
+        };
+
+        const idx = db.pages.findIndex(p => p.page_id === newPage.page_id);
+        if (idx >= 0) {
+          db.pages[idx] = { ...db.pages[idx], ...newPage };
+        } else {
+          db.pages.push(newPage);
+        }
+
+        addLog('INFO', 'USER', newPage.page_id, `🔗 เชื่อมต่อเพจ Facebook สำเร็จ: ${newPage.page_name} (ID: ${newPage.page_id})`, 'SUCCESS');
+        return res.json({
+          success: true,
+          pages: [{ ...newPage, page_access_token: maskToken(newPage.page_access_token) }],
+          count: 1,
+          message: `เชื่อมต่อเพจ ${newPage.page_name} สำเร็จ!`
+        });
+      }
+
+      // Query all accounts linked to User Access Token
+      const graphUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?access_token=${encodeURIComponent(userAccessToken)}&fields=id,name,picture{url},category,access_token,followers_count,fan_count`;
+      const response = await fetch(graphUrl);
+      const data = await response.json();
+
+      if (data.error) {
+        return res.status(400).json({ error: data.error.message || 'เกิดข้อผิดพลาดจาก Meta Graph API', details: data.error });
+      }
+
+      const rawPages = data.data || [];
+      if (rawPages.length === 0) {
+        return res.json({ success: true, pages: [], count: 0, message: 'ไม่พบเพจที่บัญชีนี้เป็นผู้ดูแล (กรุณาตรวจสอบสิทธิ์ pages_show_list)' });
+      }
+
+      const basePage = INITIAL_PAGES[0];
+      const syncedPages: PageConfig[] = [];
+
+      for (const fbPage of rawPages) {
+        const existing = db.pages.find(p => p.page_id === fbPage.id);
+        const cat: ProductCategory = existing?.category || (fbPage.category?.toUpperCase().includes('RELIG') ? 'AMULET' : fbPage.category?.toUpperCase().includes('AGRI') ? 'AGRICULTURE' : 'CHINA');
+        
+        // Auto-subscribe page to webhook app
+        if (fbPage.access_token) {
+          try {
+            const subUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${fbPage.id}/subscribed_apps?subscribed_fields=messages,messaging_postbacks,feed&access_token=${encodeURIComponent(fbPage.access_token)}`;
+            await fetch(subUrl, { method: 'POST' });
+          } catch (subErr) {
+            console.warn('[FB Sync] Subscribed app error:', subErr);
+          }
+        }
+
+        const encryptedToken = encryptToken(fbPage.access_token || '');
+
+        const pageObj: PageConfig = {
+          ...(existing || basePage),
+          page_id: fbPage.id,
+          page_name: fbPage.name,
+          page_access_token: encryptedToken,
+          verify_token: existing?.verify_token || 'FB_AI_SALES_TOKEN_2026',
+          is_active: existing?.is_active ?? true,
+          auto_reply: existing?.auto_reply ?? true,
+          auto_close_ai: existing?.auto_close_ai ?? true,
+          ai_model: existing?.ai_model || 'gemini-3.7-flash',
+          category: cat,
+          page_avatar: fbPage.picture?.data?.url || existing?.page_avatar || basePage.page_avatar,
+          page_cover: existing?.page_cover || basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
+          follower_count: fbPage.followers_count || fbPage.fan_count || existing?.follower_count || 15000,
+          likes_count: fbPage.fan_count || existing?.likes_count || 12000,
+          inquiries_count: existing?.inquiries_count || 0,
+          admin_name: existing?.admin_name || 'แอดมิน AI',
+          ai_tone: existing?.ai_tone || 'FRIENDLY',
+          ai_custom_instructions: existing?.ai_custom_instructions || 'ตอบลูกค้าด้วยความสุภาพ แนะนำโปรโมชั่นและเก็บเงินปลายทางทันที',
+          ai_brevity_mode: existing?.ai_brevity_mode ?? true
+        };
+
+        const idx = db.pages.findIndex(p => p.page_id === pageObj.page_id);
+        if (idx >= 0) {
+          db.pages[idx] = { ...db.pages[idx], ...pageObj };
+        } else {
+          db.pages.push(pageObj);
+        }
+        syncedPages.push(pageObj);
+      }
+
+      addLog('INFO', 'USER', 'ALL', `🔄 ซิงค์เพจ Facebook สำเร็จ: ดึง ${syncedPages.length} เพจผ่าน User Token (Token เข้ารหัสปลอดภัย)`, 'SUCCESS');
+      return res.json({
+        success: true,
+        pages: syncedPages.map(p => ({ ...p, page_access_token: maskToken(p.page_access_token) })),
+        count: syncedPages.length,
+        message: `ซิงค์สำเร็จ ${syncedPages.length} เพจ!`
+      });
+    } catch (err: any) {
+      console.error('[FB Sync Error]:', err);
+      return res.status(500).json({ error: err.message || 'Internal Server Error' });
+    }
+  });
+
+  // Disconnect Facebook Page Endpoint (POST /api/facebook/disconnect)
+  app.post('/api/facebook/disconnect-page', (req: Request, res: Response) => {
+    const { page_id } = req.body;
+    if (!page_id) {
+      return res.status(400).json({ error: 'Missing page_id' });
+    }
+    const idx = db.pages.findIndex(p => p.page_id === page_id);
+    if (idx >= 0) {
+      const pageName = db.pages[idx].page_name;
+      db.pages[idx].is_active = false;
+      addLog('INFO', 'USER', page_id, `🔌 ยกเลิกการเชื่อมต่อเพจ Facebook: ${pageName}`, 'WARNING');
+      return res.json({ success: true, message: `ยกเลิกการเชื่อมต่อเพจ ${pageName} แล้ว` });
+    }
+    res.status(404).json({ error: 'Page not found' });
+  });
+
+  // 1. Facebook Webhook Hub Verification Endpoint (GET)
+  const handleWebhookVerify = (req: Request, res: Response) => {
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    console.log(`[FB Webhook GET] Verification request. Mode: ${mode}, Token: ${token}`);
+
+    const expectedToken = process.env.FACEBOOK_VERIFY_TOKEN || 'FB_AI_SALES_TOKEN_2026';
+    const isMatched = db.pages.some(p => p.verify_token === token) || token === expectedToken;
+
+    if (mode === 'subscribe' && isMatched) {
+      console.log('[FB Webhook GET] Verified successfully!');
+      addLog('INFO', 'FACEBOOK_HUB', 'SYSTEM', `Webhook Verification สำเร็จ (Challenge: ${challenge})`, 'SUCCESS');
+      return res.status(200).send(challenge);
+    } else {
+      console.warn('[FB Webhook GET] Verification failed. Token mismatch.');
+      addLog('INFO', 'FACEBOOK_HUB', 'SYSTEM', `Webhook Verification ล้มเหลว (Token ไม่ตรงกัน)`, 'WARNING', { token });
+      return res.sendStatus(403);
+    }
+  };
+
+  app.get('/webhook/facebook', handleWebhookVerify);
+  app.get('/webhooks/facebook', handleWebhookVerify);
+  app.get('/api/webhook/facebook', handleWebhookVerify);
+  app.get('/api/webhooks/facebook', handleWebhookVerify);
+
+  // 2. Facebook Webhook Handler Endpoint (POST)
+  const handleWebhookPost = async (req: Request, res: Response) => {
+    try {
+      const body = req.body;
+      const appSecret = process.env.META_APP_SECRET || process.env.FACEBOOK_APP_SECRET || '';
+      if (body?.object === 'page' && !(req as any).isInternal && appSecret) {
+        const receivedSignature = req.headers?.['x-hub-signature-256'];
+        const expectedSignature = `sha256=${crypto.createHmac('sha256', appSecret).update((req as any).rawBody || '').digest('hex')}`;
+        const valid = typeof receivedSignature === 'string' && receivedSignature.length === expectedSignature.length && crypto.timingSafeEqual(Buffer.from(receivedSignature), Buffer.from(expectedSignature));
+        if (!valid) {
+          addLog('INFO', 'FACEBOOK_WEBHOOK', 'SYSTEM', '⛔ ปฏิเสธ Webhook: ลายเซ็น X-Hub-Signature-256 ไม่ถูกต้อง', 'ERROR');
+          return res.status(403).json({ error: 'INVALID_WEBHOOK_SIGNATURE' });
+        }
+      }
+      console.log('[FB Webhook POST] Received payload:', JSON.stringify(body, null, 2));
+
+      // Immediate acknowledge to Facebook within 20 seconds
+      res.status(200).json({ status: 'EVENT_RECEIVED' });
+
+      // Meta may batch events for multiple Pages and multiple senders. Process
+      // every item; never silently discard all but entry[0].
+      if (Array.isArray(body.entry) && body.entry.length > 1) {
+        for (const entry of body.entry) {
+          await handleWebhookPost({ body: { object: body.object, entry: [entry] }, isInternal: true } as any, { status: () => ({ json: () => {} }), sendStatus: () => {} } as any);
+        }
+        return;
+      }
+      if (body.entry?.[0]?.messaging?.length > 1) {
+        const entry = body.entry[0];
+        for (const messaging of entry.messaging) {
+          await handleWebhookPost({ body: { object: body.object, entry: [{ ...entry, messaging: [messaging] }] }, isInternal: true } as any, { status: () => ({ json: () => {} }), sendStatus: () => {} } as any);
+        }
+        return;
+      }
+      if (body.entry?.[0]?.changes?.length > 1) {
+        const entry = body.entry[0];
+        for (const change of entry.changes) {
+          await handleWebhookPost({ body: { object: body.object, entry: [{ ...entry, changes: [change] }] }, isInternal: true } as any, { status: () => ({ json: () => {} }), sendStatus: () => {} } as any);
+        }
+        return;
+      }
+
+      // Step 2 in n8n: Event Router
+      let eventType: 'MESSAGE' | 'COMMENT' | 'UNKNOWN' = 'UNKNOWN';
+      let senderId = '';
+      let pageId = '';
+      let messageText = '';
+      let commentId: string | null = null;
+      let postId: string | null = null;
+
+      if (body.entry && body.entry[0]) {
+        const entry = body.entry[0];
+        pageId = entry.id || 'AMULET_PAGE_ID';
+
+        if (entry.messaging && entry.messaging[0]) {
+          const messagingEvent = entry.messaging[0];
+
+          // Ignore delivery or read receipts gracefully
+          if (messagingEvent.delivery || messagingEvent.read) {
+            return;
+          }
+
+          if (messagingEvent.message?.text) {
+            eventType = 'MESSAGE';
+            senderId = messagingEvent.sender?.id || 'UNKNOWN_SENDER';
+            messageText = messagingEvent.message.text;
+          } else if (messagingEvent.postback?.payload) {
+            eventType = 'MESSAGE';
+            senderId = messagingEvent.sender?.id || 'UNKNOWN_SENDER';
+            messageText = messagingEvent.postback.title || messagingEvent.postback.payload;
+          }
+        } else if (entry.changes && entry.changes[0]) {
+          const change = entry.changes[0];
+          if (change.field === 'feed' && change.value?.item === 'comment') {
+            eventType = 'COMMENT';
+            senderId = change.value.from?.id || 'COMMENT_USER';
+            messageText = change.value.message || '';
+            commentId = change.value.comment_id || `cmt_${Date.now()}`;
+            postId = change.value.post_id || `post_${Date.now()}`;
+          }
+        }
+      } else if (body.event_type) {
+        // Direct simulated structure
+        eventType = body.event_type;
+        senderId = body.sender_id || `PSID_${Math.floor(1000000000 + Math.random() * 9000000000)}`;
+        pageId = body.page_id || 'AMULET_PAGE_ID';
+        messageText = body.message_text || '';
+        commentId = body.comment_id || null;
+        postId = body.post_id || null;
+      }
+
+      if (eventType === 'UNKNOWN' || !messageText) {
+        return;
+      }
+
+      const page = db.pages.find(p => p.page_id === pageId);
+      if (!page) {
+        addLog('INFO', senderId || 'UNKNOWN', pageId || 'UNKNOWN', '⛔ ปฏิเสธ event: ไม่พบเพจที่เชื่อมต่ออยู่ในระบบ', 'ERROR');
+        return;
+      }
+      if (!page.is_active || !page.auto_reply) {
+        addLog('INFO', senderId || 'UNKNOWN', pageId, '⏸️ รับ event แล้ว แต่เพจถูกพักหรือปิด Auto-reply อยู่', 'INFO');
+        return;
+      }
+      if (!(db.settings.geminiApiKey || process.env.GEMINI_API_KEY)) {
+        addLog('INFO', senderId || 'UNKNOWN', pageId, '⛔ ไม่ตอบอัตโนมัติ: ยังไม่ได้ตั้งค่า Gemini API key ที่ใช้งานได้', 'ERROR');
+        // Send notification to user that API key is not configured
+        await sendFacebookMessage(page.page_access_token || '', senderId, '🙏 สวัสดีค่ะ ระบบ AI ยังไม่ได้ตั้งค่า API Key กรุณาติดต่อแอดมินเพื่อตั้งค่าก่อนนะคะ แอดมินจะตอบกลับให้เร็วที่สุดค่ะ');
+        return;
+      }
+
+      // CRISIS MONITORING: Scan for major customer complaints / legal threats / สคบ / แจ้งความ
+      const crisisKeywords = [
+        'แจ้งความ',
+        'สคบ',
+        'ฟ้อง',
+        'ตำรวจ',
+        'ทนาย',
+        'ดำเนินคดี',
+        'ร้องเรียน',
+        'โกงเงิน',
+        'ฉ้อโกง',
+        'เอาเรื่อง',
+        'จับกุม',
+        'ขึ้นศาล'
+      ];
+      const isCrisis = crisisKeywords.some(k => messageText.includes(k));
+      if (isCrisis) {
+        await triggerCrisisAlert({
+          page_id: pageId,
+          page_name: page.page_name,
+          threat_type: messageText.includes('สคบ') || messageText.includes('ตำรวจ') || messageText.includes('แจ้งความ')
+            ? 'SAKOB_POLICE_THREAT'
+            : messageText.includes('ฟ้อง') || messageText.includes('ทนาย') || messageText.includes('ดำเนินคดี')
+            ? 'LEGAL_THREAT'
+            : 'SEVERE_COMPLAINT',
+          customer_name: senderId,
+          message_text: messageText,
+          psid: senderId
+        });
+      }
+
+      // Handle COMMENT moderation & Auto-Reply with up to 6 images & customer tagging
+      if (eventType === 'COMMENT') {
+        const hideKeywords = page.toxic_keywords || ['โกง', 'หลอก', 'แย่', 'ฟ้อง', 'ระวัง', 'ปลอม', 'โกงเงิน', 'มิจฉาชีพ'];
+        const intentKeywords = page.purchase_keywords || ['สนใจ', 'ราคา', 'ซื้อ', 'เอา', 'รายละเอียด', 'สั่ง', 'เท่าไหร่', 'ขอราคา', 'จอง'];
+
+        const shouldHide = hideKeywords.some(w => messageText.includes(w));
+        const hasPurchaseIntent = intentKeywords.some(w => messageText.includes(w));
+
+        if (shouldHide && page.hide_toxic_comments !== false) {
+          addLog('COMMENT_HIDDEN', senderId, pageId, `🛡️ ซ่อนคอมเมนต์สแปม/คำต้องห้าม: "${messageText}" (Comment ID: ${commentId})`, 'WARNING');
+          if (commentId) {
+            await hideFacebookComment(page.page_access_token || '', commentId);
+          }
+          return;
+        }
+
+        if (hasPurchaseIntent || page.scrape_comments_enabled !== false) {
+          const customerTag = page.comment_auto_tag_customer !== false ? `@ลูกค้า` : '';
+          const replyTemplate = page.comment_reply_template || 'ขอบพระคุณที่สนใจค่ะคุณ @customer_name แอดมินทัก Inbox ส่งรายละเอียดให้เรียบร้อยแล้วนะคะ 🙏';
+          const replyText = replyTemplate.replace('@customer_name', customerTag || 'ลูกค้า');
+          const replyImages = page.comment_reply_images || [];
+
+          addLog(
+            'COMMENT',
+            senderId,
+            pageId,
+            `💬 ตอบกลับคอมเมนต์ & แนบรูป ${replyImages.length} รูป: "${replyText}" -> ทัก Inbox ทันที`,
+            'SUCCESS',
+            { replyText, replyImagesCount: replyImages.length, tagged: customerTag }
+          );
+
+          if (commentId) {
+            await sendFacebookCommentReply(page.page_access_token || '', commentId, replyText);
+          }
+
+          // Send automatic inbox invite
+          const autoInboxMsg = `สวัสดีค่ะคุณลูกค้า สนใจ ${page.product?.product_name || 'สินค้า'} แอดมินส่งรายละเอียดและของแถมพิเศษให้ในแชทนี้แล้วนะคะ 🙏`;
+          addLog('AI_REPLY', senderId, pageId, `📨 ส่งข้อความทัก Inbox: "${autoInboxMsg}"`, 'SUCCESS');
+
+          await sendFacebookMessage(page.page_access_token || '', senderId, autoInboxMsg);
+        }
+        return;
+      }
+
+      // Handle MESSENGER MESSAGE Event
+      addLog('MESSAGE', senderId, pageId, `📩 ลูกค้าทักแชท: "${messageText}"`, 'INFO', { senderId, pageId });
+
+      // Customer Search & Create/Update (Steps 3-6 in n8n)
+      let customer = db.customers.find(c => c.psid === senderId);
+      if (!customer) {
+        customer = {
+          psid: senderId,
+          customer_name: `ลูกค้า Facebook (${senderId.substring(senderId.length - 4)})`,
+          phone_number: '',
+          address: '',
+          first_interaction: new Date().toISOString(),
+          last_interaction: new Date().toISOString(),
+          status: 'NEW_CUSTOMER',
+          notes: 'ทักมาจากข้อความเพจ',
+          order_count: 0
+        };
+        db.customers.unshift(customer);
+        addLog('INFO', senderId, pageId, `👤 สร้างประวัติลูกค้าใหม่ (PSID: ${senderId})`, 'SUCCESS');
+      } else {
+        customer.last_interaction = new Date().toISOString();
+        if (customer.status !== 'ORDER_COMPLETED') {
+          customer.status = 'OLD_CUSTOMER';
+        }
+      }
+
+      // Product and Detailed Specs selection
+      let relevantProducts: any[] = [];
+      if (page.category === 'CHINA' || pageId === 'CHINA_PAGE_ID') {
+        relevantProducts = db.china.filter(product => product.page_id === pageId);
+      } else if (page.category === 'OTOP' || pageId === 'OTOP_PAGE_ID') {
+        relevantProducts = db.otop.filter(product => product.page_id === pageId);
+      } else if (page.category === 'AGRICULTURE' || pageId === 'AGRI_PAGE_ID') {
+        relevantProducts = db.agriculture.filter(product => product.page_id === pageId);
+      } else {
+        relevantProducts = db.amulet.filter(product => product.page_id === pageId);
+      }
+
+      // The page product is the canonical fallback, so a chat can never use
+      // another page's catalog item merely because it shares a category.
+      let matchedProduct: any = relevantProducts[0] || page.product || {};
+      for (const prod of relevantProducts) {
+        if (
+          messageText.includes(prod.product_name) ||
+          (prod.product_id && messageText.includes(prod.product_id)) ||
+          (prod.master && messageText.includes(prod.master)) ||
+          (prod.temple && messageText.includes(prod.temple)) ||
+          (prod.brand && messageText.includes(prod.brand))
+        ) {
+          matchedProduct = prod;
+          break;
+        }
+      }
+
+      // AI Persona & Model Execution
+      const selectedModel = page.ai_model || 'gemini-3.7-flash';
+      const adminName = page.admin_name || 'แอดมิน';
+      const aiTone = page.ai_tone || 'FRIENDLY';
+      const customInstructions = page.ai_custom_instructions || 'ตอบสั้นกระชับ สุภาพ เหมือนแอดมินคนจริง และเน้นปิดการขาย';
+      const brevityMode = page.ai_brevity_mode !== false;
+      const combinedSpecs = {
+        ...(matchedProduct || {}),
+        ...(page.product?.specs || {})
+      };
+
+      let specsText = '';
+      if (page.category === 'AMULET' || pageId === 'AMULET_PAGE_ID') {
+        specsText = `
+- หมวดหมู่สินค้า: พระเครื่อง / วัตถุมงคล
+- วัดที่จัดสร้าง (Temple): ${combinedSpecs.temple || combinedSpecs.origin_or_temple || 'ไม่ระบุ'}
+- พระเกจิอาจารย์ (Master/Maker): ${combinedSpecs.master || combinedSpecs.master_or_maker || 'ไม่ระบุ'}
+- ปีสร้าง (Year): ${combinedSpecs.year || combinedSpecs.ceremony_or_batch || 'ไม่ระบุ'}
+- รุ่น/พิมพ์ (Edition): ${combinedSpecs.edition || combinedSpecs.ceremony_or_batch || 'ไม่ระบุ'}
+- เนื้อวัสดุ/มวลสาร (Material): ${combinedSpecs.material || 'ไม่ระบุ'}
+- จำนวนสร้าง (Quantity Created): ${combinedSpecs.quantity_created || combinedSpecs.quantity || 'ไม่ระบุ'}
+- ข้อมูลความเชื่อ/พุทธคุณ (Belief Info): ${combinedSpecs.belief_info || 'ไม่ระบุ'}
+- คาถาบทสวด (Spell/Prayer): ${combinedSpecs.spell || combinedSpecs.spell_or_instructions || 'ไม่ระบุ'}
+- วิธีบูชา (Worship Method): ${combinedSpecs.worship_method || 'ไม่ระบุ'}
+- การดูแลรักษา (Care Instruction): ${combinedSpecs.care_instruction || 'ไม่ระบุ'}
+- ข้อควรระวัง (Warning): ${combinedSpecs.warning || 'ไม่ระบุ'}
+- ประวัติความเป็นมา (History): ${combinedSpecs.history || 'ไม่ระบุ'}
+- ใบรับประกันความแท้ (Warranty/Cert): ${combinedSpecs.warranty || combinedSpecs.authenticity_cert || 'รับประกันพระแท้ 100%'}
+        `;
+      } else if (page.category === 'CHINA' || pageId === 'CHINA_PAGE_ID') {
+        specsText = `
+- หมวดหมู่สินค้า: สินค้านำเข้า / ไอที
+- แบรนด์ (Brand): ${combinedSpecs.brand || 'ไม่ระบุ'}
+- วัสดุ (Material): ${combinedSpecs.material || 'ไม่ระบุ'}
+- ขนาด (Size/Dimensions): ${combinedSpecs.size || combinedSpecs.dimensions || 'มาตรฐาน'}
+- น้ำหนัก (Weight): ${combinedSpecs.weight || 'ไม่ระบุ'}
+- วิธีใช้งาน (Usage Instructions): ${combinedSpecs.usage || combinedSpecs.usage_instructions || 'ไม่ระบุ'}
+- ข้อมูลการจัดส่ง (Shipping Info): ${combinedSpecs.shipping_info || combinedSpecs.shipping_duration || 'จัดส่งด่วน 1-2 วัน มีบริการเก็บเงินปลายทาง'}
+- คุณสมบัติเด่น (Features): ${combinedSpecs.features || 'ไม่ระบุ'}
+- ประโยชน์/จุดเด่น (Benefits): ${combinedSpecs.benefit || combinedSpecs.benefits || 'ไม่ระบุ'}
+- การรับประกัน (Warranty): ${combinedSpecs.warranty || 'รับประกันคุณภาพสินค้า'}
+        `;
+      } else if (page.category === 'OTOP' || pageId === 'OTOP_PAGE_ID') {
+        specsText = `
+- หมวดหมู่สินค้า: สินค้า OTOP / วิสาหกิจชุมชน
+- ชุมชน/กลุ่มผู้ผลิต (Community): ${combinedSpecs.community || 'ไม่ระบุ'}
+- จังหวัด (Province): ${combinedSpecs.province || 'ไม่ระบุ'}
+- ผู้ผลิต (Maker): ${combinedSpecs.maker || combinedSpecs.master_or_maker || 'ไม่ระบุ'}
+- แหล่งที่มา (Origin): ${combinedSpecs.origin || combinedSpecs.origin_or_temple || 'ไม่ระบุ'}
+- วัตถุดิบหลัก (Material): ${combinedSpecs.material || 'วัตถุดิบธรรมชาติจากชุมชน'}
+- ขนาด / น้ำหนัก (Size/Weight): ${combinedSpecs.size || combinedSpecs.weight || 'มาตรฐาน'}
+- เรื่องราวสินค้า (Story): ${combinedSpecs.story || 'ภูมิปัญญาท้องถิ่นสืบทอดกันมา'}
+- วิธีการผลิตโบราณ (Production Method): ${combinedSpecs.production_method || 'งานหัตถกรรม/ฝีมือโบราณ'}
+- วิธีการดูแลรักษา (Care Instruction): ${combinedSpecs.care_instruction || 'ไม่ระบุ'}
+- ข้อควรระวัง (Warning): ${combinedSpecs.warning || 'ไม่ระบุ'}
+- ประโยชน์เด่น (Benefit): ${combinedSpecs.benefit || 'คุณภาพมาตรฐาน OTOP'}
+        `;
+      } else if (page.category === 'AGRICULTURE' || pageId === 'AGRI_PAGE_ID') {
+        specsText = `
+- หมวดหมู่สินค้า: สินค้าการเกษตร / ปุ๋ยชีวภาพ / เมล็ดพันธุ์
+- ข้อมูลพืช & เมล็ดพันธุ์ / หมวดย่อย (Subcategory): ${combinedSpecs.subcategory || combinedSpecs.species || 'ไม่ระบุ'}
+- สายพันธุ์ F1 / ชนิดสายพันธุ์ (Variety): ${combinedSpecs.variety || 'ไม่ระบุ'}
+- อัตราการงอกโดยประมาณ (Germination Rate): ${combinedSpecs.germination_rate || 'ไม่ระบุ'}
+- ระยะเวลาเพาะงอก (Germination Days): ${combinedSpecs.germination_days || 'ไม่ระบุ'}
+- การเพาะ & การปลูก (Planting Method): ${combinedSpecs.planting_method || 'ไม่ระบุ'}
+- ดิน/วัสดุปลูก (Soil Type): ${combinedSpecs.soil_type || 'ไม่ระบุ'}
+- ระยะห่างระหว่างแปลง/ต้น (Plant Spacing): ${combinedSpecs.plant_spacing || 'ไม่ระบุ'}
+- ความต้องการแสงแดด (Sunlight Requirement): ${combinedSpecs.sunlight_requirement || 'ไม่ระบุ'}
+- อุณหภูมิที่เหมาะสม (Suitable Temperature): ${combinedSpecs.suitable_temperature || 'ไม่ระบุ'}
+- การรดน้ำ & ความถี่ (Watering Method): ${combinedSpecs.watering_method || 'ไม่ระบุ'}
+- ปุ๋ย & อัตราการใช้ (Usage/Fertilizer): ${combinedSpecs.usage_instructions || 'ไม่ระบุ'}
+- ระยะเวลาเก็บเกี่ยว (Harvest Time): ${combinedSpecs.harvest_time || 'ไม่ระบุ'}
+- ผลผลิตคาดการณ์ (Expected Yield): ${combinedSpecs.expected_yield || 'ไม่ระบุ'}
+- ประโยชน์และผลลัพธ์ (Benefits): ${combinedSpecs.benefits || 'ไม่ระบุ'}
+- การเก็บรักษา (Storage Method): ${combinedSpecs.storage_method || 'ไม่ระบุ'}
+- แบรนด์ (Brand): ${combinedSpecs.brand || 'ไม่ระบุ'}
+- เลขที่จดทะเบียนปุ๋ย/ยา (Registration Number): ${combinedSpecs.registration_number || 'ไม่ระบุ'}
+- ขนาดบรรจุภัณฑ์ (Package Size): ${combinedSpecs.package_size || 'ไม่ระบุ'}
+- ข้อควรระวังด้านความปลอดภัย (Safety Warning): ${combinedSpecs.safety_warning || 'ไม่ระบุ'}
+        `;
+      } else {
+        specsText = Object.entries(combinedSpecs)
+          .filter(([k, v]) => v && typeof v === 'string' && k !== 'product_name' && k !== 'product_id' && k !== 'page_id' && k !== 'category')
+          .map(([k, v]) => `- ${k}: ${v}`)
+          .join('\n');
+      }
+
+      const ai = getGemini();
+
+      const promptContext = `
+คุณคือ "${adminName}" ซึ่งเป็นแอดมินร้านค้าเพจ Facebook: "${page.page_name}"
+ลักษณะการตอบและบุคลิก:
+- ชื่อแอดมิน: ${adminName}
+- โทนเสียง: ${aiTone}
+- ความยาวคำตอบ: ${brevityMode ? 'ตอบสั้น กระชับ ตรงประเด็น ไม่เยิ่นเย้อ เหมือนคนพิมพ์แชทมือถือจริง' : 'ให้ข้อมูลครบถ้วน ชัดเจน'}
+- คำสั่งเฉพาะของเพจนี้: ${customInstructions}
+
+ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
+- รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
+- ชื่อสินค้า: ${page.product?.product_name || matchedProduct.product_name}
+- ราคาปกติ: ฿${(page.product?.base_price || matchedProduct.price_1 || 990).toLocaleString()}
+- ราคาโปรโมชั่นขาย: ฿${(page.product?.display_price || matchedProduct.display_price || 990).toLocaleString()}
+- รายละเอียด: ${page.product?.description || matchedProduct.detail_text || ''}
+- รายการของแถม: ${combinedSpecs.box_contents || 'ของแถมพิเศษ'}
+
+📋 ข้อมูลสเปกสินค้าแบบละเอียด (Detailed Product Specifications):
+${specsText}
+- โปรโมชั่นทั้งหมดที่มี:
+${JSON.stringify(page.product?.promotions || [
+  { name: 'โปรโมชั่น 1 ชิ้น', price: matchedProduct.price_1 || 990 },
+  { name: 'โปรโมชั่น 2 ชิ้น', price: matchedProduct.price_2 || 1800 },
+  { name: 'โปรโมชั่น 3 ชิ้น', price: matchedProduct.price_3 || 2500 }
+], null, 2)}
+
+แพตเทิร์นการขาย 6 สเต็ปของเพจนี้:
+- สเต็ป 1 (ข้อความเปิด): ${page.sequence?.step1_opening_text || matchedProduct.opening_text}
+- สเต็ป 3 (รายละเอียดโปรโมชั่น): ${page.sequence?.step3_promotion_detail || matchedProduct.promotion_text}
+- สเต็ป 6 (ข้อความปิดการขาย): ${page.sequence?.step6_closing_text || matchedProduct.closing_text}
+
+ข้อมูลลูกค้าปัจจุบัน:
+${JSON.stringify(customer, null, 2)}
+
+กฎเหล็ก:
+1. ตอบแบบมนุษย์ที่เป็นแอดมินจริงๆ เท่านั้น ห้ามตอบยาวเป็นเรียงความ และห้ามอ้างอิงว่าเป็น AI
+2. ให้ข้อมูลเฉพาะโปรโมชั่นและสินค้าของเพจนี้ ห้ามแต่งข้อมูล ห้ามเดา
+3. หากเป็นพระเครื่อง: ห้ามสร้างพุทธคุณเอง ให้ใช้ข้อมูลแท้เท่านั้น
+4. หากลูกค้าถามทั่วไป/ราคา ให้ตอบสุภาพ แนะนำโปรโมชั่น และปิดการขายอย่างกระชับ
+5. หากลูกค้าส่งข้อมูลสั่งซื้อหรือส่งชื่อ/ที่อยู่/เบอร์โทร หรือจำนวน: ให้ตรวจจับเป็น ORDER และดึงข้อมูลลูกค้าออกมาให้ครบถ้วน
+
+ข้อความที่ลูกค้าส่งมา:
+"${messageText}"
+`;
+
+      try {
+        const response = await ai.models.generateContent({
+          model: selectedModel,
+          contents: promptContext,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                intent: {
+                  type: Type.STRING,
+                  description: 'QUESTION หรือ ORDER'
+                },
+                replyText: {
+                  type: Type.STRING,
+                  description: 'ข้อความตอบกลับลูกค้า สั้นกระชับ สุภาพ เหมือนแอดมินคนจริง'
+                },
+                sequenceStep: {
+                  type: Type.NUMBER,
+                  description: 'ขั้นตอน Sales Sequence 1-6'
+                },
+                isOrderDetected: {
+                  type: Type.BOOLEAN,
+                  description: 'ตรวจพบเจตนาสั่งซื้อและข้อมูลที่อยู่/เบอร์โทรหรือไม่'
+                },
+                orderData: {
+                  type: Type.OBJECT,
+                  properties: {
+                    customer_name: { type: Type.STRING },
+                    phone_number: { type: Type.STRING },
+                    address: { type: Type.STRING },
+                    product_id: { type: Type.STRING },
+                    quantity: { type: Type.NUMBER },
+                    unit_price: { type: Type.NUMBER },
+                    total_amount: { type: Type.NUMBER }
+                  }
+                }
+              },
+              required: ['intent', 'replyText', 'isOrderDetected']
+            }
+          }
+        });
+
+        const parsed: any = JSON.parse(response.text?.trim() || '{}');
+        const intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
+        const replyText = parsed.replyText || page.sequence?.step1_opening_text || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นแจ้งได้เลยนะคะ 🙏';
+
+        // Add Log of AI Closing response
+        addLog(
+          'AI_REPLY',
+          senderId,
+          pageId,
+          `🤖 AI Closing (${selectedModel} | ${adminName}): "${replyText.substring(0, 100)}${replyText.length > 100 ? '...' : ''}"`,
+          'SUCCESS',
+          { fullReply: replyText, matchedProduct: page.product?.product_name || matchedProduct.product_name, model: selectedModel }
+        );
+
+        // Send the AI answer, then the configured sales step (text/image) for this Page.
+        await sendFacebookMessage(page.page_access_token || '', senderId, replyText);
+        await sendConfiguredSequenceStep(page, senderId, Math.min(6, Math.max(1, Number(parsed.sequenceStep) || 1)));
+
+        // If ORDER is detected
+        if (intent === 'ORDER' || (parsed.orderData && (parsed.orderData.phone_number || parsed.orderData.address))) {
+          const od = parsed.orderData || {};
+          const qty = Number(od.quantity) || 1;
+          const unitPrice = Number(od.unit_price) || Number(page.product?.display_price || matchedProduct.display_price) || 990;
+          const totalAmount = od.total_amount || qty * unitPrice;
+          const custName = (od.customer_name || customer.customer_name || '').trim();
+          const phone = String(od.phone_number || customer.phone_number || '').replace(/\D/g, '');
+          const address = (od.address || customer.address || '').trim();
+          const hasCustomerName = custName.length >= 2 && !custName.startsWith('ลูกค้า Facebook');
+          const hasValidOrderData = hasCustomerName && /^0\d{9}$/.test(phone) && address.length >= 10;
+
+          if (!hasValidOrderData) {
+            addLog('ORDER', senderId, pageId, '🟡 พบความต้องการสั่งซื้อ แต่ข้อมูลยังไม่ครบ จึงยังไม่สร้างออเดอร์', 'WARNING', { hasCustomerName, hasPhone: /^0\d{9}$/.test(phone), hasAddress: address.length >= 10 });
+            persistData();
+            return;
+          }
+
+          const newOrder: Order = {
+            order_id: `ORD-${Date.now()}`,
+            psid: senderId,
+            customer_name: custName,
+            phone_number: phone,
+            shipping_address: address,
+            items: `${page.product?.product_name || matchedProduct.product_name} ${qty} ชุด`,
+            quantity: qty,
+            total_amount: totalAmount,
+            payment_status: 'PENDING',
+            created_at: new Date().toISOString(),
+            tracking_number: `TH${Math.floor(1000000000 + Math.random() * 9000000000)}FL`,
+            page_id: pageId
+          };
+
+          db.orders.unshift(newOrder);
+
+          // Update customer record
+          customer.customer_name = custName;
+          customer.phone_number = phone;
+          customer.address = address;
+          customer.status = 'ORDER_COMPLETED';
+          customer.order_count = (customer.order_count || 0) + 1;
+          customer.last_product_id = page.product?.product_id || matchedProduct.product_id;
+
+          addLog('ORDER', senderId, pageId, `🎉 บันทึกคำสั่งซื้อใหม่! รหัส ${newOrder.order_id} ยอดรวม ฿${totalAmount.toLocaleString()}`, 'SUCCESS', newOrder);
+
+          // Dispatch order summary to Telegram / LINE based on Page configuration
+          await dispatchOrderSummary(newOrder, page);
+        }
+
+      } catch (aiErr: any) {
+        console.error('Gemini AI execution error:', aiErr);
+        const fallbackReply = `${matchedProduct.opening_text}\n\n${matchedProduct.detail_text}\n\n${matchedProduct.promotion_text}\n\n${matchedProduct.closing_text}`;
+        addLog('AI_REPLY', senderId, pageId, `🤖 ตอบกลับตามชีท (Fallback): "${fallbackReply.substring(0, 80)}..."`, 'INFO');
+        await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply.trim() || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าได้เลยนะคะ 🙏');
+        await sendConfiguredSequenceStep(page, senderId, 1);
+      }
+
+      persistData();
+
+    } catch (err: any) {
+      console.error('[FB Webhook POST] Error processing webhook:', err);
+      addLog('INFO', 'SYSTEM', 'SYSTEM', `เกิดข้อผิดพลาดในการประมวลผล Webhook: ${err.message}`, 'ERROR');
+    }
+  };
+
+  app.post('/webhook/facebook', handleWebhookPost);
+  app.post('/webhooks/facebook', handleWebhookPost);
+  app.post('/api/webhook/facebook', handleWebhookPost);
+  app.post('/api/webhooks/facebook', handleWebhookPost);
+
+  // 3. Database Data APIs (Read & Write for all Google Sheets tables)
+  app.get('/api/data', (req: Request, res: Response) => {
+    const sanitizedPages = db.pages.map(p => ({
+      ...p,
+      page_access_token: maskToken(p.page_access_token),
+      telegram_bot_token: maskToken(p.telegram_bot_token || ''),
+      line_notify_token: maskToken(p.line_notify_token || '')
+    }));
+
+    res.json({
+      pages: sanitizedPages,
+      amulet: db.amulet,
+      china: db.china,
+      otop: db.otop,
+      agriculture: db.agriculture,
+      customers: db.customers,
+      orders: db.orders,
+      logs: db.logs.slice(0, 60),
+      emergencyAlerts: db.emergencyAlerts
+    });
+  });
+
+  // Full Database Backup Export API
+  app.get('/api/backup/export', (req: Request, res: Response) => {
+    const backupData = {
+      version: '2.0.0',
+      exported_at: new Date().toISOString(),
+      counts: {
+        pages: db.pages.length,
+        customers: db.customers.length,
+        orders: db.orders.length,
+        amulet: db.amulet.length,
+        china: db.china.length,
+        otop: db.otop.length,
+        agriculture: db.agriculture.length
+      },
+      data: {
+        pages: db.pages.map(p => ({ ...p, page_access_token: maskToken(p.page_access_token) })),
+        amulet: db.amulet,
+        china: db.china,
+        otop: db.otop,
+        agriculture: db.agriculture,
+        customers: db.customers,
+        orders: db.orders
+      }
+    };
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename=SuperAI_CRM_Backup_${Date.now()}.json`);
+    res.json(backupData);
+  });
+
+  // Full Database Restore API
+  app.post('/api/backup/restore', (req: Request, res: Response) => {
+    try {
+      const { data, mode } = req.body; // mode: 'overwrite' | 'merge'
+      if (!data) {
+        return res.status(400).json({ error: 'No backup data provided' });
+      }
+
+      if (mode === 'merge') {
+        if (data.customers && Array.isArray(data.customers)) {
+          for (const newCust of data.customers) {
+            const idx = db.customers.findIndex(c => c.phone_number === newCust.phone_number || (c.psid && c.psid === newCust.psid));
+            if (idx >= 0) {
+              db.customers[idx] = { ...db.customers[idx], ...newCust };
+            } else {
+              db.customers.push(newCust);
+            }
+          }
+        }
+        if (data.orders && Array.isArray(data.orders)) {
+          for (const newOrd of data.orders) {
+            const idx = db.orders.findIndex(o => o.order_id === newOrd.order_id);
+            if (idx >= 0) {
+              db.orders[idx] = { ...db.orders[idx], ...newOrd };
+            } else {
+              db.orders.push(newOrd);
+            }
+          }
+        }
+        if (data.pages && Array.isArray(data.pages)) {
+          for (const newPage of data.pages) {
+            const idx = db.pages.findIndex(p => p.page_id === newPage.page_id);
+            if (idx >= 0) db.pages[idx] = newPage;
+            else db.pages.push(newPage);
+          }
+        }
+      } else {
+        // Overwrite mode
+        if (data.pages && Array.isArray(data.pages)) db.pages = data.pages;
+        if (data.customers && Array.isArray(data.customers)) db.customers = data.customers;
+        if (data.orders && Array.isArray(data.orders)) db.orders = data.orders;
+        if (data.amulet && Array.isArray(data.amulet)) db.amulet = data.amulet;
+        if (data.china && Array.isArray(data.china)) db.china = data.china;
+        if (data.otop && Array.isArray(data.otop)) db.otop = data.otop;
+        if (data.agriculture && Array.isArray(data.agriculture)) db.agriculture = data.agriculture;
+      }
+
+      addLog('INFO', 'USER', 'SYSTEM', `🔄 กู้คืนฐานข้อมูล (${mode === 'merge' ? 'Merge รวมข้อมูล' : 'Overwrite เขียนทับ'}) สำเร็จ ลูกค้า: ${db.customers.length}, ออเดอร์: ${db.orders.length}`, 'SUCCESS');
+
+      res.json({
+        success: true,
+        counts: {
+          customers: db.customers.length,
+          orders: db.orders.length,
+          pages: db.pages.length
+        }
+      });
+    } catch (err: any) {
+      console.error('Backup restore error:', err);
+      res.status(500).json({ error: err.message || 'Restore failed' });
+    }
+  });
+
+  // AI CRM Smart Parser Endpoint (Gemini Auto-Extraction for Bulk Copy-Paste / Excel)
+  app.post('/api/ai/parse-crm', async (req: Request, res: Response) => {
+    try {
+      const { rawText, rowsData } = req.body;
+      const textToParse = rawText || (Array.isArray(rowsData) ? JSON.stringify(rowsData.slice(0, 50)) : '');
+
+      if (!textToParse || !textToParse.trim()) {
+        return res.status(400).json({ error: 'Text or data is required for parsing' });
+      }
+
+      const ai = getGemini();
+      const parsePrompt = `
+คุณคือ AI ผู้เชี่ยวชาญการวิเคราะห์ข้อมูลลูกค้าและคำสั่งซื้อ (CRM Data Parser) สำหรับธุรกิจออนไลน์ไทย
+งานของคุณ:
+อ่านข้อมูลข้อความหรือตารางที่ผู้ใช้คัดลอกมาวาง ซึ่งอาจเป็นรายชื่อลูกค้า เบอร์โทร ที่อยู่ รายการสินค้าที่สั่ง วันที่สั่งซื้อ หรือเลขพัสดุ
+ให้สกัด (Extract) ออกมาเป็นโครงสร้างข้อมูลมาตรฐานทีละรายการอย่างแม่นยำที่สุด:
+
+กฎการทำงาน:
+1. customer_name: ชื่อ-นามสกุลลูกค้า (เช่น "คุณสมศักดิ์ วันดี" หรือ "สมศักดิ์")
+2. phone_number: เบอร์โทรศัพท์ (กรองเอาเฉพาะตัวเลข 9-10 หลัก เช่น "0812345678")
+3. address: ที่อยู่จัดส่งพัสดุพร้อมรหัสไปรษณีย์
+4. items: รายการสินค้าที่ลูกค้าสั่งหรือสนใจ (เช่น "เหรียญหลวงปู่ทวด 1 องค์", "ปุ๋ยน้ำ 2 ขวด", "เครื่องฟอกอากาศ")
+5. quantity: จำนวนชิ้น (ตัวเลข default 1)
+6. total_amount: ยอดเงินรวมที่จ่ายหรือเก็บเงินปลายทาง (ตัวเลข ถ้าไม่มีให้คำนวณหรือใส่ 0)
+7. order_date: วันที่สั่งซื้อ (ISO string หรือ YYYY-MM-DD ถ้าไม่มีให้ใช้วันนี้)
+8. tracking_number: เลขพัสดุ (เช่น TH123456789FL หรือ Kerry/Flash tracking ถ้ามี ถ้าไม่มีให้เว้นว่างไว้)
+9. category: หมวดหมู่สินค้า ('AMULET' | 'CHINA' | 'OTOP' | 'AGRICULTURE' หรือเดาจากชื่อสินค้า)
+10. notes: บันทึกพิเศษหรือความต้องการเพิ่มเติม
+11. tier: ระดับลูกค้า ('NORMAL' | 'VIP' | 'SUPER_VIP') ประเมินจากยอดซื้อหรือประวัติ
+
+ข้อมูลที่ส่งมาให้วิเคราะห์:
+"""
+${textToParse}
+"""
+`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.7-flash',
+        contents: parsePrompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              parsedCount: { type: Type.NUMBER },
+              summary: { type: Type.STRING },
+              customers: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    customer_name: { type: Type.STRING },
+                    phone_number: { type: Type.STRING },
+                    address: { type: Type.STRING },
+                    items: { type: Type.STRING },
+                    quantity: { type: Type.NUMBER },
+                    total_amount: { type: Type.NUMBER },
+                    order_date: { type: Type.STRING },
+                    tracking_number: { type: Type.STRING },
+                    category: { type: Type.STRING },
+                    notes: { type: Type.STRING },
+                    tier: { type: Type.STRING }
+                  },
+                  required: ['customer_name', 'phone_number']
+                }
+              }
+            },
+            required: ['parsedCount', 'customers']
+          }
+        }
+      });
+
+      const parsedResult: any = JSON.parse(response.text?.trim() || '{"customers":[], "parsedCount": 0}');
+      addLog('INFO', 'AI_CRM', 'SYSTEM', `🤖 AI Smart Parser สกัดข้อมูลสำเร็จ ${parsedResult.customers?.length || 0} รายการ`, 'SUCCESS');
+      res.json(parsedResult);
+    } catch (err: any) {
+      console.error('AI Parse CRM error:', err);
+      res.status(500).json({ error: err.message || 'AI parsing failed' });
+    }
+  });
+
+  // AI Admin Copilot Chatbot Endpoint (Floating Assistant on Bottom-Right)
+  app.post('/api/ai/copilot', async (req: Request, res: Response) => {
+    try {
+      const { message, history } = req.body;
+
+      if (!message || !message.trim()) {
+        return res.status(400).json({ error: 'Message is required' });
+      }
+
+      const totalRevenue = db.orders.reduce((sum, o) => sum + (o.payment_status !== 'CANCELLED' ? o.total_amount : 0), 0);
+      const pendingOrders = db.orders.filter(o => o.payment_status === 'PENDING');
+      const paidOrders = db.orders.filter(o => o.payment_status === 'PAID' || o.payment_status === 'SHIPPED');
+      const unresolvedAlerts = db.emergencyAlerts.filter(e => !e.is_resolved);
+
+      // Category and product breakdown for sales summary
+      const categorySummary: Record<string, any> = {
+        'ของจีน / ไอที': { items: {}, revenue: 0, orderCount: 0, units: 0, inquiries: 0 },
+        'พระเครื่อง / วัตถุมงคล': { items: {}, revenue: 0, orderCount: 0, units: 0, inquiries: 0 },
+        'โอทอป OTOP / ชุมชน': { items: {}, revenue: 0, orderCount: 0, units: 0, inquiries: 0 },
+        'เกษตร / ปุ๋ยยาชีวภาพ': { items: {}, revenue: 0, orderCount: 0, units: 0, inquiries: 0 }
+      };
+
+      db.pages.forEach(p => {
+        const catKey = p.category === 'CHINA' ? 'ของจีน / ไอที' :
+                       p.category === 'AMULET' ? 'พระเครื่อง / วัตถุมงคล' :
+                       p.category === 'OTOP' ? 'โอทอป OTOP / ชุมชน' : 'เกษตร / ปุ๋ยยาชีวภาพ';
+        if (categorySummary[catKey]) {
+          categorySummary[catKey].inquiries += (p.inquiries_count || 15);
+        }
+      });
+
+      let totalItemsCount = 0;
+      db.orders.forEach(o => {
+        const amt = o.total_amount || 0;
+        const qty = o.quantity || 1;
+        totalItemsCount += qty;
+        let catKey = 'ของจีน / ไอที';
+        if (o.page_id === 'AMULET_PAGE_ID' || o.items?.includes('หลวงปู่ทวด') || o.items?.includes('AML')) {
+          catKey = 'พระเครื่อง / วัตถุมงคล';
+        } else if (o.page_id === 'OTOP_PAGE_ID' || o.items?.includes('ผ้าไหม') || o.items?.includes('OTP')) {
+          catKey = 'โอทอป OTOP / ชุมชน';
+        } else if (o.page_id === 'AGRI_PAGE_ID' || o.items?.includes('ปุ๋ย') || o.items?.includes('AGR')) {
+          catKey = 'เกษตร / ปุ๋ยยาชีวภาพ';
+        }
+
+        const itemName = o.items || 'สินค้าทั่วไป';
+        if (!categorySummary[catKey].items[itemName]) {
+          categorySummary[catKey].items[itemName] = {
+            prices: {},
+            subtotal: 0,
+            count: 0,
+            units: 0
+          };
+        }
+
+        const priceKey = `${amt}.-`;
+        const method = o.payment_status === 'PAID' ? 'โอน' : 'COD';
+        const priceTierKey = `(${amt}.-) ${method}`;
+        if (!categorySummary[catKey].items[itemName].prices[priceTierKey]) {
+          categorySummary[catKey].items[itemName].prices[priceTierKey] = 0;
+        }
+        categorySummary[catKey].items[itemName].prices[priceTierKey] += 1;
+        categorySummary[catKey].items[itemName].subtotal += amt;
+        categorySummary[catKey].items[itemName].count += 1;
+        categorySummary[catKey].items[itemName].units += qty;
+
+        categorySummary[catKey].revenue += amt;
+        categorySummary[catKey].orderCount += 1;
+        categorySummary[catKey].units += qty;
+      });
+
+      const totalInquiriesAll = db.pages.reduce((sum, p) => sum + (p.inquiries_count || 20), 0);
+      const overallConversionRate = totalInquiriesAll > 0 ? ((db.orders.length / totalInquiriesAll) * 100).toFixed(1) : '85.5';
+
+      const copilotContext = `
+คุณคือ "Vorakamol SuperAI Copilot" — ผู้ช่วย AI อัจฉริยะส่วนตัวของเจ้าของธุรกิจและแอดมินระบบ
+คุณสามารถสั่งการ, วิเคราะห์ข้อมูลธุรกิจ, ตรวจสอบยอดขาย, รายงานปัญหาฉุกเฉิน, ค้นหาลูกค้า, และช่วยร่างข้อความตอบลูกค้าหรือเทเลเซลได้อย่างยอดเยี่ยม
+
+บริบทข้อมูลสดปัจจุบันของระบบ (Live Context):
+- จำนวนเพจทั้งหมด: ${db.pages.length} เพจ (${db.pages.map(p => p.page_name).join(', ')})
+- จำนวนลูกค้าทั้งหมดใน CRM: ${db.customers.length} คน
+- จำนวนคำสั่งซื้อทั้งหมด: ${db.orders.length} ออเดอร์
+- จำนวนสินค้าทั้งหมดที่ขายได้: ${totalItemsCount} ชิ้น
+- ยอดขายรวม: ฿${totalRevenue.toLocaleString()}
+- จำนวนคนทักรวม (Total Inquiries): ${totalInquiriesAll} คน
+- อัตราปิดการขายเฉลี่ย (Conversion Rate): ${overallConversionRate}%
+- ออเดอร์ที่ชำระ/ส่งแล้ว: ${paidOrders.length} รายการ
+- ออเดอร์รอจัดส่ง/รอชำระ (Pending): ${pendingOrders.length} รายการ
+- ปัญหาหรือการแจ้งเตือนวิกฤต (Emergency / Crisis): ${unresolvedAlerts.length} รายการ
+  ${unresolvedAlerts.map(a => `- [${a.type}] เพจ ${a.page_id}: "${a.threat_text}"`).join('\n')}
+- สินค้าแยกตามหมวด:
+  * พระเครื่อง: ${db.amulet.length} รายการ (${db.amulet.map(a => a.product_name).join(', ')})
+  * จีน/ไอที: ${db.china.length} รายการ (${db.china.map(c => c.product_name).join(', ')})
+  * โอทอป OTOP: ${db.otop.length} รายการ (${db.otop.map(o => o.product_name).join(', ')})
+  * เกษตร/ปุ๋ยยา: ${db.agriculture.length} รายการ (${db.agriculture.map(g => g.product_name).join(', ')})
+
+โครงสร้างข้อมูลคำสั่งซื้อแยกตามหมวดหมู่และราคาสินค้า:
+${JSON.stringify(categorySummary, null, 2)}
+
+กฎเหล็กสำคัญสำหรับการสรุปยอดขาย / ปิดยอด (Sales Closing Summary Format):
+หากผู้ใช้ขอให้ "สรุปยอด", "ปิดยอด", "รายงานยอดขาย", หรือถามยอดขายประจำวัน/แยกหมวดสินค้า ให้คุณจัดรูปแบบข้อความสรุปตามแพทเทิร์นเป๊ะๆ ดังต่อไปนี้:
+
+ตัวอย่างแพทเทิร์นที่ต้องตอบ:
+ปิดยอด[ชื่อหมวดหมู่ หรือ รวมทุกหมวด] [ระบุวันที่ เช่น 24 ส.ค. 69]
+
+[ชื่อสินค้า เช่น เสาอากาศ / เครื่องฟอกอากาศ]
+([ราคา].-) [จำนวน] ออเดอร์ [COD/โอน]
+([ราคา].-) [จำนวน] ออเดอร์ [COD/โอน]
+ยอดขาย[ชื่อสินค้า] [ยอดเงินรวมของสินค้านั้น] บาท
+
+[ชื่อสินค้าถัดไป เช่น ชุดบล็อก / หลวงปู่ทวด]
+([ราคา].-) [จำนวน] ออเดอร์ [COD/โอน]
+ยอดขาย[ชื่อสินค้า] [ยอดเงินรวมของสินค้านั้น] บาท
+
+━━━━━━━━━━━━━━━━━━━━
+📊 สรุปรวมทั้งหมด
+💰 ยอดขายรวม: [ยอดเงินรวมทั้งหมด] บาท
+📦 จำนวนคำสั่งซื้อ: [จำนวนออเดอร์รวม] ออเดอร์
+🛍️ จำนวนสินค้า: [จำนวนชิ้นรวม] ชิ้น
+👥 จำนวนคนทัก: [จำนวนคนทัก] คน
+🎯 เปอร์เซ็นต์ปิดการขาย: [xx.x]%
+
+ลักษณะการตอบอื่นๆ:
+1. ตอบสุภาพ ชัดเจน มีความรู้จริงเรื่องธุรกิจปิดการขาย แนะนำขั้นตอนอย่างเป็นมืออาชีพ
+2. หากถามเรื่องปัญหา ให้รายงานสถานะระบบ ออเดอร์ค้าง หรือข้อความวิกฤตอย่างรวดเร็ว
+3. หากผู้ใช้ถามสั้นๆ ให้ตอบกระชับ ตรงประเด็น
+`;
+
+      const ai = getGemini();
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.7-flash',
+        contents: [
+          { text: copilotContext },
+          ...(history && Array.isArray(history)
+            ? history.slice(-6).map((h: any) => ({
+                text: `${h.role === 'user' ? 'ผู้ใช้' : 'AI Copilot'}: ${h.text}`
+              }))
+            : []),
+          { text: `คำถามหรือคำสั่งจากผู้ใช้: "${message}"` }
+        ]
+      });
+
+      const reply = response.text?.trim() || 'ขออภัยค่ะ ไม่สามารถประมวลผลคำตอบได้ในขณะนี้ กรุณาลองใหม่อีกครั้งนะคะ';
+
+      res.json({
+        reply,
+        systemStats: {
+          totalRevenue,
+          totalCustomers: db.customers.length,
+          totalOrders: db.orders.length,
+          pendingOrders: pendingOrders.length,
+          unresolvedAlertsCount: unresolvedAlerts.length
+        }
+      });
+    } catch (err: any) {
+      console.error('AI Copilot error:', err);
+      res.status(500).json({ error: err.message || 'AI Copilot error' });
+    }
+  });
+
+  // Dedicated AI Sales Summary & Daily Closing Generator API
+  app.post('/api/ai/sales-summary-report', async (req: Request, res: Response) => {
+    try {
+      const { dateStr, category = 'ALL', customOrders, customDateTitle } = req.body;
+
+      // Select target orders
+      let targetOrders = customOrders && Array.isArray(customOrders) && customOrders.length > 0
+        ? customOrders
+        : db.orders;
+
+      if (dateStr && dateStr !== 'ALL') {
+        targetOrders = targetOrders.filter((o: any) => o.created_at?.startsWith(dateStr));
+      }
+
+      if (category && category !== 'ALL') {
+        targetOrders = targetOrders.filter((o: any) => {
+          if (category === 'AMULET' && (o.page_id === 'AMULET_PAGE_ID' || o.items?.includes('AML') || o.items?.includes('หลวงปู่ทวด'))) return true;
+          if (category === 'CHINA' && (o.page_id === 'CHINA_PAGE_ID' || o.items?.includes('CHN') || o.items?.includes('ฟอกอากาศ') || o.items?.includes('เสาอากาศ') || o.items?.includes('ชุดบล็อก'))) return true;
+          if (category === 'OTOP' && (o.page_id === 'OTOP_PAGE_ID' || o.items?.includes('OTP') || o.items?.includes('ผ้าไหม'))) return true;
+          if (category === 'AGRICULTURE' && (o.page_id === 'AGRI_PAGE_ID' || o.items?.includes('AGR') || o.items?.includes('ปุ๋ย'))) return true;
+          return false;
+        });
+      }
+
+      // Group by Category -> Product -> Price Tier
+      const categoryMap: Record<string, Record<string, { prices: Record<string, number>; subtotal: number; units: number; count: number }>> = {};
+
+      let grandTotalRevenue = 0;
+      let grandTotalOrders = targetOrders.length;
+      let grandTotalUnits = 0;
+
+      targetOrders.forEach((o: any) => {
+        const amt = o.total_amount || 0;
+        const qty = o.quantity || 1;
+        grandTotalRevenue += amt;
+        grandTotalUnits += qty;
+
+        // Determine category label
+        let catLabel = 'สินค้าของจีน / Gadget';
+        if (o.page_id === 'AMULET_PAGE_ID' || o.items?.includes('หลวงปู่ทวด') || o.items?.includes('AML')) {
+          catLabel = 'หมวดพระเครื่อง / วัตถุมงคล';
+        } else if (o.page_id === 'OTOP_PAGE_ID' || o.items?.includes('ผ้าไหม') || o.items?.includes('OTP')) {
+          catLabel = 'หมวดโอทอป OTOP / ของดีชุมชน';
+        } else if (o.page_id === 'AGRI_PAGE_ID' || o.items?.includes('ปุ๋ย') || o.items?.includes('AGR')) {
+          catLabel = 'หมวดเกษตร / ปุ๋ยยาชีวภาพ';
+        }
+
+        if (!categoryMap[catLabel]) {
+          categoryMap[catLabel] = {};
+        }
+
+        // Clean product name
+        const rawItem = o.items || 'สินค้าทั่วไป';
+        let prodName = rawItem;
+        if (rawItem.includes('เสาอากาศ')) prodName = 'เสาอากาศดิจิตอล';
+        else if (rawItem.includes('ชุดบล็อก')) prodName = 'ชุดบล็อกประแจ';
+        else if (rawItem.includes('ฟอกอากาศ')) prodName = 'เครื่องฟอกอากาศ Smart H13';
+        else if (rawItem.includes('หลวงปู่ทวด')) prodName = 'เหรียญหลวงปู่ทวด วัดช้างให้';
+        else if (rawItem.includes('ผ้าไหม')) prodName = 'ผ้าไหมแพรวากาฬสินธุ์';
+        else if (rawItem.includes('ปุ๋ย')) prodName = 'ปุ๋ยน้ำอะมิโนพลัส';
+
+        if (!categoryMap[catLabel][prodName]) {
+          categoryMap[catLabel][prodName] = {
+            prices: {},
+            subtotal: 0,
+            units: 0,
+            count: 0
+          };
+        }
+
+        const method = o.payment_status === 'PAID' ? 'โอน' : 'COD';
+        const tierKey = `(${amt.toLocaleString()}.-) ${method}`;
+
+        if (!categoryMap[catLabel][prodName].prices[tierKey]) {
+          categoryMap[catLabel][prodName].prices[tierKey] = 0;
+        }
+        categoryMap[catLabel][prodName].prices[tierKey] += 1;
+        categoryMap[catLabel][prodName].subtotal += amt;
+        categoryMap[catLabel][prodName].units += qty;
+        categoryMap[catLabel][prodName].count += 1;
+      });
+
+      // Calculate inquiries & closing rate
+      let relevantPages = db.pages;
+      if (category && category !== 'ALL') {
+        relevantPages = db.pages.filter(p => p.category === category);
+      }
+      const totalInquiries = relevantPages.reduce((sum, p) => sum + (p.inquiries_count || (grandTotalOrders > 0 ? Math.round(grandTotalOrders / 0.85) : 15)), 0);
+      const conversionRate = totalInquiries > 0
+        ? Math.min(100, Number(((grandTotalOrders / totalInquiries) * 100).toFixed(1)))
+        : 88.5;
+
+      // Format Date string in Thai (e.g. "9 ก.ค. 68" or "24 ส.ค. 69")
+      const now = new Date();
+      const thaiMonthsShort = ['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
+      const dateTitle = customDateTitle || `${now.getDate()} ${thaiMonthsShort[now.getMonth()]} ${String(now.getFullYear() + 543).slice(-2)}`;
+
+      const categoryTitle = category === 'CHINA' ? 'ของจีน' :
+                            category === 'AMULET' ? 'พระเครื่อง' :
+                            category === 'OTOP' ? 'โอทอป' :
+                            category === 'AGRICULTURE' ? 'สินค้าเกษตร' : 'ทุกหมวดสินค้า';
+
+      // Build structured text output
+      let textOutput = `ปิดยอด${categoryTitle} ${dateTitle}\n\n`;
+
+      Object.keys(categoryMap).forEach(cat => {
+        const prods = categoryMap[cat];
+        Object.keys(prods).forEach(prodName => {
+          const pData = prods[prodName];
+          textOutput += `${prodName}\n`;
+          Object.keys(pData.prices).forEach(tierKey => {
+            const count = pData.prices[tierKey];
+            textOutput += `${tierKey.replace(' COD', '')} ${count} ออเดอร์ COD\n`;
+          });
+          textOutput += `ยอดขาย${prodName} ${pData.subtotal.toLocaleString()} บาท\n\n`;
+        });
+      });
+
+      if (Object.keys(categoryMap).length === 0) {
+        textOutput += `ไม่มีรายการคำสั่งซื้อในช่วงเวลาที่เลือก\n\n`;
+      }
+
+      textOutput += `━━━━━━━━━━━━━━━━━━━━\n`;
+      textOutput += `📊 สรุปรวมผลประกอบการทั้งหมด\n`;
+      textOutput += `💰 ยอดเงินรวม: ${grandTotalRevenue.toLocaleString()} บาท\n`;
+      textOutput += `📦 จำนวนออเดอร์: ${grandTotalOrders} ออเดอร์\n`;
+      textOutput += `🛍️ จำนวนสินค้า: ${grandTotalUnits} ชิ้น\n`;
+      textOutput += `👥 จำนวนคนทัก: ${totalInquiries} คน\n`;
+      textOutput += `🎯 เปอร์เซ็นต์ปิดการขาย: ${conversionRate}%\n`;
+
+      addLog('INFO', 'AI_SUMMARY', 'SYSTEM', `📊 AI สร้างรายงานสรุปยอดขาย ${categoryTitle} (${grandTotalOrders} ออเดอร์ ยอด ฿${grandTotalRevenue.toLocaleString()}) สำเร็จ`, 'SUCCESS');
+
+      res.json({
+        success: true,
+        summaryText: textOutput.trim(),
+        stats: {
+          categoryTitle,
+          dateTitle,
+          totalRevenue: grandTotalRevenue,
+          totalOrders: grandTotalOrders,
+          totalUnits: grandTotalUnits,
+          totalInquiries,
+          conversionRate,
+          breakdown: categoryMap
+        }
+      });
+    } catch (err: any) {
+      console.error('AI Sales Summary error:', err);
+      res.status(500).json({ error: err.message || 'Sales summary failed' });
+    }
+  });
+
+  // Update specific collection in Database
+  app.post('/api/data/update', (req: Request, res: Response) => {
+    const { collection, data } = req.body;
+    if (collection && Array.isArray(data)) {
+      if (collection === 'pages') {
+        db.pages = data.map((incomingPage: PageConfig) => {
+          const existing = db.pages.find(p => p.page_id === incomingPage.page_id);
+          let token = incomingPage.page_access_token || '';
+          if (!token || token.includes('•••') || token.includes('••••')) {
+            token = existing ? existing.page_access_token : '';
+          } else if (token.startsWith('EAA') && !token.startsWith('enc:')) {
+            token = encryptToken(token);
+          }
+          const protectSecret = (value: string | undefined, prior: string | undefined) => {
+            if (!value || value.includes('•••') || value.includes('••••')) return prior || '';
+            return value.startsWith('enc:') ? value : encryptToken(value);
+          };
+          return {
+            ...incomingPage,
+            page_access_token: token,
+            telegram_bot_token: protectSecret(incomingPage.telegram_bot_token, existing?.telegram_bot_token),
+            line_notify_token: protectSecret(incomingPage.line_notify_token, existing?.line_notify_token)
+          };
+        });
+        syncCatalogFromPages();
+      }
+      else if (collection === 'amulet') { db.amulet = data; syncPagesFromCatalog('amulet'); }
+      else if (collection === 'china') { db.china = data; syncPagesFromCatalog('china'); }
+      else if (collection === 'otop') { db.otop = data; syncPagesFromCatalog('otop'); }
+      else if (collection === 'agriculture') { db.agriculture = data; syncPagesFromCatalog('agriculture'); }
+      else if (collection === 'customers') db.customers = data;
+      else if (collection === 'orders') db.orders = data;
+
+      addLog('INFO', 'USER', 'SYSTEM', `อัปเดตข้อมูลตาราง ${collection.toUpperCase()} จำนวน ${data.length} รายการ`, 'SUCCESS');
+      persistData();
+      return res.json({ success: true, count: data.length });
+    }
+    res.status(400).json({ error: 'Invalid collection or data' });
+  });
+
+  // 4. Voice Audio Transcription API using Gemini (gemini-3.7-flash)
+  app.post('/api/ai/transcribe', async (req: Request, res: Response) => {
+    try {
+      const { audioBase64, mimeType } = req.body;
+      if (!audioBase64) {
+        return res.status(400).json({ error: 'audioBase64 is required' });
+      }
+
+      const ai = getGemini();
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.7-flash',
+        contents: [
+          {
+            inlineData: {
+              mimeType: mimeType || 'audio/webm',
+              data: audioBase64
+            }
+          },
+          {
+            text: 'กรุณาถอดเสียงภาษาไทยจากคลิปเสียงนี้อย่างแม่นยำ ทุกถ้อยคำ หากมีชื่อสินค้า ที่อยู่ เบอร์โทรศัพท์ หรือการสั่งซื้อ ให้ถอดข้อความออกมาให้ถูกต้องตามธรรมชาติของการพิมพ์แชท'
+          }
+        ]
+      });
+
+      const transcribedText = response.text?.trim() || '';
+      addLog('INFO', 'VOICE_USER', 'SYSTEM', `🎙️ ถอดเสียงสำเร็จ: "${transcribedText}"`, 'SUCCESS');
+      res.json({ text: transcribedText });
+    } catch (err: any) {
+      console.error('Audio transcription error:', err);
+      res.status(500).json({ error: err.message || 'Failed to transcribe audio' });
+    }
+  });
+
+  // 5. Test Notification Dispatch API (Telegram / LINE)
+  app.post('/api/notifications/test', async (req: Request, res: Response) => {
+    const { channel, page_id, page_name, line_token, line_group_id, telegram_token, telegram_chat_id, sample_order } = req.body;
+
+    const page = db.pages.find(p => p.page_id === page_id) || db.pages[0];
+
+    const orderData: Order = {
+      order_id: `ORD-TEST-${Date.now()}`,
+      psid: 'PSID_TEST',
+      customer_name: sample_order?.customer_name || 'คุณวิชัย วันดี',
+      shipping_address: sample_order?.address || 'โตโยต้าชัวร์ ทีบีเอ็น 318/4 ถ.ลาดกระบัง กทม 10520',
+      phone_number: sample_order?.phone || '0927015995',
+      items: sample_order?.item || `${page.product?.product_name || 'กล้องส่องพระแบบเซียน'} 1 ชุด`,
+      quantity: 1,
+      total_amount: sample_order?.total || 990,
+      payment_status: 'PENDING',
+      created_at: new Date().toISOString(),
+      tracking_number: 'TH999888777FL',
+      page_id: page_id || 'AMULET_PAGE_ID'
+    };
+
+    const formatted = await dispatchOrderSummary(orderData, page);
+    res.json({
+      success: true,
+      message: `ส่งการแจ้งเตือนทดสอบ (${channel}) สำหรับเพจ ${page_name || page.page_name} สำเร็จเรียบร้อย!`,
+      summaryFormatted: formatted
+    });
+  });
+
+  // 6. Emergency Crisis Alert Trigger API
+  app.post('/api/emergency/alert', async (req: Request, res: Response) => {
+    const { page_id, threat_type, message_text, customer_name } = req.body;
+    const page = db.pages.find(p => p.page_id === page_id) || db.pages[0];
+
+    const alert = await triggerCrisisAlert({
+      page_id: page_id || page.page_id,
+      page_name: page.page_name,
+      threat_type: threat_type || 'SAKOB_POLICE_THREAT',
+      customer_name: customer_name || 'ลูกค้าขู่แจ้งความ/สคบ.',
+      message_text: message_text || 'จะไปแจ้ง สคบ และแจ้งความดำเนินคดีหลอกลวง'
+    });
+
+    res.json({ success: true, alert });
+  });
+
+  // 7. Automated Follow-Up Runner with interval logic
+  app.post('/api/followup/run', async (req: Request, res: Response) => {
+    const { psid, intervalName, page_id } = req.body;
+    const page = db.pages.find(p => p.page_id === page_id) || db.pages[0];
+
+    const targets = psid
+      ? db.customers.filter(c => c.psid === psid)
+      : db.customers.filter(c => c.status !== 'ORDER_COMPLETED');
+
+    const configuredFollowups = page.followup_messages || [];
+    const matchedFollowup = configuredFollowups.find(f => f.interval === intervalName);
+
+    const followUpMessages = matchedFollowup
+      ? [matchedFollowup.message]
+      : configuredFollowups.length
+      ? configuredFollowups.map(f => f.message)
+      : [
+          'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นเพิ่มเติมไหมคะ รับส่วนลดพิเศษแจ้งได้เลยนะคะ 😊',
+          'แจ้งเตือนสิทธิ์ของแถมและส่งฟรีวันนี้ สินค้ามีจำนวนจำกัดนะคะ สนใจรับสิทธิ์พิมพ์ 1 หรือแจ้งชื่อได้เลยค่ะ 🙏',
+          'โปรโมชั่นรอบพิเศษวันนี้ใกล้จะหมดแล้วนะคะ หากคุณพี่ต้องการให้จัดส่งพรุ่งนี้เช้าแจ้งที่อยู่ได้เลยค่ะ 📦'
+        ];
+
+    const results = [];
+    for (const target of targets) {
+      const selectedMsg = followUpMessages[Math.floor(Math.random() * followUpMessages.length)];
+      target.status = 'FOLLOW_UP_SENT';
+      target.last_interaction = new Date().toISOString();
+
+      addLog(
+        'FOLLOW_UP',
+        target.psid,
+        page.page_id,
+        `⏰ ส่งข้อความติดตามออเดอร์ (${intervalName || 'Follow-Up ตามเวลาที่ตั้งไว้'}) ให้ ${target.customer_name}: "${selectedMsg}"`,
+        'SUCCESS'
+      );
+
+      // Dispatch to Facebook Messenger if real PSID and Page Token available
+      if (target.psid) {
+        await sendFacebookMessage(page.page_access_token || '', target.psid, selectedMsg);
+      }
+
+      results.push({ psid: target.psid, name: target.customer_name, message: selectedMsg });
+    }
+
+    res.json({ success: true, processedCount: results.length, details: results });
+  });
+
+  // 8. Interactive Simulation endpoint
+  app.post('/api/simulate', async (req: Request, res: Response) => {
+    const { event_type, sender_id, page_id, message_text, comment_id } = req.body;
+    await handleWebhookPost(
+      {
+        body: {
+          event_type: event_type || 'MESSAGE',
+          sender_id: sender_id || `PSID_${Math.floor(1000000000 + Math.random() * 9000000000)}`,
+          page_id: page_id || 'AMULET_PAGE_ID',
+          message_text: message_text || 'สอบถามราคาครับ',
+          comment_id: comment_id || null
+        },
+        isInternal: true
+      } as any,
+      {
+        status: () => ({ json: () => {} }),
+        sendStatus: () => {}
+      } as any
+    );
+
+    res.json({
+      success: true,
+      latestLogs: db.logs.slice(0, 6),
+      ordersCount: db.orders.length,
+      customersCount: db.customers.length
+    });
+  });
+
+  // Vite Middleware for Dev & Static Serving in Production
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa'
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req: Request, res: Response) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  if (process.env.VERCEL !== '1') {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`=======================================================`);
+      console.log(`🚀 Facebook AI Auto-Sales Hub & Sheet CRM Ready`);
+      console.log(`📡 Server running on http://0.0.0.0:${PORT}`);
+      console.log(`🔗 Webhook GET/POST endpoint: /api/webhook/facebook`);
+      console.log(`=======================================================`);
+    });
+  }
+}
+
+startServer().catch(err => {
+  console.error('Fatal server startup error:', err);
+});
+
+export { app };
+export default app;
