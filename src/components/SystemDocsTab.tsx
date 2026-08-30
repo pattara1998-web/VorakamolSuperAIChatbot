@@ -140,7 +140,7 @@ function sanitizeAndExtractOrder(rawText: string, product: PageProductConfig) {
           rootCause: 'ไม่ได้ตั้งค่า GEMINI_API_KEY ในสภาพแวดล้อม (.env) หรือโควต้า API Key หมด',
           actionPlan: [
             '1. ตรวจสอบว่าไฟล์ .env มี GEMINI_API_KEY ที่ถูกต้อง',
-            '2. สลับโมเดล AI ในการตั้งค่าเพจเป็น gemini-3.7-flash หรือ gemini-2.5-flash เพื่อประหยัดโควต้า',
+            '2. สลับโมเดล AI ในการตั้งค่าเพจเป็น gemini-3.6-flash (แนะนำ) หรือ gemini-3.7-flash เพื่อประหยัดโควต้า',
             '3. ตรวจสอบสถานะการเชื่อมต่อที่หน้าแรกของระบบ'
           ],
           aiFixCode: `// Robust Gemini Fallback Engine

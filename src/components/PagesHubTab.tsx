@@ -96,7 +96,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
       avgTicket,
       topProduct: p.product?.product_name || p.page_name,
       adminName: p.admin_name || 'แอดมิน AI',
-      model: p.ai_model || 'gemini-2.5-flash',
+      model: p.ai_model || 'gemini-3.6-flash',
       avatar: p.page_avatar || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=200&h=200&q=80',
       cover: p.page_cover || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1200&q=80',
       followers: p.follower_count || 0,

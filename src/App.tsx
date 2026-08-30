@@ -158,7 +158,7 @@ export default function App() {
                 likes_count: item.fan_count || item.followers_count || 0,
                 inquiries_count: 0,
                 unread_messages: 0,
-                ai_model: 'gemini-2.5-flash',
+                ai_model: 'gemini-3.6-flash',
                 admin_name: 'แอดมิน AI',
                 ai_tone: 'FRIENDLY',
                 ai_custom_instructions: '',
@@ -251,6 +251,20 @@ export default function App() {
     fetchBackendData();
     const interval = setInterval(fetchBackendData, 3000);
     return () => clearInterval(interval);
+  }, []);
+
+  // Enforce AI setup: if no Gemini API key is configured on the server,
+  // automatically open the settings modal on startup so it cannot be
+  // forgotten — chat auto-reply is completely silent without the key.
+  useEffect(() => {
+    fetch('/api/settings')
+      .then(res => (res.ok ? res.json() : Promise.reject()))
+      .then(data => {
+        if (!data.geminiApiKeyConfigured) setIsAiSettingsOpen(true);
+      })
+      .catch(() => {
+        // Server unreachable — do not force the modal
+      });
   }, []);
 
   const handleSaveToBackend = async (collection: string, data: any[]) => {

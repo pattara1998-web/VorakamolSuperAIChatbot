@@ -220,29 +220,20 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [specsCategoryFilter, setSpecsCategoryFilter] = useState<'AUTO' | ProductCategory>('AUTO');
 
+  // NOTE: Google deprecated the gemini-2.5-* series for new API keys
+  // (NOT_FOUND). The server validates with gemini-3.6-flash first and
+  // auto-fallbacks deprecated selections via resolveAiModel().
   const geminiModels = [
     {
-      id: 'gemini-2.5-flash',
-      name: 'Gemini 2.5 Flash',
-      desc: 'ตอบสนองเร็วทันใจ ปิดการขายไว (โมเดลฟรี 100%)',
-      badge: 'FREE • เร็วสูงสุด'
-    },
-    {
-      id: 'gemini-2.5-pro',
-      name: 'Gemini 2.5 Pro',
-      desc: 'ฉลาดลึกซึ้ง สินค้าซับซ้อน พระเครื่อง สเปกไอที (โมเดลฟรี 100%)',
-      badge: 'FREE • ฉลาดสูงสุด'
-    },
-    {
-      id: 'gemini-2.5-flash-lite',
-      name: 'Gemini 2.5 Flash-Lite',
-      desc: 'ประหยัดโทเคน ทำงานเสถียร คนทักพร้อมกันจำนวนมาก (โมเดลฟรี 100%)',
-      badge: 'FREE • ประหยัด'
+      id: 'gemini-3.6-flash',
+      name: 'Gemini 3.6 Flash',
+      desc: 'ตอบสนองเร็วทันใจ ปิดการขายไว โมเดลล่าสุดที่ Google แนะนำ (ฟรี)',
+      badge: 'แนะนำ • เร็วสูงสุด'
     },
     {
       id: 'gemini-3.7-flash',
       name: 'Gemini 3.7 Flash',
-      desc: 'เหมาะกับงานที่ต้องวิเคราะห์หลายขั้นตอนและตอบตามข้อมูลสินค้า',
+      desc: 'เหมาะกับงานที่ต้องวิเคราะห์หลายขั้นตอนและตอบตามข้อมูลสินค้าซับซ้อน',
       badge: 'ใหม่ • ฉลาดสูง'
     }
   ];

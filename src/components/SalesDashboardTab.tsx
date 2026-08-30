@@ -181,7 +181,7 @@ export const SalesDashboardTab: React.FC<SalesDashboardTabProps> = ({
         avgTicket,
         profit: pageProfit,
         topProduct: p.product?.product_name || p.page_name,
-        model: p.ai_model || 'gemini-2.5-flash',
+        model: p.ai_model || 'gemini-3.6-flash',
         adminName: p.admin_name || 'แอดมิน'
       };
     }).sort((a, b) => b.revenue - a.revenue);

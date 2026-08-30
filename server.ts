@@ -42,6 +42,7 @@ interface DatabaseStore {
   settings: {
     geminiApiKey: string;
     geminiApiKeyUpdatedAt?: string;
+    geminiModel?: string;
   };
 }
 
@@ -445,6 +446,26 @@ function getGemini(): GoogleGenAI {
   return aiClient;
 }
 
+// ---------------------------------------------------------------------------
+// Central Gemini model resolution. Google periodically deprecates model IDs
+// (e.g. `gemini-2.5-flash` now returns NOT_FOUND for new API keys and Google
+// recommends `gemini-3.6-flash`). The /api/settings/gemini validator probes
+// GEMINI_MODEL_CANDIDATES newest-first and stores the first working model in
+// db.settings.geminiModel; resolveAiModel() routes every AI call through it so
+// a deprecated per-page model selection can never break chat replies.
+// ---------------------------------------------------------------------------
+const DEFAULT_GEMINI_MODEL = 'gemini-3.6-flash';
+const GEMINI_MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash'];
+const DEPRECATED_GEMINI_MODELS = new Set([
+  'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite',
+  'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'
+]);
+
+function resolveAiModel(preferred?: string): string {
+  if (preferred && !DEPRECATED_GEMINI_MODELS.has(preferred)) return preferred;
+  return db.settings.geminiModel || DEFAULT_GEMINI_MODEL;
+}
+
 const app = express();
 // Render (and most PaaS) injects a dynamic PORT env var; fall back to 3000 for local dev.
 const PORT = Number(process.env.PORT) || 3000;
@@ -512,25 +533,62 @@ async function startServer() {
     // Only return true/false if key exists to prevent exposing the key
     res.json({
       geminiApiKeyConfigured: !!(db.settings.geminiApiKey || process.env.GEMINI_API_KEY),
-      geminiApiKeyUpdatedAt: db.settings.geminiApiKeyUpdatedAt || null
+      geminiApiKeyUpdatedAt: db.settings.geminiApiKeyUpdatedAt || null,
+      geminiModel: db.settings.geminiModel || DEFAULT_GEMINI_MODEL
     });
   });
 
   app.post('/api/settings/gemini', async (req: Request, res: Response) => {
     const { apiKey } = req.body;
-    if (typeof apiKey === 'string' && apiKey.trim().length >= 10) {
-      try {
-        const validator = new GoogleGenAI({ apiKey: apiKey.trim() });
-        await validator.models.generateContent({ model: 'gemini-2.5-flash', contents: 'Reply only: OK', config: { maxOutputTokens: 2 } });
-        db.settings.geminiApiKey = apiKey.trim();
-        db.settings.geminiApiKeyUpdatedAt = new Date().toISOString();
-        persistData();
-        res.json({ success: true, message: 'Gemini API Key validated and saved.' });
-      } catch (error: any) {
-        res.status(400).json({ success: false, message: `ไม่สามารถยืนยัน Gemini API key ได้: ${error.message || 'โปรดตรวจสอบคีย์และโควต้า'}` });
+    if (!(typeof apiKey === 'string' && apiKey.trim().length >= 10)) {
+      return res.status(400).json({ success: false, message: 'Invalid API Key.' });
+    }
+    try {
+      const validator = new GoogleGenAI({ apiKey: apiKey.trim() });
+      // Google deprecates model IDs over time (gemini-2.5-flash now returns
+      // NOT_FOUND for new keys). Probe candidates newest-first and remember
+      // the first model that actually works for this key.
+      const candidates = Array.from(new Set([db.settings.geminiModel, ...GEMINI_MODEL_CANDIDATES].filter(Boolean))) as string[];
+      let workingModel = '';
+      let quotaLimited = false;
+      let lastError: any = null;
+      for (const model of candidates) {
+        try {
+          await validator.models.generateContent({ model, contents: 'Reply only: OK', config: { maxOutputTokens: 2 } });
+          workingModel = model;
+          break;
+        } catch (probeErr: any) {
+          lastError = probeErr;
+          const msg = String(probeErr?.message || '');
+          const status = Number(probeErr?.status || probeErr?.code || 0);
+          if (msg.includes('API key not valid') || msg.includes('API_KEY_INVALID') || status === 401 || status === 403) {
+            return res.status(400).json({ success: false, message: 'API Key ไม่ถูกต้องหรือถูกปิดใช้งาน โปรดคัดลอกคีย์ใหม่จาก Google AI Studio แล้วลองอีกครั้ง' });
+          }
+          if (status === 429 || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota')) {
+            // Key is valid but temporarily rate/quota limited — accept it.
+            workingModel = model;
+            quotaLimited = true;
+            break;
+          }
+          // NOT_FOUND (deprecated model) or other model error → try next candidate
+        }
       }
-    } else {
-      res.status(400).json({ success: false, message: 'Invalid API Key.' });
+      if (!workingModel) {
+        return res.status(400).json({ success: false, message: `ไม่สามารถยืนยัน Gemini API key ได้: ${lastError?.message || 'โปรดตรวจสอบคีย์และโควต้าการใช้งาน'}` });
+      }
+      db.settings.geminiApiKey = apiKey.trim();
+      db.settings.geminiModel = workingModel;
+      db.settings.geminiApiKeyUpdatedAt = new Date().toISOString();
+      persistData();
+      res.json({
+        success: true,
+        model: workingModel,
+        message: quotaLimited
+          ? `คีย์ถูกต้องและบันทึกแล้ว (ขณะนี้โควต้าถูกจำกัดชั่วคราว) ระบบจะใช้โมเดล ${workingModel}`
+          : `ยืนยันและบันทึก API Key สำเร็จ ระบบจะใช้โมเดล ${workingModel}`
+      });
+    } catch (error: any) {
+      res.status(400).json({ success: false, message: `ไม่สามารถยืนยัน Gemini API key ได้: ${error.message || 'โปรดตรวจสอบคีย์และโควต้าการใช้งาน'}` });
     }
   });
 
@@ -1643,7 +1701,7 @@ async function startServer() {
       }
 
       // AI Persona & Model Execution
-      const selectedModel = page.ai_model || 'gemini-3.7-flash';
+      const selectedModel = resolveAiModel(page.ai_model);
       const adminName = page.admin_name || 'แอดมิน';
       const aiTone = page.ai_tone || 'FRIENDLY';
       const customInstructions = page.ai_custom_instructions || 'ตอบสั้นกระชับ สุภาพ เหมือนแอดมินคนจริง และเน้นปิดการขาย';
@@ -2057,7 +2115,7 @@ ${textToParse}
 `;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3.7-flash',
+        model: resolveAiModel(),
         contents: parsePrompt,
         config: {
           responseMimeType: 'application/json',
@@ -2231,7 +2289,7 @@ ${JSON.stringify(categorySummary, null, 2)}
 
       const ai = getGemini();
       const response = await ai.models.generateContent({
-        model: 'gemini-3.7-flash',
+        model: resolveAiModel(),
         contents: [
           { text: copilotContext },
           ...(history && Array.isArray(history)
@@ -2463,7 +2521,7 @@ ${JSON.stringify(categorySummary, null, 2)}
 
       const ai = getGemini();
       const response = await ai.models.generateContent({
-        model: 'gemini-3.7-flash',
+        model: resolveAiModel(),
         contents: [
           {
             inlineData: {

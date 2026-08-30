@@ -413,7 +413,7 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
               <Facebook className="w-4 h-4 text-indigo-500" /> เพจ Facebook ที่กำลังทดสอบ
             </h3>
             <span className="text-[10px] font-mono font-bold bg-indigo-500/10 text-indigo-400 px-2 py-0.5 rounded border border-indigo-500/20">
-              {selectedPage.ai_model || 'gemini-2.5-flash'}
+              {selectedPage.ai_model || 'gemini-3.6-flash'}
             </span>
           </div>
 
@@ -607,7 +607,7 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
               <p className="text-[11px] text-zinc-400 flex items-center gap-2">
                 <span>แอดมิน: <strong className="text-indigo-400">{selectedPage.admin_name || 'น้องน้ำมนต์'}</strong></span>
                 <span>•</span>
-                <span>โมเดล: <code className="text-amber-400 font-mono">{selectedPage.ai_model || 'gemini-2.5-flash'}</code></span>
+                <span>โมเดล: <code className="text-amber-400 font-mono">{selectedPage.ai_model || 'gemini-3.6-flash'}</code></span>
                 <span>•</span>
                 <span>ตอบกลับใน 0.5s</span>
               </p>
