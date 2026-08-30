@@ -161,6 +161,37 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
 
   const currentSheetMeta = sheetsMeta.find(s => s.id === activeSheet)!;
 
+  // Feature 8: single source of truth for promotion tiers shared by Pages Hub & database editor.
+  // Prefer the real tiers already stored (custom names, free_shipping, gift_quantity); only fall
+  // back to plain price tiers derived from legacy price_1/2/3 columns — never invent gift/shipping claims.
+  const resolvePromotionTiers = (incoming: any, fallback: any, priceSource: any): any[] => {
+    // Propagate price_1/2/3 edits from the database sheet onto the matching tiers so both
+    // editors stay identical (the columns are derived from tier prices, so this is idempotent).
+    const applyPriceOverrides = (tiers: any[]) =>
+      tiers.map((t: any, i: number) => {
+        const edited = Number(priceSource?.[`price_${i + 1}`]);
+        return Number.isFinite(edited) && edited > 0 ? { ...t, price: edited } : t;
+      });
+    if (Array.isArray(incoming) && incoming.length) return applyPriceOverrides(incoming);
+    if (Array.isArray(fallback) && fallback.length) return applyPriceOverrides(fallback);
+    return [
+      { id: 'tier-1', name: '1 ชิ้น', quantity: 1, price: Number(priceSource?.price_1 ?? priceSource?.display_price ?? 0), description: '' },
+      { id: 'tier-2', name: '2 ชิ้น', quantity: 2, price: Number(priceSource?.price_2 ?? 0), description: String(priceSource?.promotion_detail || '') },
+      { id: 'tier-3', name: '3 ชิ้น', quantity: 3, price: Number(priceSource?.price_3 ?? 0), description: '' }
+    ];
+  };
+
+  // Keep the real promotion tiers already saved on the catalog row when the template form
+  // doesn't carry them, so editing the database never destroys Pages Hub promotion settings.
+  const mergeCatalogRow = (existing: any, incoming: any) => ({
+    ...existing,
+    ...incoming,
+    promotions:
+      Array.isArray(incoming?.promotions) && incoming.promotions.length
+        ? incoming.promotions
+        : existing?.promotions
+  });
+
   const handleSyncVercelDB = () => {
     setSyncStatus('กำลังซิงค์และดึงข้อมูลล่าสุดจาก Vercel Cloud Database & KV Storage...');
     
@@ -202,11 +233,7 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                     review: productData.image_review || '',
                     closing: productData.image_closing || ''
                   },
-                  promotions: [
-                    { id: 'tier-1', name: 'โปรโมชั่น 1 ชิ้น', quantity: 1, price: productData.price_1 || productData.display_price, description: '' },
-                    { id: 'tier-2', name: 'โปรโมชั่น 2 ชิ้น', quantity: 2, price: productData.price_2 || 0, description: productData.promotion_detail || '' },
-                    { id: 'tier-3', name: 'โปรโมชั่น 3 ชิ้น', quantity: 3, price: productData.price_3 || 0, description: '' }
-                  ],
+                  promotions: resolvePromotionTiers(productData.promotions, p.product?.promotions, productData),
                   specs: productData
                 },
                 sequence: {
@@ -306,9 +333,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
       let updated: ProductChina[];
       if (existingIdx >= 0) {
         updated = [...china];
-        updated[existingIdx] = productData;
+        updated[existingIdx] = mergeCatalogRow(china[existingIdx], productData);
       } else {
-        updated = [productData, ...china];
+        updated = [mergeCatalogRow({}, productData), ...china];
       }
       setChina(updated);
       onSaveToBackend('china', updated);
@@ -317,9 +344,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
       let updated: ProductAmulet[];
       if (existingIdx >= 0) {
         updated = [...amulet];
-        updated[existingIdx] = productData;
+        updated[existingIdx] = mergeCatalogRow(amulet[existingIdx], productData);
       } else {
-        updated = [productData, ...amulet];
+        updated = [mergeCatalogRow({}, productData), ...amulet];
       }
       setAmulet(updated);
       onSaveToBackend('amulet', updated);
@@ -328,9 +355,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
       let updated: ProductOtop[];
       if (existingIdx >= 0) {
         updated = [...otop];
-        updated[existingIdx] = productData;
+        updated[existingIdx] = mergeCatalogRow(otop[existingIdx], productData);
       } else {
-        updated = [productData, ...otop];
+        updated = [mergeCatalogRow({}, productData), ...otop];
       }
       setOtop(updated);
       onSaveToBackend('otop', updated);
@@ -339,9 +366,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
       let updated: ProductAgriculture[];
       if (existingIdx >= 0) {
         updated = [...agriculture];
-        updated[existingIdx] = productData;
+        updated[existingIdx] = mergeCatalogRow(agriculture[existingIdx], productData);
       } else {
-        updated = [productData, ...(agriculture || [])];
+        updated = [mergeCatalogRow({}, productData), ...(agriculture || [])];
       }
       setAgriculture(updated);
       onSaveToBackend('agriculture', updated);
@@ -361,9 +388,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                 product_id: productData.product_id,
                 product_name: productData.product_name,
                 category: productData.category || cat,
-                display_price: productData.display_price || productData.price_1 || 990,
-                base_price: productData.display_price || 990,
-                shipping_duration: productData.shipping_duration || 'จัดส่งด่วน 1-2 วันทำการ (Flash / Kerry)',
+                display_price: Number(productData.display_price ?? productData.price_1 ?? p.product.display_price ?? 0),
+                base_price: Number(productData.display_price ?? p.product.base_price ?? 0),
+                shipping_duration: productData.shipping_duration || p.product.shipping_duration || '',
                 description: productData.description || productData.detail_text || productData.belief_info || '',
                 images: {
                   main: productData.image_main || p.product.images.main,
@@ -372,38 +399,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                   review: productData.image_review || p.product.images.review,
                   closing: productData.image_closing || p.product.images.closing
                 },
-                promotions: [
-                  {
-                    id: 'promo-1',
-                    name: 'โปรโมชั่น 1 ชิ้น',
-                    quantity: 1,
-                    price: productData.price_1 || productData.display_price || 990,
-                    original_price: (productData.display_price || 990) * 1.5,
-                    free_gifts: productData.promotion_detail || 'ของแถมพิเศษ',
-                    description: 'จัดส่งฟรีเก็บเงินปลายทาง',
-                    is_popular: false
-                  },
-                  {
-                    id: 'promo-2',
-                    name: 'โปรโมชั่น 2 ชิ้น (สุดคุ้ม)',
-                    quantity: 2,
-                    price: productData.price_2 || (productData.price_1 ? productData.price_1 * 2 * 0.9 : 1800),
-                    original_price: (productData.display_price || 990) * 3,
-                    free_gifts: productData.promotion_detail || 'ของแถมพิเศษ 2 เท่า',
-                    description: 'เซตยอดนิยม ส่งฟรี',
-                    is_popular: true
-                  },
-                  {
-                    id: 'promo-3',
-                    name: 'โปรโมชั่น 3 ชิ้น (ชุดใหญ่)',
-                    quantity: 3,
-                    price: productData.price_3 || (productData.price_1 ? productData.price_1 * 3 * 0.8 : 2500),
-                    original_price: (productData.display_price || 990) * 4.5,
-                    free_gifts: productData.promotion_detail || 'ของแถมชุดใหญ่ครบเซ็ต',
-                    description: 'ประหยัดสูงสุด ส่งฟรี',
-                    is_popular: false
-                  }
-                ],
+                // Feature 8: reuse the SAME real promotion tiers (custom names, free_shipping,
+                // gift_quantity) instead of fabricating prices/gift/shipping claims.
+                promotions: resolvePromotionTiers(productData.promotions, p.product.promotions, productData),
                 specs: {
                   ...p.product.specs,
                   ...productData,

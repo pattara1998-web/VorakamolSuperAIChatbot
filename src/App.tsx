@@ -159,7 +159,7 @@ export default function App() {
                 inquiries_count: 0,
                 unread_messages: 0,
                 ai_model: 'gemini-3.6-flash',
-                admin_name: 'แอดมิน AI',
+                admin_name: 'น้ำหวาน',
                 ai_tone: 'FRIENDLY',
                 ai_custom_instructions: '',
                 ai_brevity_mode: false,
@@ -227,11 +227,35 @@ export default function App() {
   }, [theme]);
 
   // Fetch live state from backend
+  // Feature: ระบบจำค่าที่ตั้งไว้ — if the server restarted and lost its data
+  // (ephemeral disk on free hosting), restore from the browser's saved copy
+  // instead of letting the empty server response wipe everything the user set.
+  const hasRestoredFromLocal = React.useRef(false);
   const fetchBackendData = async () => {
     try {
       const res = await fetch('/api/data');
       if (res.ok) {
         const data = await res.json();
+        const serverPagesEmpty = !Array.isArray(data.pages) || data.pages.length === 0;
+        if (serverPagesEmpty && !hasRestoredFromLocal.current) {
+          const localPages = loadLocal<PageConfig[]>('pages', []);
+          if (localPages.length > 0) {
+            // Push locally-saved page settings back to the server (self-heal)
+            hasRestoredFromLocal.current = true;
+            try {
+              await fetch('/api/data/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ collection: 'pages', data: localPages })
+              });
+              console.info('🛡️ กู้คืนค่าที่ตั้งไว้ทั้งหมดจากเครื่องลูกค้ากลับสู่เซิร์ฟเวอร์แล้ว');
+            } catch {
+              // Server still offline — keep using local data
+            }
+            setPages(localPages);
+            return;
+          }
+        }
         if (data.pages) { setPages(data.pages); saveLocal('pages', data.pages); }
         if (data.amulet) { setAmulet(data.amulet); saveLocal('amulet', data.amulet); }
         if (data.china) { setChina(data.china); saveLocal('china', data.china); }
@@ -295,27 +319,41 @@ export default function App() {
       const prod = updatedPage.product;
       const cat = updatedPage.category;
 
+      // Honest promotion summary built ONLY from real values (Feature 8):
+      // gifts are mentioned only when named, "ส่งฟรี" only when checked.
+      const promotionPerkSummary = (prod.promotions || [])
+        .map((pr: any) => {
+          const perks: string[] = [];
+          if (pr.free_gifts && String(pr.free_gifts).trim()) {
+            perks.push(`แถม ${String(pr.free_gifts).trim()}${pr.gift_quantity ? ` ${pr.gift_quantity} ชิ้น` : ''}`);
+          }
+          if (pr.free_shipping === true) perks.push('ส่งฟรี');
+          return perks.length ? `${pr.name || `${pr.quantity || 1} ชิ้น`}: ${perks.join(' + ')}` : '';
+        })
+        .filter(Boolean)
+        .join(' | ');
+
       if (cat === 'CHINA') {
         const existingIdx = china.findIndex(c => c.page_id === updatedPage.page_id || c.product_id === prod.product_id);
         const item: ProductChina = {
           product_id: prod.product_id || `CHN-${Math.floor(100 + Math.random() * 900)}`,
           page_id: updatedPage.page_id,
           product_name: prod.product_name,
-          brand: prod.specs?.brand || (prod.specs as any)?.brand || 'SuperBrand',
+          brand: prod.specs?.brand || (prod.specs as any)?.brand || '',
           category: prod.category || 'CHINA',
           description: prod.description || '',
           features: prod.specs?.features || (prod.specs as any)?.features || prod.description || '',
-          material: prod.specs?.material || 'พลาสติก ABS เกรดสูง',
-          size: prod.specs?.size || prod.specs?.dimensions || 'มาตรฐาน',
-          weight: prod.specs?.weight || '250g',
-          usage: prod.specs?.usage || (prod.specs as any)?.usage || 'เสียบสายใช้งานได้ทันที',
-          benefit: prod.specs?.benefit || (prod.specs as any)?.benefit || 'สะดวกสบาย ประหยัดไฟ',
-          shipping_info: prod.specs?.shipping_info || prod.shipping_duration || 'จัดส่งด่วน 1-2 วัน มีบริการเก็บเงินปลายทาง',
+          material: prod.specs?.material || '',
+          size: prod.specs?.size || prod.specs?.dimensions || '',
+          weight: prod.specs?.weight || '',
+          usage: prod.specs?.usage || (prod.specs as any)?.usage || '',
+          benefit: prod.specs?.benefit || (prod.specs as any)?.benefit || '',
+          shipping_info: prod.specs?.shipping_info || prod.shipping_duration || '',
           display_price: prod.display_price || prod.base_price || 990,
           price_1: prod.promotions?.[0]?.price || prod.display_price || 990,
-          price_2: prod.promotions?.[1]?.price || (prod.display_price ? prod.display_price * 1.8 : 1800),
-          price_3: prod.promotions?.[2]?.price || (prod.display_price ? prod.display_price * 2.5 : 2500),
-          promotion_detail: prod.promotions?.[1]?.free_gifts || 'ซื้อ 2 ชิ้น ส่งฟรี COD',
+          price_2: prod.promotions?.[1]?.price ?? 0,
+          price_3: prod.promotions?.[2]?.price ?? 0,
+          promotion_detail: promotionPerkSummary || prod.promotions?.[1]?.description || '',
           shipping_duration: prod.shipping_duration,
           image_main: prod.images?.main || '',
           image_detail: prod.images?.detail || '',
@@ -325,11 +363,13 @@ export default function App() {
           opening_text: updatedPage.sequence?.step1_opening_text || '',
           detail_text: prod.description || '',
           promotion_text: updatedPage.sequence?.step3_promotion_detail || '',
-          review_text: '⭐⭐⭐⭐⭐ สินค้าคุณภาพดี ลูกค้าประทับใจ',
+          review_text: (existingIdx >= 0 ? china[existingIdx]?.review_text : '') || '',
           closing_text: updatedPage.sequence?.step6_closing_text || '',
           // Preserve every raw field (for example brand) entered in the product editor.
           ...(prod.specs || {}),
-          custom_specs: prod.specs?.custom_specs
+          custom_specs: prod.specs?.custom_specs,
+          // Round-trip the real promotion tiers (names, prices, free shipping, gift qty)
+          ...(prod.promotions?.length ? { promotions: prod.promotions } : {})
         };
         let newChina: ProductChina[];
         if (existingIdx >= 0) {
@@ -347,23 +387,23 @@ export default function App() {
           page_id: updatedPage.page_id,
           product_name: prod.product_name,
           category: prod.category || 'AMULET',
-          temple: prod.specs?.temple || prod.specs?.origin_or_temple || 'วัดช้างให้',
-          master: prod.specs?.master || prod.specs?.master_or_maker || 'พระอาจารย์ทิม',
-          year: prod.specs?.year || prod.specs?.ceremony_or_batch || '2508',
-          edition: prod.specs?.edition || prod.specs?.ceremony_or_batch || 'รุ่นเลื่อนสมณศักดิ์',
-          material: prod.specs?.material || 'เนื้อทองแดงรมดำ',
-          quantity: Number(prod.specs?.quantity) || 1,
-          history: prod.specs?.history || (prod.specs as any)?.history || 'ประวัติการจัดสร้างเข้มขลัง',
-          belief_info: prod.specs?.belief_info || (prod.specs as any)?.belief_info || 'เมตตามหานิยม แคล้วคลาดปลอดภัย',
-          spell: prod.specs?.spell || prod.specs?.spell_or_instructions || 'นะโม โพธิสัตโต อาคันติมายะ อิติภะคะวา',
-          worship_method: prod.specs?.worship_method || (prod.specs as any)?.worship_method || 'พกติดตัว เลี่ยมกรอบบูชา',
-          care_instruction: prod.specs?.care_instruction || (prod.specs as any)?.care_instruction || 'เก็บในที่สะอาด',
-          warning: prod.specs?.warning || (prod.specs as any)?.warning || 'ไม่สวมใส่เข้าที่อโคจร',
+          temple: prod.specs?.temple || prod.specs?.origin_or_temple || '',
+          master: prod.specs?.master || prod.specs?.master_or_maker || '',
+          year: prod.specs?.year || prod.specs?.ceremony_or_batch || '',
+          edition: prod.specs?.edition || prod.specs?.ceremony_or_batch || '',
+          material: prod.specs?.material || '',
+          quantity: Number(prod.specs?.quantity) || 0,
+          history: prod.specs?.history || (prod.specs as any)?.history || '',
+          belief_info: prod.specs?.belief_info || (prod.specs as any)?.belief_info || '',
+          spell: prod.specs?.spell || prod.specs?.spell_or_instructions || '',
+          worship_method: prod.specs?.worship_method || (prod.specs as any)?.worship_method || '',
+          care_instruction: prod.specs?.care_instruction || (prod.specs as any)?.care_instruction || '',
+          warning: prod.specs?.warning || (prod.specs as any)?.warning || '',
           display_price: prod.display_price || prod.base_price || 990,
           price_1: prod.promotions?.[0]?.price || prod.display_price || 990,
-          price_2: prod.promotions?.[1]?.price || (prod.display_price ? prod.display_price * 1.8 : 1800),
-          price_3: prod.promotions?.[2]?.price || (prod.display_price ? prod.display_price * 2.5 : 2500),
-          promotion_detail: prod.promotions?.[1]?.free_gifts || 'บูชา 2 องค์ รับแถมผ้ายันต์',
+          price_2: prod.promotions?.[1]?.price ?? 0,
+          price_3: prod.promotions?.[2]?.price ?? 0,
+          promotion_detail: promotionPerkSummary || prod.promotions?.[1]?.description || '',
           shipping_duration: prod.shipping_duration,
           image_main: prod.images?.main || '',
           image_detail: prod.images?.detail || '',
@@ -373,10 +413,12 @@ export default function App() {
           opening_text: updatedPage.sequence?.step1_opening_text || '',
           detail_text: prod.description || '',
           promotion_text: updatedPage.sequence?.step3_promotion_detail || '',
-          review_text: '⭐⭐⭐⭐⭐ พุทธคุณเด่น การันตีพระแท้',
+          review_text: (existingIdx >= 0 ? amulet[existingIdx]?.review_text : '') || '',
           closing_text: updatedPage.sequence?.step6_closing_text || '',
           ...(prod.specs || {}),
-          custom_specs: prod.specs?.custom_specs
+          custom_specs: prod.specs?.custom_specs,
+          // Round-trip the real promotion tiers (names, prices, free shipping, gift qty)
+          ...(prod.promotions?.length ? { promotions: prod.promotions } : {})
         };
         let newAmulet: ProductAmulet[];
         if (existingIdx >= 0) {
@@ -394,24 +436,24 @@ export default function App() {
           page_id: updatedPage.page_id,
           product_name: prod.product_name,
           category: prod.category || 'OTOP',
-          community: prod.specs?.community || (prod.specs as any)?.community || 'วิสาหกิจชุมชนไทย',
-          province: prod.specs?.province || (prod.specs as any)?.province || 'เชียงใหม่',
-          maker: prod.specs?.maker || prod.specs?.master_or_maker || 'กลุ่มแม่บ้านเกษตรกร',
-          origin: prod.specs?.origin || prod.specs?.origin_or_temple || 'แหล่งผลิตธรรมชาติ',
-          story: prod.specs?.story || (prod.specs as any)?.story || 'เรื่องราวภูมิปัญญาชาวบ้าน',
-          production_method: prod.specs?.production_method || (prod.specs as any)?.production_method || 'ทอมือโบราณ',
-          material: prod.specs?.material || 'วัตถุดิบธรรมชาติ',
-          size: prod.specs?.size || prod.specs?.dimensions || 'มาตรฐาน',
-          weight: prod.specs?.weight || '300g',
-          usage: prod.specs?.usage || (prod.specs as any)?.usage || 'พร้อมรับประทาน/สวมใส่',
-          benefit: prod.specs?.benefit || (prod.specs as any)?.benefit || 'คุณภาพมาตรฐาน อย. / OTOP 5 ดาว',
-          care_instruction: prod.specs?.care_instruction || (prod.specs as any)?.care_instruction || 'เก็บในอุณหภูมิปกติ',
+          community: prod.specs?.community || (prod.specs as any)?.community || '',
+          province: prod.specs?.province || (prod.specs as any)?.province || '',
+          maker: prod.specs?.maker || prod.specs?.master_or_maker || '',
+          origin: prod.specs?.origin || prod.specs?.origin_or_temple || '',
+          story: prod.specs?.story || (prod.specs as any)?.story || '',
+          production_method: prod.specs?.production_method || (prod.specs as any)?.production_method || '',
+          material: prod.specs?.material || '',
+          size: prod.specs?.size || prod.specs?.dimensions || '',
+          weight: prod.specs?.weight || '',
+          usage: prod.specs?.usage || (prod.specs as any)?.usage || '',
+          benefit: prod.specs?.benefit || (prod.specs as any)?.benefit || '',
+          care_instruction: prod.specs?.care_instruction || (prod.specs as any)?.care_instruction || '',
           warning: prod.specs?.warning || (prod.specs as any)?.warning || '',
           display_price: prod.display_price || prod.base_price || 990,
           price_1: prod.promotions?.[0]?.price || prod.display_price || 990,
-          price_2: prod.promotions?.[1]?.price || (prod.display_price ? prod.display_price * 1.8 : 1800),
-          price_3: prod.promotions?.[2]?.price || (prod.display_price ? prod.display_price * 2.5 : 2500),
-          promotion_detail: prod.promotions?.[1]?.free_gifts || 'ซื้อ 2 ชุด แถมฟรีของสมนาคุณ',
+          price_2: prod.promotions?.[1]?.price ?? 0,
+          price_3: prod.promotions?.[2]?.price ?? 0,
+          promotion_detail: promotionPerkSummary || prod.promotions?.[1]?.description || '',
           shipping_duration: prod.shipping_duration,
           image_main: prod.images?.main || '',
           image_detail: prod.images?.detail || '',
@@ -421,10 +463,12 @@ export default function App() {
           opening_text: updatedPage.sequence?.step1_opening_text || '',
           detail_text: prod.description || '',
           promotion_text: updatedPage.sequence?.step3_promotion_detail || '',
-          review_text: '⭐⭐⭐⭐⭐ OTOP 5 ดาว ของแท้ ส่งตรงจากชุมชน',
+          review_text: (existingIdx >= 0 ? otop[existingIdx]?.review_text : '') || '',
           closing_text: updatedPage.sequence?.step6_closing_text || '',
           ...(prod.specs || {}),
-          custom_specs: prod.specs?.custom_specs
+          custom_specs: prod.specs?.custom_specs,
+          // Round-trip the real promotion tiers (names, prices, free shipping, gift qty)
+          ...(prod.promotions?.length ? { promotions: prod.promotions } : {})
         };
         let newOtop: ProductOtop[];
         if (existingIdx >= 0) {
@@ -453,23 +497,23 @@ export default function App() {
           sunlight_requirement: prod.specs?.sunlight_requirement || '',
           suitable_temperature: prod.specs?.suitable_temperature || '',
           watering_method: prod.specs?.watering_method || '',
-          usage_instructions: prod.specs?.usage_instructions || prod.specs?.spell_or_instructions || 'ผสมน้ำ 20-30 ซีซี ต่อน้ำ 20 ลิตร ฉีดพ่นทางใบ',
-          benefits: prod.specs?.benefits || (prod.specs as any)?.benefits || 'เพิ่มผลผลิต พืชโตไว ใบเขียวเข้ม',
+          usage_instructions: prod.specs?.usage_instructions || prod.specs?.spell_or_instructions || '',
+          benefits: prod.specs?.benefits || (prod.specs as any)?.benefits || '',
           harvest_time: prod.specs?.harvest_time || '',
           expected_yield: prod.specs?.expected_yield || '',
           storage_method: prod.specs?.storage_method || '',
           seed_quantity: prod.specs?.seed_quantity || '',
-          brand: prod.specs?.brand || (prod.specs as any)?.brand || 'SuperAgri Bio',
-          formula_or_type: prod.specs?.formula_or_type || (prod.specs as any)?.formula_or_type || 'อะมิโนเข้มข้น เร่งราก',
-          suitable_for: prod.specs?.suitable_for || (prod.specs as any)?.suitable_for || 'ข้าว พืชไร่ ไม้ผลทุกชนิด',
-          registration_number: prod.specs?.registration_number || (prod.specs as any)?.registration_number || 'รส. กรมวิชาการเกษตร',
-          package_size: prod.specs?.package_size || prod.specs?.dimensions || '1 ลิตร',
-          safety_warning: prod.specs?.safety_warning || (prod.specs as any)?.safety_warning || 'เก็บให้พ้นมือเด็กและแสงแดด',
+          brand: prod.specs?.brand || (prod.specs as any)?.brand || '',
+          formula_or_type: prod.specs?.formula_or_type || (prod.specs as any)?.formula_or_type || '',
+          suitable_for: prod.specs?.suitable_for || (prod.specs as any)?.suitable_for || '',
+          registration_number: prod.specs?.registration_number || (prod.specs as any)?.registration_number || '',
+          package_size: prod.specs?.package_size || prod.specs?.dimensions || '',
+          safety_warning: prod.specs?.safety_warning || (prod.specs as any)?.safety_warning || '',
           display_price: prod.display_price || prod.base_price || 990,
           price_1: prod.promotions?.[0]?.price || prod.display_price || 990,
-          price_2: prod.promotions?.[1]?.price || (prod.display_price ? prod.display_price * 1.8 : 1800),
-          price_3: prod.promotions?.[2]?.price || (prod.display_price ? prod.display_price * 2.5 : 2500),
-          promotion_detail: prod.promotions?.[1]?.free_gifts || 'ซื้อ 2 ขวด แถมฟรีฮอร์โมนเร่งราก 1 ซอง ส่งฟรี COD',
+          price_2: prod.promotions?.[1]?.price ?? 0,
+          price_3: prod.promotions?.[2]?.price ?? 0,
+          promotion_detail: promotionPerkSummary || prod.promotions?.[1]?.description || '',
           shipping_duration: prod.shipping_duration,
           image_main: prod.images?.main || '',
           image_detail: prod.images?.detail || '',
@@ -479,10 +523,12 @@ export default function App() {
           opening_text: updatedPage.sequence?.step1_opening_text || '',
           detail_text: prod.description || '',
           promotion_text: updatedPage.sequence?.step3_promotion_detail || '',
-          review_text: '⭐⭐⭐⭐⭐ เกษตรกรใช้จริง ผลผลิตเพิ่มขึ้นเท่าตัว',
+          review_text: (existingIdx >= 0 ? (agriculture || [])[existingIdx]?.review_text : '') || '',
           closing_text: updatedPage.sequence?.step6_closing_text || '',
           ...(prod.specs || {}),
-          custom_specs: prod.specs?.custom_specs
+          custom_specs: prod.specs?.custom_specs,
+          // Round-trip the real promotion tiers (names, prices, free shipping, gift qty)
+          ...(prod.promotions?.length ? { promotions: prod.promotions } : {})
         };
         let newAgri: ProductAgriculture[];
         if (existingIdx >= 0) {
@@ -505,6 +551,12 @@ export default function App() {
 
   const handleBulkToggle = (enable: boolean) => {
     const updatedPages = pages.map(p => ({ ...p, is_active: enable }));
+    setPages(updatedPages);
+    handleSaveToBackend('pages', updatedPages);
+  };
+
+  const handleUpdatePageTag = (pageId: string, tag: 'NORMAL' | 'EMPTY' | 'RETIRED') => {
+    const updatedPages = pages.map(p => (p.page_id === pageId ? { ...p, page_tag: tag } : p));
     setPages(updatedPages);
     handleSaveToBackend('pages', updatedPages);
   };
@@ -610,6 +662,7 @@ export default function App() {
             onBulkToggle={handleBulkToggle}
             onOpenConnectModal={() => setIsConnectModalOpen(true)}
             onAddNewPage={handleAddNewPage}
+            onUpdatePageTag={handleUpdatePageTag}
           />
         )}
 

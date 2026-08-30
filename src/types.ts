@@ -8,11 +8,13 @@ export interface CustomSpecItem {
 
 export interface PromotionTier {
   id: string;
-  name: string; // e.g. "โปรโมชั่น 1 ชิ้น (ชุดทดลอง)"
+  name: string; // e.g. "โปรโมชั่น 1 ชิ้น (ชุดทดลอง)" — กำหนดชื่อเองได้ AI จะเข้าใจตามชื่อนี้
   quantity: number;
   price: number;
   original_price?: number;
-  free_gifts?: string;
+  free_gifts?: string; // ชื่อ/รายละเอียดของแถม (ข้อความอิสระ)
+  gift_quantity?: number; // จำนวนของแถมต่อแพ็กเกจ (0 หรือเว้นว่าง = ไม่มีของแถม)
+  free_shipping?: boolean; // ติ๊กเฉพาะเมื่อส่งฟรีจริงเท่านั้น — AI ห้ามบอกส่งฟรีถ้าไม่ได้ติ๊ก
   description: string;
   is_popular?: boolean;
 }
@@ -239,8 +241,12 @@ export interface PageConfig {
 
   google_sheet_url?: string;
 
+  // Page tag for organization in Pages Hub:
+  // 'NORMAL' = ใช้งานปกติ, 'EMPTY' = เพจว่าง, 'RETIRED' = เพจไม่ได้ใช้แล้ว
+  page_tag?: 'NORMAL' | 'EMPTY' | 'RETIRED';
+
   // AI Model & Persona settings
-  ai_model: string; // e.g. 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-3.7-flash', etc.
+  ai_model: string; // e.g. 'gemini-3.6-flash', 'gemini-3.7-flash', 'ollama:<model>', 'lmstudio:<model>'
   admin_name: string; // e.g. 'แอดมินน้ำผึ้ง', 'แอดมินปลา'
   ai_tone: 'FRIENDLY' | 'PROFESSIONAL' | 'SACRED' | 'FAST_CLOSING';
   ai_custom_instructions: string;

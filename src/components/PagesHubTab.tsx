@@ -23,9 +23,23 @@ import {
   MoreVertical,
   Layers,
   ArrowUpRight,
-  Bot
+  Bot,
+  Tag
 } from 'lucide-react';
 import { PageConfig, Order, Customer, ProductCategory } from '../types';
+
+// แท็กหมวดหมู่ของเพจ (Feature: แท็กเพจว่าง / เพจไม่ได้ใช้แล้ว)
+const PAGE_TAG_META: Record<'NORMAL' | 'EMPTY' | 'RETIRED', { label: string; emoji: string; classes: string }> = {
+  NORMAL: { label: 'ใช้งานปกติ', emoji: '🏷️', classes: 'bg-slate-100 text-slate-700 border-slate-200 dark:bg-zinc-800 dark:text-zinc-300 dark:border-zinc-700' },
+  EMPTY: { label: 'เพจว่าง', emoji: '📭', classes: 'bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-800/60' },
+  RETIRED: { label: 'ไม่ได้ใช้แล้ว', emoji: '🗄️', classes: 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-800/60' }
+};
+
+const NEXT_PAGE_TAG: Record<'NORMAL' | 'EMPTY' | 'RETIRED', 'NORMAL' | 'EMPTY' | 'RETIRED'> = {
+  NORMAL: 'EMPTY',
+  EMPTY: 'RETIRED',
+  RETIRED: 'NORMAL'
+};
 
 interface PagesHubTabProps {
   pages: PageConfig[];
@@ -37,6 +51,7 @@ interface PagesHubTabProps {
   onBulkToggle: (enable: boolean) => void;
   onOpenConnectModal: () => void;
   onAddNewPage: (newPage: PageConfig) => void;
+  onUpdatePageTag: (pageId: string, tag: 'NORMAL' | 'EMPTY' | 'RETIRED') => void;
 }
 
 export const PagesHubTab: React.FC<PagesHubTabProps> = ({
@@ -48,11 +63,13 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
   onTogglePageStatus,
   onBulkToggle,
   onOpenConnectModal,
-  onAddNewPage
+  onAddNewPage,
+  onUpdatePageTag
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [selectedStatus, setSelectedStatus] = useState<'ALL' | 'ACTIVE' | 'PAUSED'>('ALL');
+  const [selectedTag, setSelectedTag] = useState<'ALL' | 'NORMAL' | 'EMPTY' | 'RETIRED'>('ALL');
   const [viewMode, setViewMode] = useState<'grid' | 'table'>('grid');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -62,7 +79,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
   const [newPageCategory, setNewPageCategory] = useState<ProductCategory>('AMULET');
   const [newProductName, setNewProductName] = useState('');
   const [newProductPrice, setNewProductPrice] = useState('990');
-  const [newAdminName, setNewAdminName] = useState('แอดมิน AI');
+  const [newAdminName, setNewAdminName] = useState('น้ำหวาน');
 
   const copyPageId = (id: string) => {
     navigator.clipboard.writeText(id);
@@ -95,7 +112,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
       conversion,
       avgTicket,
       topProduct: p.product?.product_name || p.page_name,
-      adminName: p.admin_name || 'แอดมิน AI',
+      adminName: p.admin_name || 'น้ำหวาน',
       model: p.ai_model || 'gemini-3.6-flash',
       avatar: p.page_avatar || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=200&h=200&q=80',
       cover: p.page_cover || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1200&q=80',
@@ -118,8 +135,10 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
       selectedStatus === 'ALL' ||
       (selectedStatus === 'ACTIVE' && p.is_active) ||
       (selectedStatus === 'PAUSED' && !p.is_active);
+    const pageTag = p.page_tag || 'NORMAL';
+    const matchesTag = selectedTag === 'ALL' || pageTag === selectedTag;
 
-    return matchesSearch && matchesCategory && matchesStatus;
+    return matchesSearch && matchesCategory && matchesStatus && matchesTag;
   });
 
   const totalActivePages = pages.filter(p => p.is_active).length;
@@ -151,8 +170,8 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
       is_active: true,
       auto_reply: true,
       auto_close_ai: true,
-      ai_model: 'gemini-3.7-flash',
-      admin_name: newAdminName || 'แอดมิน AI',
+      ai_model: 'gemini-3.6-flash',
+      admin_name: newAdminName || 'น้ำหวาน',
       ai_tone: newPageCategory === 'AMULET' ? 'SACRED' : newPageCategory === 'CHINA' ? 'FAST_CLOSING' : 'FRIENDLY',
       ai_custom_instructions: 'ตอบลูกค้าด้วยความสุภาพ แนะนำโปรโมชั่นและเก็บเงินปลายทางทันที',
       ai_brevity_mode: true,
@@ -368,6 +387,19 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
               <option value="ACTIVE">🟢 เปิดใช้งาน AI</option>
               <option value="PAUSED">⚪ พักชั่วคราว</option>
             </select>
+
+            {/* Page Tag Filter (แท็กเพจ) */}
+            <select
+              value={selectedTag}
+              onChange={e => setSelectedTag(e.target.value as any)}
+              className="bg-slate-50 dark:bg-[#141418] border border-slate-200 dark:border-zinc-800 rounded-xl px-3 py-2 text-xs font-medium text-slate-800 dark:text-zinc-300 focus:outline-none focus:border-indigo-500"
+              title="กรองตามแท็กของเพจ"
+            >
+              <option value="ALL">แท็กทั้งหมด</option>
+              <option value="NORMAL">🏷️ ใช้งานปกติ</option>
+              <option value="EMPTY">📭 เพจว่าง</option>
+              <option value="RETIRED">🗄️ เพจไม่ได้ใช้แล้ว</option>
+            </select>
           </div>
 
           {/* View Mode & Quick Bulk Controls */}
@@ -439,6 +471,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
               setSearchQuery('');
               setSelectedCategory('ALL');
               setSelectedStatus('ALL');
+              setSelectedTag('ALL');
             }}
             className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all"
           >
@@ -469,11 +502,19 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
                   />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-black/20 to-transparent" />
 
-                  {/* Category Pill on top-left */}
-                  <div className="absolute top-3 left-3">
+                  {/* Category Pill & Page Tag on top-left */}
+                  <div className="absolute top-3 left-3 flex items-center gap-1.5">
                     <span className="px-2.5 py-1 rounded-md text-[11px] font-bold backdrop-blur-md bg-white/95 text-slate-900 border border-slate-200/80 flex items-center gap-1 shadow-xs">
                       {p.category === 'AMULET' ? '📿 พระเครื่อง' : p.category === 'CHINA' ? '🏮 สินค้านำเข้า/ไอที' : p.category === 'AGRICULTURE' ? '🌾 สินค้าการเกษตร' : '🌿 OTOP 5 ดาว'}
                     </span>
+                    <button
+                      onClick={() => onUpdatePageTag(p.page_id, NEXT_PAGE_TAG[p.page_tag || 'NORMAL'])}
+                      className={`px-2 py-1 rounded-md text-[10px] font-bold backdrop-blur-md border flex items-center gap-1 shadow-xs transition-all hover:scale-105 ${PAGE_TAG_META[p.page_tag || 'NORMAL'].classes}`}
+                      title="คลิกเพื่อเปลี่ยนแท็กเพจ (ใช้งานปกติ → เพจว่าง → ไม่ได้ใช้แล้ว)"
+                    >
+                      <Tag className="w-3 h-3" />
+                      {PAGE_TAG_META[p.page_tag || 'NORMAL'].emoji} {PAGE_TAG_META[p.page_tag || 'NORMAL'].label}
+                    </button>
                   </div>
 
                   {/* Status Indicator & Power Toggle on top-right */}
@@ -654,6 +695,14 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
                           <div>
                             <span className="font-bold text-slate-900 dark:text-zinc-100 block">{p.page_name}</span>
                             <span className="text-[11px] text-slate-500 font-mono">ID: {p.page_id}</span>
+                            <button
+                              onClick={() => onUpdatePageTag(p.page_id, NEXT_PAGE_TAG[p.page_tag || 'NORMAL'])}
+                              className={`mt-1 px-2 py-0.5 rounded-full text-[10px] font-bold border flex items-center gap-1 transition-all hover:scale-105 ${PAGE_TAG_META[p.page_tag || 'NORMAL'].classes}`}
+                              title="คลิกเพื่อเปลี่ยนแท็กเพจ (ใช้งานปกติ → เพจว่าง → ไม่ได้ใช้แล้ว)"
+                            >
+                              <Tag className="w-3 h-3" />
+                              {PAGE_TAG_META[p.page_tag || 'NORMAL'].emoji} {PAGE_TAG_META[p.page_tag || 'NORMAL'].label}
+                            </button>
                           </div>
                         </div>
                       </td>

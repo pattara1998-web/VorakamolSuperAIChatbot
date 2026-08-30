@@ -96,8 +96,8 @@ function createDefaultPageTemplate(): PageConfig {
     follower_count: 0,
     likes_count: 0,
     inquiries_count: 0,
-    ai_model: 'gemini-3.7-flash',
-    admin_name: 'แอดมิน AI',
+    ai_model: 'gemini-3.6-flash',
+    admin_name: 'น้ำหวาน',
     ai_tone: 'FRIENDLY',
     ai_custom_instructions: 'ตอบลูกค้าด้วยความสุภาพ แนะนำโปรโมชั่นและเก็บเงินปลายทางทันที',
     ai_brevity_mode: true,
@@ -271,6 +271,9 @@ function syncCatalogFromPages() {
       price_1: page.product.promotions?.[0]?.price ?? current.price_1 ?? page.product.display_price,
       price_2: page.product.promotions?.[1]?.price ?? current.price_2 ?? 0,
       price_3: page.product.promotions?.[2]?.price ?? current.price_3 ?? 0,
+      // Feature 8: keep the SAME real promotion tiers (custom names, free_shipping, gift_quantity)
+      // on the catalog row so the database editor and Pages Hub always show identical data.
+      promotions: page.product.promotions?.length ? page.product.promotions : current.promotions,
       promotion_detail: page.product.promotions?.[1]?.description || current.promotion_detail || '',
       shipping_duration: page.product.shipping_duration || current.shipping_duration,
       image_main: page.product.images?.main || current.image_main || '', image_detail: page.product.images?.detail || current.image_detail || '',
@@ -395,33 +398,38 @@ async function dispatchOrderSummary(order: Order, page: PageConfig) {
 
   const dispatchContent = `📦 [คำสั่งซื้อใหม่ - เก็บเงินปลายทาง]\nเพจ: ${page.page_name}\n----------------------------------\n${formattedSummary}\n----------------------------------\nยอดเรียกเก็บ: ฿${order.total_amount.toLocaleString()}\nสถานะ: ส่งสรุปยอดเรียบร้อย ✅`;
 
+  // Per-channel delivery results so callers (e.g. /api/notifications/test) can
+  // report the REAL outcome instead of assuming success.
+  let telegramResult: { success: boolean; skipped?: boolean; error?: string } = { success: false, skipped: true, error: 'CHANNEL_DISABLED' };
+  let lineResult: { success: boolean; skipped?: boolean; error?: string } = { success: false, skipped: true, error: 'CHANNEL_DISABLED' };
+
   // Send to Telegram if enabled
   if ((channel === 'TELEGRAM' || channel === 'BOTH') && deliverTelegram) {
-    const sent = await deliverTelegram(page, dispatchContent);
+    telegramResult = await deliverTelegram(page, dispatchContent);
     addLog(
       'INFO',
       'TELEGRAM_BOT',
       page.page_id,
-      sent.success ? `✈️ ส่งสรุปยอด COD ไปยัง Telegram (${page.telegram_chat_id || 'CHANNEL'}):\n${formattedSummary.replace(/\n/g, ' | ')}` : '❌ ส่งสรุปยอด COD ไปยัง Telegram ไม่สำเร็จ',
-      sent.success ? 'SUCCESS' : 'ERROR',
+      telegramResult.success ? `✈️ ส่งสรุปยอด COD ไปยัง Telegram (${page.telegram_chat_id || 'CHANNEL'}):\n${formattedSummary.replace(/\n/g, ' | ')}` : '❌ ส่งสรุปยอด COD ไปยัง Telegram ไม่สำเร็จ',
+      telegramResult.success ? 'SUCCESS' : 'ERROR',
       { order_id: order.order_id, target: 'TELEGRAM' }
     );
   }
 
   // Send to LINE if enabled
   if ((channel === 'LINE' || channel === 'BOTH') && deliverLine) {
-    const sent = await deliverLine(page, dispatchContent);
+    lineResult = await deliverLine(page, dispatchContent);
     addLog(
       'LINE_ALERT',
       'LINE_BOT',
       page.page_id,
-      sent.success ? `📲 ส่งสรุปยอด COD ไปยังกลุ่ม LINE (${page.line_group_id || 'DEFAULT'}):\n${formattedSummary.replace(/\n/g, ' | ')}` : '❌ ส่งสรุปยอด COD ไปยัง LINE ไม่สำเร็จ',
-      sent.success ? 'SUCCESS' : 'ERROR',
+      lineResult.success ? `📲 ส่งสรุปยอด COD ไปยังกลุ่ม LINE (${page.line_group_id || 'DEFAULT'}):\n${formattedSummary.replace(/\n/g, ' | ')}` : '❌ ส่งสรุปยอด COD ไปยัง LINE ไม่สำเร็จ',
+      lineResult.success ? 'SUCCESS' : 'ERROR',
       { order_id: order.order_id, target: 'LINE' }
     );
   }
 
-  return formattedSummary;
+  return { formattedSummary, telegram: telegramResult, line: lineResult };
 }
 
 // Lazy Gemini AI client
@@ -462,6 +470,11 @@ const DEPRECATED_GEMINI_MODELS = new Set([
 ]);
 
 function resolveAiModel(preferred?: string): string {
+  // Local AI models (ollama:*/lmstudio:*) run in the user's browser and are
+  // unreachable from this cloud server — always fall back to Gemini here.
+  if (preferred && (preferred.startsWith('ollama:') || preferred.startsWith('lmstudio:'))) {
+    return db.settings.geminiModel || DEFAULT_GEMINI_MODEL;
+  }
   if (preferred && !DEPRECATED_GEMINI_MODELS.has(preferred)) return preferred;
   return db.settings.geminiModel || DEFAULT_GEMINI_MODEL;
 }
@@ -1218,14 +1231,14 @@ async function startServer() {
           is_active: existing?.is_active ?? true,
           auto_reply: existing?.auto_reply ?? true,
           auto_close_ai: existing?.auto_close_ai ?? true,
-          ai_model: existing?.ai_model || 'gemini-3.7-flash',
+          ai_model: existing?.ai_model || 'gemini-3.6-flash',
           category: cat,
           page_avatar: fbPage.picture?.data?.url || existing?.page_avatar || basePage.page_avatar,
           page_cover: existing?.page_cover || basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
           follower_count: fbPage.followers_count || fbPage.fan_count || existing?.follower_count || 15000,
           likes_count: fbPage.fan_count || existing?.likes_count || 12000,
           inquiries_count: existing?.inquiries_count || 0,
-          admin_name: existing?.admin_name || 'แอดมิน AI',
+          admin_name: existing?.admin_name || 'น้ำหวาน',
           ai_tone: existing?.ai_tone || 'FRIENDLY',
           ai_custom_instructions: existing?.ai_custom_instructions || 'ตอบลูกค้าด้วยความสุภาพ แนะนำโปรโมชั่นและเก็บเงินปลายทางทันที',
           ai_brevity_mode: existing?.ai_brevity_mode ?? true
@@ -1310,14 +1323,14 @@ async function startServer() {
           is_active: true,
           auto_reply: true,
           auto_close_ai: true,
-          ai_model: 'gemini-3.7-flash',
+          ai_model: 'gemini-3.6-flash',
           category: detectedCategory,
           page_avatar: data.picture?.data?.url || basePage.page_avatar,
           page_cover: basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
           follower_count: data.followers_count || data.fan_count || 12000,
           likes_count: data.fan_count || 10000,
           inquiries_count: 0,
-          admin_name: 'แอดมิน AI',
+          admin_name: 'น้ำหวาน',
           ai_tone: 'FRIENDLY',
           ai_custom_instructions: 'ตอบลูกค้าด้วยความสุภาพ แนะนำโปรโมชั่นและเก็บเงินปลายทางทันที',
           ai_brevity_mode: true
@@ -1382,14 +1395,14 @@ async function startServer() {
           is_active: existing?.is_active ?? true,
           auto_reply: existing?.auto_reply ?? true,
           auto_close_ai: existing?.auto_close_ai ?? true,
-          ai_model: existing?.ai_model || 'gemini-3.7-flash',
+          ai_model: existing?.ai_model || 'gemini-3.6-flash',
           category: cat,
           page_avatar: fbPage.picture?.data?.url || existing?.page_avatar || basePage.page_avatar,
           page_cover: existing?.page_cover || basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
           follower_count: fbPage.followers_count || fbPage.fan_count || existing?.follower_count || 15000,
           likes_count: fbPage.fan_count || existing?.likes_count || 12000,
           inquiries_count: existing?.inquiries_count || 0,
-          admin_name: existing?.admin_name || 'แอดมิน AI',
+          admin_name: existing?.admin_name || 'น้ำหวาน',
           ai_tone: existing?.ai_tone || 'FRIENDLY',
           ai_custom_instructions: existing?.ai_custom_instructions || 'ตอบลูกค้าด้วยความสุภาพ แนะนำโปรโมชั่นและเก็บเงินปลายทางทันที',
           ai_brevity_mode: existing?.ai_brevity_mode ?? true
@@ -1702,7 +1715,7 @@ async function startServer() {
 
       // AI Persona & Model Execution
       const selectedModel = resolveAiModel(page.ai_model);
-      const adminName = page.admin_name || 'แอดมิน';
+      const adminName = page.admin_name || 'น้ำหวาน';
       const aiTone = page.ai_tone || 'FRIENDLY';
       const customInstructions = page.ai_custom_instructions || 'ตอบสั้นกระชับ สุภาพ เหมือนแอดมินคนจริง และเน้นปิดการขาย';
       const brevityMode = page.ai_brevity_mode !== false;
@@ -1807,12 +1820,19 @@ async function startServer() {
 
 📋 ข้อมูลสเปกสินค้าแบบละเอียด (Detailed Product Specifications):
 ${specsText}
-- โปรโมชั่นทั้งหมดที่มี:
-${JSON.stringify(page.product?.promotions || [
+- โปรโมชั่นทั้งหมดที่มี (ชื่อแพ็กเกจคือชื่อที่ร้านกำหนดเอง ให้ใช้ชื่อนี้ตามนั้น):
+${JSON.stringify((page.product?.promotions || [
   { name: 'โปรโมชั่น 1 ชิ้น', price: matchedProduct.price_1 || 990 },
   { name: 'โปรโมชั่น 2 ชิ้น', price: matchedProduct.price_2 || 1800 },
   { name: 'โปรโมชั่น 3 ชิ้น', price: matchedProduct.price_3 || 2500 }
-], null, 2)}
+]).map((p: any) => ({
+  name: p.name,
+  quantity: p.quantity,
+  price: p.price,
+  free_shipping: p.free_shipping === true,
+  gift_quantity: p.gift_quantity || 0,
+  free_gifts: p.free_gifts || ''
+})), null, 2)}
 
 แพตเทิร์นการขาย 6 สเต็ปของเพจนี้:
 - สเต็ป 1 (ข้อความเปิด): ${page.sequence?.step1_opening_text || matchedProduct.opening_text}
@@ -1828,6 +1848,8 @@ ${JSON.stringify(customer, null, 2)}
 3. หากเป็นพระเครื่อง: ห้ามสร้างพุทธคุณเอง ให้ใช้ข้อมูลแท้เท่านั้น
 4. หากลูกค้าถามทั่วไป/ราคา ให้ตอบสุภาพ แนะนำโปรโมชั่น และปิดการขายอย่างกระชับ
 5. หากลูกค้าส่งข้อมูลสั่งซื้อหรือส่งชื่อ/ที่อยู่/เบอร์โทร หรือจำนวน: ให้ตรวจจับเป็น ORDER และดึงข้อมูลลูกค้าออกมาให้ครบถ้วน
+6. เรื่องการจัดส่ง: บอกว่า "ส่งฟรี" ได้เฉพาะแพ็กเกจที่ free_shipping = true เท่านั้น แพ็กเกจที่ free_shipping = false ห้ามบอกส่งฟรีเด็ดขาด ให้บอกว่ามีค่าจัดส่งตามจริง
+7. เรื่องของแถม: บอกของแถมเฉพาะแพ็กเกจที่ gift_quantity > 0 หรือมี free_gifts ระบุเท่านั้น แพ็กเกจที่ไม่มีของแถมห้ามบอกว่ามีของแถม
 
 ข้อความที่ลูกค้าส่งมา:
 "${messageText}"
@@ -2544,11 +2566,203 @@ ${JSON.stringify(categorySummary, null, 2)}
     }
   });
 
+  // 4.5 Real-AI Spec Parser (AI Auto-Key แบบใช้ AI จริง)
+  // รับข้อความรายละเอียดสินค้าดิบ แล้วให้ Gemini แยกข้อมูลลงช่องสเปกที่ถูกต้อง
+  // ตามหมวดหมู่สินค้า แก้ปัญหา "คุณสมบัติสินค้าใส่ไม่ถูกช่องและไม่ได้ใส่บางอัน"
+  app.post('/api/ai/parse-specs', async (req: Request, res: Response) => {
+    try {
+      const { rawText, category } = req.body;
+      if (!rawText || !String(rawText).trim()) {
+        return res.status(400).json({ error: 'rawText is required' });
+      }
+
+      const categoryLabel: Record<string, string> = {
+        AMULET: 'พระเครื่อง / วัตถุมงคล',
+        CHINA: 'สินค้านำเข้าจากจีน / สินค้าทั่วไป',
+        OTOP: 'สินค้าโอทอปไทย / สินค้าชุมชน',
+        AGRICULTURE: 'สินค้าการเกษตร / ปุ๋ยยา / เมล็ดพันธุ์'
+      };
+
+      const ai = getGemini();
+      const prompt = `คุณคือผู้เชี่ยวชาญระบบกรอกข้อมูลสินค้าอีคอมเมิร์ซไทย หน้าที่ของคุณคืออ่านข้อความรายละเอียดสินค้าดิบ แล้วแยกข้อมูลใส่ "ช่องฟิลด์" ที่กำหนดให้ถูกต้อง ครบถ้วนที่สุด
+
+หมวดหมู่สินค้า: ${categoryLabel[category] || 'สินค้าทั่วไป'}
+
+กฎเหล็ก:
+1. ใส่ข้อมูลลงช่องให้ตรงความหมายของแต่ละช่องเท่านั้น ห้ามใส่ข้อมูลผิดช่อง
+2. ถ้าข้อความมีข้อมูลแต่ไม่มีช่องที่ตรงกัน ให้ใส่ใน custom_specs เป็นรายการ {key, value}
+3. ถ้าไม่มีข้อมูลในข้อความสำหรับช่องใด ให้เว้นช่องนั้นเป็นค่าว่าง "" ห้ามเดาหรือแต่งข้อมูลเพิ่มเองเด็ดขาด
+4. คงข้อความต้นฉบับไว้ให้มากที่สุด ปรับเฉพาะรูปแบบให้อ่านง่าย
+5. ตอบเป็นภาษาไทย
+
+ข้อความรายละเอียดสินค้าดิบ:
+"""
+${String(rawText).slice(0, 12000)}
+"""`;
+
+      const response = await ai.models.generateContent({
+        model: resolveAiModel(),
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              product_name: { type: Type.STRING, description: 'ชื่อสินค้า' },
+              description: { type: Type.STRING, description: 'รายละเอียดสินค้าโดยรวม' },
+              features: { type: Type.STRING, description: 'คุณสมบัติเด่น / จุดเด่นของสินค้า' },
+              benefit: { type: Type.STRING, description: 'ประโยชน์ที่ได้รับ' },
+              usage: { type: Type.STRING, description: 'วิธีใช้งาน' },
+              material: { type: Type.STRING, description: 'วัสดุ / มวลสาร / ส่วนประกอบ' },
+              size: { type: Type.STRING, description: 'ขนาด กว้างxยาวxสูง' },
+              weight: { type: Type.STRING, description: 'น้ำหนัก' },
+              brand: { type: Type.STRING, description: 'แบรนด์ / ยี่ห้อ' },
+              shipping_info: { type: Type.STRING, description: 'ข้อมูลการจัดส่ง / ค่าส่ง / ระยะเวลา' },
+              // พระเครื่อง
+              temple: { type: Type.STRING, description: 'วัด / สำนักที่จัดสร้าง' },
+              master: { type: Type.STRING, description: 'พระเกจิอาจารย์ผู้สร้าง / ปลุกเสก' },
+              year: { type: Type.STRING, description: 'ปีที่สร้าง พ.ศ.' },
+              edition: { type: Type.STRING, description: 'รุ่น / พิมพ์' },
+              quantity: { type: Type.STRING, description: 'จำนวนการสร้าง (ตัวเลข)' },
+              history: { type: Type.STRING, description: 'ประวัติการจัดสร้าง' },
+              belief_info: { type: Type.STRING, description: 'พุทธคุณ / ความเชื่อ (เฉพาะที่ระบุในข้อความ)' },
+              spell: { type: Type.STRING, description: 'คาถาบูชา' },
+              worship_method: { type: Type.STRING, description: 'วิธีบูชา' },
+              care_instruction: { type: Type.STRING, description: 'วิธีดูแลรักษา' },
+              warning: { type: Type.STRING, description: 'ข้อควรระวัง' },
+              // OTOP
+              community: { type: Type.STRING, description: 'ชุมชน / กลุ่มผู้ผลิต' },
+              province: { type: Type.STRING, description: 'จังหวัดผู้ผลิต' },
+              maker: { type: Type.STRING, description: 'ผู้ผลิต / ผู้ประกอบการ' },
+              origin: { type: Type.STRING, description: 'แหล่งที่มา / ต้นกำเนิด' },
+              story: { type: Type.STRING, description: 'เรื่องราว / ภูมิปัญญา' },
+              production_method: { type: Type.STRING, description: 'วิธีการผลิต' },
+              // การเกษตร
+              subcategory: { type: Type.STRING, description: 'หมวดย่อย / ประเภทสินค้า' },
+              variety: { type: Type.STRING, description: 'สายพันธุ์' },
+              species: { type: Type.STRING, description: 'ชนิดพืช / ชนิดสินค้า' },
+              seed_quantity: { type: Type.STRING, description: 'จำนวนเมล็ด / ปริมาณบรรจุ' },
+              planting_season: { type: Type.STRING, description: 'ฤดูปลูก / ช่วงเวลาปลูก' },
+              planting_method: { type: Type.STRING, description: 'วิธีปลูก / การเพาะ' },
+              soil_type: { type: Type.STRING, description: 'ประเภทดินที่เหมาะสม' },
+              sunlight: { type: Type.STRING, description: 'ความต้องการแสงแดด' },
+              watering: { type: Type.STRING, description: 'การรดน้ำ / การให้น้ำ' },
+              fertilizer: { type: Type.STRING, description: 'ปุ๋ยที่แนะนำ / การให้ปุ๋ย' },
+              harvest_time: { type: Type.STRING, description: 'ระยะเวลาเก็บเกี่ยว' },
+              usage_instructions: { type: Type.STRING, description: 'วิธีใช้ / อัตราการใช้ (ปุ๋ยยา)' },
+              benefits: { type: Type.STRING, description: 'ประโยชน์และผลลัพธ์' },
+              custom_specs: {
+                type: Type.ARRAY,
+                description: 'ข้อมูลอื่น ๆ ที่ไม่มีช่องด้านบน',
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    key: { type: Type.STRING },
+                    value: { type: Type.STRING }
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+
+      const parsedText = response.text || '{}';
+      let parsed: any = {};
+      try {
+        parsed = JSON.parse(parsedText);
+      } catch {
+        const match = parsedText.match(/\{[\s\S]*\}/);
+        parsed = match ? JSON.parse(match[0]) : {};
+      }
+
+      // กรองค่าว่างออกเพื่อไม่ให้ไปทับข้อมูลเดิมที่ผู้ใช้กรอกไว้
+      const cleanResult: Record<string, any> = {};
+      for (const [key, value] of Object.entries(parsed)) {
+        if (key === 'custom_specs') {
+          const customs = Array.isArray(value)
+            ? value
+                .filter((c: any) => c && (c.key || '').trim() && (c.value || '').trim())
+                .map((c: any) => ({ id: `cs-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, key: String(c.key).trim(), value: String(c.value).trim() }))
+            : [];
+          if (customs.length) cleanResult.custom_specs = customs;
+        } else if (value !== null && value !== undefined && String(value).trim() !== '') {
+          cleanResult[key] = key === 'quantity' ? (Number(String(value).replace(/[^0-9]/g, '')) || undefined) : String(value).trim();
+        }
+      }
+
+      addLog('INFO', 'AI_AUTO_KEY', 'SYSTEM', `🧠 AI แยกสเปกสินค้าสำเร็จ ${Object.keys(cleanResult).length} ช่อง (หมวด ${category || 'GENERAL'})`, 'SUCCESS');
+      res.json({ success: true, specs: cleanResult });
+    } catch (err: any) {
+      console.error('AI parse-specs error:', err);
+      res.status(500).json({ error: err.message || 'AI ไม่สามารถแยกข้อมูลสเปกได้ กรุณาตั้ง API Key ก่อน' });
+    }
+  });
+
   // 5. Test Notification Dispatch API (Telegram / LINE)
+  //    Sends a REAL test message using the values from the settings form —
+  //    including tokens/destinations the user just typed but has not saved yet.
+  //    Returns the genuine per-channel outcome plus helpers (bot username,
+  //    auto-detected Chat ID, deep links) so the admin can pick a destination.
   app.post('/api/notifications/test', async (req: Request, res: Response) => {
     const { channel, page_id, page_name, line_token, line_group_id, telegram_token, telegram_chat_id, sample_order } = req.body;
 
-    const page = db.pages.find(p => p.page_id === page_id) || db.pages[0];
+    const basePage = db.pages.find(p => p.page_id === page_id) || db.pages[0];
+    if (!basePage) {
+      return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ กรุณาเพิ่มเพจก่อนทดสอบการแจ้งเตือน' });
+    }
+
+    // The form shows masked stored tokens (••••). Only treat the incoming value
+    // as a NEW plain token when it is not the mask of the stored one.
+    const resolveTestToken = (incoming: any, stored: string | undefined): string => {
+      const value = typeof incoming === 'string' ? incoming.trim() : '';
+      if (!value) return stored || '';
+      if (stored && (value === maskToken(stored) || /^•+$/.test(value))) return stored;
+      if (value.startsWith('enc:')) return value;
+      return encryptToken(value);
+    };
+
+    const requestedChannel: 'TELEGRAM' | 'LINE' | 'BOTH' = channel === 'TELEGRAM' || channel === 'LINE' ? channel : 'BOTH';
+
+    // Temporary override page: unsaved UI values are tested without touching db.
+    const testPage: PageConfig = {
+      ...basePage,
+      notification_channel: requestedChannel === 'BOTH' ? (basePage.notification_channel || 'BOTH') : requestedChannel,
+      telegram_bot_token: resolveTestToken(telegram_token, basePage.telegram_bot_token),
+      telegram_chat_id: (typeof telegram_chat_id === 'string' && telegram_chat_id.trim()) || basePage.telegram_chat_id || '',
+      line_notify_token: resolveTestToken(line_token, basePage.line_notify_token),
+      line_group_id: (typeof line_group_id === 'string' && line_group_id.trim()) || basePage.line_group_id || ''
+    };
+
+    // Telegram helpers: resolve bot username (deep link) and auto-detect the
+    // latest Chat ID via getUpdates when the admin has not filled one in yet.
+    let telegramBotUsername = '';
+    let detectedTelegramChatId = '';
+    const rawTgToken = decryptToken(testPage.telegram_bot_token || '');
+    if (rawTgToken) {
+      try {
+        const meRes = await fetch(`https://api.telegram.org/bot${encodeURIComponent(rawTgToken)}/getMe`);
+        const meData: any = await meRes.json();
+        if (meData?.ok && meData.result?.username) telegramBotUsername = meData.result.username;
+      } catch (meErr) {
+        console.warn('[Notifications Test] Telegram getMe lookup failed:', meErr);
+      }
+      if (!testPage.telegram_chat_id) {
+        try {
+          const updRes = await fetch(`https://api.telegram.org/bot${encodeURIComponent(rawTgToken)}/getUpdates?limit=10`);
+          const updData: any = await updRes.json();
+          if (updData?.ok && Array.isArray(updData.result)) {
+            for (let i = updData.result.length - 1; i >= 0; i--) {
+              const chat = updData.result[i]?.message?.chat || updData.result[i]?.channel_post?.chat || updData.result[i]?.my_chat_member?.chat;
+              if (chat?.id) { detectedTelegramChatId = String(chat.id); break; }
+            }
+          }
+        } catch (updErr) {
+          console.warn('[Notifications Test] Telegram getUpdates lookup failed:', updErr);
+        }
+        if (detectedTelegramChatId) testPage.telegram_chat_id = detectedTelegramChatId;
+      }
+    }
 
     const orderData: Order = {
       order_id: `ORD-TEST-${Date.now()}`,
@@ -2556,7 +2770,7 @@ ${JSON.stringify(categorySummary, null, 2)}
       customer_name: sample_order?.customer_name || 'คุณวิชัย วันดี',
       shipping_address: sample_order?.address || 'โตโยต้าชัวร์ ทีบีเอ็น 318/4 ถ.ลาดกระบัง กทม 10520',
       phone_number: sample_order?.phone || '0927015995',
-      items: sample_order?.item || `${page.product?.product_name || 'กล้องส่องพระแบบเซียน'} 1 ชุด`,
+      items: sample_order?.item || `${basePage.product?.product_name || 'กล้องส่องพระแบบเซียน'} 1 ชุด`,
       quantity: 1,
       total_amount: sample_order?.total || 990,
       payment_status: 'PENDING',
@@ -2565,11 +2779,37 @@ ${JSON.stringify(categorySummary, null, 2)}
       page_id: page_id || 'AMULET_PAGE_ID'
     };
 
-    const formatted = await dispatchOrderSummary(orderData, page);
+    const { formattedSummary, telegram, line } = await dispatchOrderSummary(orderData, testPage);
+    const channelResults: Record<'TELEGRAM' | 'LINE', { success: boolean; skipped?: boolean; error?: string }> = { TELEGRAM: telegram, LINE: line };
+
+    const describeResult = (ch: 'TELEGRAM' | 'LINE', r: { success: boolean; skipped?: boolean; error?: string }) => {
+      if (r.success) return `✅ ${ch === 'TELEGRAM' ? 'Telegram' : 'LINE'} ส่งข้อความทดสอบสำเร็จ`;
+      if (r.error === 'TELEGRAM_NOT_CONFIGURED') return '⚠️ Telegram ยังไม่ได้ตั้งค่า Bot Token หรือ Chat ID ให้ครบ';
+      if (r.error === 'LINE_NOT_CONFIGURED') return '⚠️ LINE ยังไม่ได้ตั้งค่า Token หรือ Group ID ให้ครบ';
+      if (r.error === 'CHANNEL_DISABLED') return `⏸️ ช่องทาง ${ch} ไม่ได้ถูกเลือกให้ส่ง`;
+      return `❌ ${ch} ส่งไม่สำเร็จ: ${r.error || 'ไม่ทราบสาเหตุ'}`;
+    };
+
+    const relevantResults = requestedChannel === 'BOTH'
+      ? [describeResult('TELEGRAM', telegram), describeResult('LINE', line)]
+      : [describeResult(requestedChannel, channelResults[requestedChannel])];
+    const overallSuccess = requestedChannel === 'BOTH'
+      ? telegram.success && line.success
+      : Boolean(channelResults[requestedChannel]?.success);
+
     res.json({
-      success: true,
-      message: `ส่งการแจ้งเตือนทดสอบ (${channel}) สำหรับเพจ ${page_name || page.page_name} สำเร็จเรียบร้อย!`,
-      summaryFormatted: formatted
+      success: overallSuccess,
+      message: overallSuccess
+        ? `ส่งการแจ้งเตือนทดสอบ (${requestedChannel}) สำหรับเพจ ${page_name || basePage.page_name} สำเร็จเรียบร้อย!`
+        : `ทดสอบส่ง (${requestedChannel}) สำหรับเพจ ${page_name || basePage.page_name} ไม่สำเร็จ`,
+      results: relevantResults,
+      telegram: { ...telegram, bot_username: telegramBotUsername, detected_chat_id: detectedTelegramChatId },
+      line,
+      deepLinks: {
+        telegram: telegramBotUsername ? `https://t.me/${telegramBotUsername}` : 'https://t.me/',
+        line: 'line://'
+      },
+      summaryFormatted: formattedSummary
     });
   });
 

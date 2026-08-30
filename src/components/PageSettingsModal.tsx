@@ -36,6 +36,8 @@ import {
 } from 'lucide-react';
 import { PageConfig, PromotionTier, ProductCategory, ProductDetailedSpecs, CustomSpecItem } from '../types';
 import { parseTextToSpecs } from '../utils/aiSpecParser';
+import { chatWithLocalAi, isLocalAiModel } from '../utils/localAi';
+import { getStoredLocalAiModel } from './AiApiSettingsModal';
 
 interface PageSettingsModalProps {
   isOpen: boolean;
@@ -61,32 +63,103 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
   const [isAiParsing, setIsAiParsing] = useState(false);
   const [aiAutoSuccess, setAiAutoSuccess] = useState(false);
   const [showAiAutoBox, setShowAiAutoBox] = useState(true);
+  const [aiAutoError, setAiAutoError] = useState('');
+  const [aiAutoSource, setAiAutoSource] = useState('');
 
-  const handleRunAiAutoKeyForPageSettings = (cat: ProductCategory) => {
+  /**
+   * AI Auto-Key (ใช้ AI จริง):
+   * 1) ถ้าเลือก Local AI ไว้ (Ollama/LM Studio) → ส่งให้โมเดลในเครื่องแยกข้อมูล
+   * 2) ถ้าไม่ได้เลือก หรือ Local AI ล้มเหลว → ใช้เซิร์ฟเวอร์ Gemini (/api/ai/parse-specs)
+   * 3) ถ้าทั้งสองทางล้มเหลว → ถอยกลับไปที่ parser แบบกฎในเครื่อง (ดีกว่าไม่ได้อะไร)
+   */
+  const applyParsedSpecs = (parsed: Record<string, any>) => {
+    setFormData((prev: PageConfig) => ({
+      ...prev,
+      product: {
+        ...prev.product,
+        product_name: parsed.product_name || prev.product.product_name,
+        description: parsed.description || prev.product.description,
+        specs: {
+          ...prev.product.specs,
+          ...parsed,
+          custom_specs: [
+            ...(prev.product.specs?.custom_specs || []),
+            ...(Array.isArray(parsed.custom_specs) ? parsed.custom_specs : [])
+          ]
+        }
+      }
+    }));
+  };
+
+  const parseWithLocalAi = async (text: string, cat: ProductCategory): Promise<Record<string, any> | null> => {
+    const localModel = getStoredLocalAiModel();
+    if (!isLocalAiModel(localModel)) return null;
+    const systemPrompt =
+      'คุณคือผู้เชี่ยวชาญการกรอกข้อมูลสินค้า อ่านข้อความรายละเอียดสินค้าแล้วตอบเป็น JSON เท่านั้น โดยแยกข้อมูลลงฟิลด์: product_name, description, features, benefit, usage, material, size, weight, brand, shipping_info, temple, master, year, edition, quantity, history, belief_info, spell, worship_method, care_instruction, warning, community, province, maker, origin, story, production_method, subcategory, variety, species, seed_quantity, planting_season, planting_method, soil_type, sunlight, watering, fertilizer, harvest_time, usage_instructions, benefits และ custom_specs เป็น array ของ {key, value} สำหรับข้อมูลที่ไม่มีฟิลด์ตรง ห้ามเดาข้อมูลที่ไม่อยู่ในข้อความ ตอบเป็น JSON ล้วน ๆ ไม่มีคำอธิบายอื่น';
+    try {
+      const reply = await chatWithLocalAi(localModel, systemPrompt, text.slice(0, 8000));
+      const match = reply.match(/\{[\s\S]*\}/);
+      if (!match) return null;
+      const parsed = JSON.parse(match[0]);
+      const clean: Record<string, any> = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (v !== null && v !== undefined && String(v).trim() !== '') clean[k] = v;
+      }
+      return Object.keys(clean).length > 0 ? clean : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const parseWithServerAi = async (text: string, cat: ProductCategory): Promise<Record<string, any> | null> => {
+    try {
+      const res = await fetch('/api/ai/parse-specs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rawText: text, category: cat })
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.success && data.specs ? data.specs : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const handleRunAiAutoKeyForPageSettings = async (cat: ProductCategory) => {
     if (!aiAutoText.trim()) {
       alert('กรุณาวางข้อความรายละเอียดสินค้าหรือข้อมูลสเปกในช่องก่อนกด AI Auto-Key ค่ะ');
       return;
     }
     setIsAiParsing(true);
-    setTimeout(() => {
-      const parsed = parseTextToSpecs(aiAutoText, cat);
-      setFormData((prev: PageConfig) => ({
-        ...prev,
-        product: {
-          ...prev.product,
-          product_name: parsed.product_name || prev.product.product_name,
-          category: parsed.category || prev.product.category,
-          description: parsed.description || prev.product.description,
-          specs: {
-            ...prev.product.specs,
-            ...parsed
-          }
-        }
-      }));
-      setIsAiParsing(false);
+    setAiAutoError('');
+
+    // 1) ลอง Local AI ก่อน (ถ้าผู้ใช้เลือกไว้)
+    let parsed = await parseWithLocalAi(aiAutoText, cat);
+    let parseSource = 'Local AI ในเครื่อง';
+
+    // 2) ถ้าไม่ได้ → ใช้ Gemini บนเซิร์ฟเวอร์
+    if (!parsed || Object.keys(parsed).length === 0) {
+      parsed = await parseWithServerAi(aiAutoText, cat);
+      parseSource = 'Gemini AI (เซิร์ฟเวอร์)';
+    }
+
+    // 3) ถอยกลับไปใช้ parser แบบกฎในเครื่อง
+    if (!parsed || Object.keys(parsed).length === 0) {
+      parsed = parseTextToSpecs(aiAutoText, cat) as Record<string, any>;
+      parseSource = 'โหมดพื้นฐาน (ไม่พบ AI)';
+      setAiAutoError('⚠️ ใช้ AI จริงไม่ได้ (ต้องเปิด Local AI หรือตั้ง Gemini API Key) จึงใช้โหมดแยกข้อความพื้นฐานแทน');
+    }
+
+    if (parsed && Object.keys(parsed).length > 0) {
+      applyParsedSpecs(parsed);
+      setAiAutoSource(parseSource);
       setAiAutoSuccess(true);
-      setTimeout(() => setAiAutoSuccess(false), 4500);
-    }, 400);
+      setTimeout(() => setAiAutoSuccess(false), 6000);
+    } else {
+      setAiAutoError('❌ ไม่สามารถแยกข้อมูลจากข้อความนี้ได้ กรุณาลองใหม่ด้วยข้อความที่มีรายละเอียดมากขึ้น');
+    }
+    setIsAiParsing(false);
   };
 
   const [formData, setFormData] = useState<PageConfig>(() => ({
@@ -216,7 +289,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
   }));
 
   const [saveSuccess, setSaveSuccess] = useState(false);
-  const [testNotificationStatus, setTestNotificationStatus] = useState<string | null>(null);
+  const [testNotificationStatus, setTestNotificationStatus] = useState<{ ok: boolean; message: string; results?: string[]; deepLinks?: { telegram?: string; line?: string } } | null>(null);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [specsCategoryFilter, setSpecsCategoryFilter] = useState<'AUTO' | ProductCategory>('AUTO');
 
@@ -385,8 +458,10 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
       quantity: formData.product.promotions.length + 1,
       price: Math.round((formData.product.display_price || 990) * (formData.product.promotions.length + 1) * 0.9),
       original_price: Math.round((formData.product.base_price || 1590) * (formData.product.promotions.length + 1)),
-      free_gifts: 'ของแถมพิเศษ',
-      description: 'ส่งฟรีเก็บเงินปลายทาง',
+      free_gifts: '',
+      gift_quantity: 0,
+      free_shipping: false,
+      description: '',
       is_popular: false
     };
     setFormData(prev => ({
@@ -446,9 +521,11 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
     }));
   };
 
-  // Test Notification Dispatch
+  // Test Notification Dispatch — sends a REAL test message with the values in
+  // the form (saved or not) and reports the genuine per-channel result. The
+  // server also auto-detects the Telegram Chat ID (getUpdates) when missing.
   const handleTestNotification = async (channel: 'LINE' | 'TELEGRAM') => {
-    setTestNotificationStatus(`กำลังส่งข้อความทดสอบไปยัง ${channel}...`);
+    setTestNotificationStatus({ ok: true, message: `กำลังส่งข้อความทดสอบไปยัง ${channel}...` });
     try {
       const res = await fetch('/api/notifications/test', {
         method: 'POST',
@@ -471,10 +548,24 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
         })
       });
       const data = await res.json();
-      setTestNotificationStatus(data.message || `ส่งการแจ้งเตือน ${channel} สำเร็จแล้ว!`);
-      setTimeout(() => setTestNotificationStatus(null), 4000);
+
+      // Auto-fill the Telegram Chat ID when the server detected it, so the
+      // admin only has to press save — no manual lookup needed.
+      if (channel === 'TELEGRAM' && data.telegram?.detected_chat_id && !formData.telegram_chat_id) {
+        setFormData(prev => ({ ...prev, telegram_chat_id: data.telegram.detected_chat_id }));
+      }
+
+      setTestNotificationStatus({
+        ok: Boolean(data.success),
+        message: data.message || (data.success ? `ส่งการแจ้งเตือน ${channel} สำเร็จแล้ว!` : `ส่งการแจ้งเตือน ${channel} ไม่สำเร็จ`),
+        results: Array.isArray(data.results) ? data.results : [],
+        deepLinks: data.deepLinks || undefined
+      });
+      if (data.success) {
+        setTimeout(() => setTestNotificationStatus(null), 6000);
+      }
     } catch (err: any) {
-      setTestNotificationStatus(`ส่งล้มเหลว: ${err.message}`);
+      setTestNotificationStatus({ ok: false, message: `ส่งล้มเหลว: ${err.message}` });
     }
   };
 
@@ -744,7 +835,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                       type="text"
                       value={formData.admin_name || ''}
                       onChange={e => setFormData(prev => ({ ...prev, admin_name: e.target.value }))}
-                      placeholder="เช่น แอดมินน้องน้ำมนต์, แอดมินบอย"
+                      placeholder="ค่าเริ่มต้น: น้ำหวาน (แก้ไขได้ทุกเพจ)"
                       className="w-full bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg p-2.5 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none"
                     />
                   </div>
@@ -1291,8 +1382,15 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
 
                         {aiAutoSuccess && (
                           <div className="flex items-center gap-1.5 text-emerald-400 font-bold text-xs bg-emerald-950/60 px-3 py-1 rounded-lg border border-emerald-800/80 animate-in fade-in">
-                            <CheckCircle2 className="w-4 h-4" />
-                            <span>✨ ถอดรหัสข้อความและกรอกสเปกสำเร็จแล้ว!</span>
+                            <CheckCircle2 className="w-4 h-4 shrink-0" />
+                            <span>✨ AI กรอกสเปกตรงช่องสำเร็จแล้ว! ({aiAutoSource})</span>
+                          </div>
+                        )}
+
+                        {aiAutoError && (
+                          <div className="flex items-start gap-1.5 text-amber-300 font-medium text-[11px] bg-amber-950/60 px-3 py-1.5 rounded-lg border border-amber-800/80 animate-in fade-in leading-relaxed">
+                            <AlertCircle className="w-4 h-4 shrink-0 mt-px" />
+                            <span>{aiAutoError}</span>
                           </div>
                         )}
                       </div>
@@ -1958,11 +2056,12 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
                       <div>
-                        <label className="text-[11px] text-slate-500 dark:text-zinc-400 block mb-1">ชื่อแพ็กเกจ:</label>
+                        <label className="text-[11px] text-slate-500 dark:text-zinc-400 block mb-1">ชื่อแพ็กเกจ (ตั้งเองได้ AI เข้าใจตามชื่อนี้):</label>
                         <input
                           type="text"
                           value={promo.name}
                           onChange={e => handleUpdatePromotion(promo.id, 'name', e.target.value)}
+                          placeholder="เช่น ชุดบูชาคู่บ้าน"
                           className="w-full bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg p-2 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none"
                         />
                       </div>
@@ -1985,14 +2084,38 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                         />
                       </div>
                       <div>
-                        <label className="text-[11px] text-slate-500 dark:text-zinc-400 block mb-1">ของแถม & ข้อความส่งฟรี:</label>
+                        <label className="text-[11px] text-slate-500 dark:text-zinc-400 block mb-1">ชื่อของแถม (เว้นว่าง = ไม่มีของแถม):</label>
                         <input
                           type="text"
                           value={promo.free_gifts || ''}
                           onChange={e => handleUpdatePromotion(promo.id, 'free_gifts', e.target.value)}
-                          placeholder="เช่น แถมสร้อย + ส่งฟรี COD"
+                          placeholder="เช่น เชือกถักคอ + กล่องกำมะหยี่"
                           className="w-full bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg p-2 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none"
                         />
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-4 pt-1 border-t border-slate-100 dark:border-zinc-800/60 mt-1">
+                      <label className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-400 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={promo.free_shipping === true}
+                          onChange={e => handleUpdatePromotion(promo.id, 'free_shipping', e.target.checked)}
+                          className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                        />
+                        <span className="text-emerald-700 dark:text-emerald-400 font-bold">🚚 ส่งฟรี (ติ๊กเมื่อส่งฟรีจริงเท่านั้น — AI ห้ามบอกส่งฟรีถ้าไม่ได้ติ๊ก)</span>
+                      </label>
+
+                      <div className="flex items-center gap-1.5">
+                        <label className="text-[11px] text-slate-500 dark:text-zinc-400">จำนวนของแถมต่อแพ็ก:</label>
+                        <input
+                          type="number"
+                          min={0}
+                          value={promo.gift_quantity ?? 0}
+                          onChange={e => handleUpdatePromotion(promo.id, 'gift_quantity', Math.max(0, Number(e.target.value)))}
+                          className="w-16 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg p-1.5 text-xs text-slate-900 dark:text-zinc-100 font-mono focus:border-indigo-500 outline-none"
+                        />
+                        <span className="text-[11px] text-slate-400 dark:text-zinc-500">(0 = ไม่แถม)</span>
                       </div>
                     </div>
                   </div>
@@ -2158,11 +2281,40 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                 </div>
 
                 {testNotificationStatus && (
-                  <div className="p-3 rounded-lg bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300 text-xs font-medium flex items-center gap-2">
-                    <CheckCircle2 className="w-4 h-4" />
-                    <span>{testNotificationStatus}</span>
+                  <div className={`p-3 rounded-lg border text-xs font-medium space-y-2 ${testNotificationStatus.ok ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300' : 'bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300'}`}>
+                    <div className="flex items-center gap-2">
+                      {testNotificationStatus.ok ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertCircle className="w-4 h-4 shrink-0" />}
+                      <span>{testNotificationStatus.message}</span>
+                    </div>
+                    {(testNotificationStatus.results || []).length > 0 && (
+                      <ul className="pl-5 list-disc space-y-0.5 font-normal">
+                        {(testNotificationStatus.results || []).map((line, idx) => (
+                          <li key={idx}>{line}</li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 )}
+
+                <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100 dark:border-zinc-800/60">
+                  <span className="text-[11px] text-slate-500 dark:text-zinc-400">
+                    💡 เปิดแอปเลือกปลายทาง: Telegram ให้ทักหาบอทของคุณ 1 ข้อความ แล้วกด "ทดสอบส่ง" ระบบจะหา Chat ID ให้อัตโนมัติ
+                  </span>
+                  <a
+                    href={testNotificationStatus?.deepLinks?.telegram || 'https://t.me/'}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-2.5 py-1 bg-sky-100 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800 rounded-lg text-[11px] font-medium hover:bg-sky-200 dark:hover:bg-sky-900/60 transition-colors inline-flex items-center gap-1"
+                  >
+                    <ExternalLink className="w-3 h-3" /> เปิด Telegram
+                  </a>
+                  <a
+                    href="line://"
+                    className="px-2.5 py-1 bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 rounded-lg text-[11px] font-medium hover:bg-emerald-200 dark:hover:bg-emerald-900/60 transition-colors inline-flex items-center gap-1"
+                  >
+                    <ExternalLink className="w-3 h-3" /> เปิดแอป LINE
+                  </a>
+                </div>
               </div>
             </div>
           )}

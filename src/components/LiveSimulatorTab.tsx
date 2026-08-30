@@ -129,7 +129,7 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
         {
           id: `msg-init-${Date.now()}`,
           sender: 'bot',
-          text: selectedPage.sequence?.step1_opening_text || `${selectedPage.admin_name || 'แอดมิน'}: สวัสดีค่ะ ยินดีต้อนรับ สนใจสินค้าตัวไหนสอบถามได้เลยนะคะ 🙏`,
+          text: selectedPage.sequence?.step1_opening_text || `${selectedPage.admin_name || 'น้ำหวาน'}: สวัสดีค่ะ ยินดีต้อนรับ สนใจสินค้าตัวไหนสอบถามได้เลยนะคะ 🙏`,
           timestamp: new Date().toLocaleTimeString('th-TH')
         }
       ];
@@ -353,7 +353,7 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
         let replyImage = selectedPage.sequence?.step2_product_image || currentPrimaryProduct?.image_main;
 
         if (isOrderQuery) {
-          replyText = `🎉 ขอบพระคุณสำหรับคำสั่งซื้อค่ะ!\n\n📦 สินค้า: ${primaryProdName}\n💰 ยอดรวม: ฿${primaryPrice.toLocaleString()} (จัดส่งฟรี มีเก็บเงินปลายทาง)\n📍 ที่อยู่จัดส่ง: ${customerAddress || 'บันทึกเรียบร้อย'}\n\nแอดมิน ${selectedPage.admin_name || 'น้องน้ำมนต์'} รับออเดอร์เรียบร้อย และเตรียมจัดส่งรอบบ่ายนี้ค่ะ ขอบคุณค่ะ 🙏`;
+          replyText = `🎉 ขอบพระคุณสำหรับคำสั่งซื้อค่ะ!\n\n📦 สินค้า: ${primaryProdName}\n💰 ยอดรวม: ฿${primaryPrice.toLocaleString()} (${(selectedPage.product?.promotions || []).some((pr: any) => pr.free_shipping === true) ? 'จัดส่งฟรี ' : ''}มีเก็บเงินปลายทาง)\n📍 ที่อยู่จัดส่ง: ${customerAddress || 'บันทึกเรียบร้อย'}\n\nแอดมิน ${selectedPage.admin_name || 'น้ำหวาน'} รับออเดอร์เรียบร้อย และเตรียมจัดส่งรอบบ่ายนี้ค่ะ ขอบคุณค่ะ 🙏`;
           replyImage = selectedPage.sequence?.step4_promotion_image || currentPrimaryProduct?.image_closing;
         } else if (fullQuery.includes('ราคา') || fullQuery.includes('โปร')) {
           replyText = `${selectedPage.sequence?.step3_promotion_detail || currentPrimaryProduct?.promotion_text}\n\n${selectedPage.sequence?.step6_closing_text || currentPrimaryProduct?.closing_text}`;
@@ -362,7 +362,7 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
           replyText = `บทสวดบูชา ${primaryProdName}:\n\n"${(currentPrimaryProduct as any).spell}"\n\n📌 พุทธคุณ: ${(currentPrimaryProduct as any).belief_info}\n\nบูชาเพียง ฿${primaryPrice} บาท สั่งซื้อได้เลยนะคะ 🙏`;
           replyImage = currentPrimaryProduct?.image_detail || currentPrimaryProduct?.image_main;
         } else {
-          replyText = `สวัสดีค่ะ แอดมิน ${selectedPage.admin_name || 'ประจำเพจ'} ยินดีให้บริการค่ะ\n\n${selectedPage.product?.description || currentPrimaryProduct?.detail_text}\n\n${selectedPage.sequence?.step3_promotion_detail || currentPrimaryProduct?.promotion_text}`;
+          replyText = `สวัสดีค่ะ แอดมิน ${selectedPage.admin_name || 'น้ำหวาน'} ยินดีให้บริการค่ะ\n\n${selectedPage.product?.description || currentPrimaryProduct?.detail_text}\n\n${selectedPage.sequence?.step3_promotion_detail || currentPrimaryProduct?.promotion_text}`;
           replyImage = selectedPage.sequence?.step2_product_image || currentPrimaryProduct?.image_main;
         }
 
@@ -446,7 +446,7 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
               {selectedPage.product?.product_name || currentPrimaryProduct?.product_name}
             </div>
             <div className="text-[11px] text-zinc-400 mt-1.5 flex items-center justify-between">
-              <span>แอดมิน: <strong className="text-indigo-400">{selectedPage.admin_name || 'น้องน้ำมนต์'}</strong></span>
+              <span>แอดมิน: <strong className="text-indigo-400">{selectedPage.admin_name || 'น้ำหวาน'}</strong></span>
               <span className="font-mono text-zinc-500">{selectedPage.product?.promotions?.length || 3} โปรโมชั่น</span>
             </div>
           </div>
@@ -605,7 +605,7 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
               </div>
               <p className="text-[11px] text-zinc-400 flex items-center gap-2">
-                <span>แอดมิน: <strong className="text-indigo-400">{selectedPage.admin_name || 'น้องน้ำมนต์'}</strong></span>
+                <span>แอดมิน: <strong className="text-indigo-400">{selectedPage.admin_name || 'น้ำหวาน'}</strong></span>
                 <span>•</span>
                 <span>โมเดล: <code className="text-amber-400 font-mono">{selectedPage.ai_model || 'gemini-3.6-flash'}</code></span>
                 <span>•</span>
