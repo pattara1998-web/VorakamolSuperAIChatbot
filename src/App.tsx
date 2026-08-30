@@ -534,7 +534,17 @@ export default function App() {
     setTheme(prev => (prev === 'dark' ? 'light' : 'dark'));
   };
 
-  const currentPageForModal = pages.find(p => p.page_id === settingsPageId) || pages[0];
+  // Bug fix: the 3-second backend poll replaces `pages` wholesale. If the open
+  // page is momentarily missing (cold start, partial sync), the modal's `page`
+  // prop becomes undefined and PageSettingsModal unmounts ("เด้งออก").
+  // Keep the last-known page for the same page_id so the modal stays stable.
+  const lastModalPageRef = React.useRef<PageConfig | null>(null);
+  const resolvedModalPage = pages.find(p => p.page_id === settingsPageId);
+  if (resolvedModalPage) lastModalPageRef.current = resolvedModalPage;
+  const currentPageForModal =
+    resolvedModalPage ||
+    (lastModalPageRef.current?.page_id === settingsPageId ? lastModalPageRef.current : null) ||
+    pages[0];
 
   // If system is locked with PIN protection
   if (isLocked) {

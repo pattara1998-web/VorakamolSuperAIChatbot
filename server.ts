@@ -132,6 +132,42 @@ function getBasePageTemplate(): PageConfig {
   return INITIAL_PAGES[0] || createDefaultPageTemplate();
 }
 
+// Meta Graph API `/me/accounts` returns only 25 pages per call by default.
+// Accounts with hundreds of pages MUST follow cursor pagination (paging.next),
+// otherwise the hub silently shows a fraction of the user's pages.
+async function fetchAllManagedPages(userAccessToken: string): Promise<any[]> {
+  const fields = 'id,name,picture{url},category,access_token,followers_count,fan_count';
+  const collected: any[] = [];
+  let url: string | null =
+    `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?access_token=${encodeURIComponent(userAccessToken)}&fields=${encodeURIComponent(fields)}&limit=100`;
+
+  // Guard: 50 iterations × 100 items = up to 5,000 pages per sync.
+  for (let page = 0; page < 50 && url; page++) {
+    const res: any = await fetch(url as string);
+    const data: any = await res.json();
+    url = null;
+
+    if (data?.error) {
+      if (collected.length === 0) {
+        const err: any = new Error(data.error.message || 'Cannot fetch managed pages');
+        err.graphError = data.error;
+        throw err;
+      }
+      console.warn('[FB Pages] Pagination stopped early due to Graph error:', data.error.message);
+      break;
+    }
+
+    collected.push(...(data.data || []));
+    // `paging.next` already carries access_token + after cursor.
+    url = data?.paging?.next || null;
+    if (!url) break;
+  }
+
+  // De-duplicate by page id in case Meta repeats a boundary item.
+  const seen = new Set<string>();
+  return collected.filter(p => p?.id && !seen.has(p.id) && seen.add(p.id));
+}
+
 let deliverTelegram: ((page: PageConfig, text: string) => Promise<{ success: boolean; [key: string]: any }>) | null = null;
 let deliverLine: ((page: PageConfig, text: string) => Promise<{ success: boolean; [key: string]: any }>) | null = null;
 
@@ -1078,18 +1114,16 @@ async function startServer() {
         }
       }
 
-      // 5. Fetch managed Facebook Pages with Meta Graph API
-      const accountsUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?access_token=${encodeURIComponent(userAccessToken)}&fields=id,name,picture{url},category,access_token,followers_count,fan_count`;
-      const accountsRes = await fetch(accountsUrl);
-      const accountsData = await accountsRes.json();
-
-      if (accountsData.error) {
-        console.error('[FB OAuth Callback] Accounts fetch failed:', accountsData.error);
-        const errMsg = accountsData.error.message || 'Cannot fetch managed pages';
+      // 5. Fetch managed Facebook Pages with Meta Graph API (follows pagination
+      //    so accounts with 100+ pages sync completely, not just the first 25).
+      let rawPages: any[];
+      try {
+        rawPages = await fetchAllManagedPages(userAccessToken);
+      } catch (acctErr: any) {
+        console.error('[FB OAuth Callback] Accounts fetch failed:', acctErr);
+        const errMsg = acctErr?.graphError?.message || acctErr.message || 'Cannot fetch managed pages';
         return renderPopupResponse(false, `ไม่สามารถดึงข้อมูลเพจ: ${errMsg}`, { origin, error: errMsg });
       }
-
-      const rawPages = accountsData.data || [];
       if (rawPages.length === 0) {
         addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', '⚠️ บัญชีนี้ไม่มีเพจที่คุณเป็นผู้ดูแล หรือยังไม่ได้ให้สิทธิ์ pages_show_list', 'WARNING');
         return renderPopupResponse(true, 'เชื่อมต่อบัญชีสำเร็จ แต่ไม่พบเพจที่คุณเป็นผู้ดูแลในบัญชีนี้', { origin, count: 0, warning: 'no_pages' });
@@ -1247,16 +1281,17 @@ async function startServer() {
         });
       }
 
-      // Query all accounts linked to User Access Token
-      const graphUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?access_token=${encodeURIComponent(userAccessToken)}&fields=id,name,picture{url},category,access_token,followers_count,fan_count`;
-      const response = await fetch(graphUrl);
-      const data = await response.json();
-
-      if (data.error) {
-        return res.status(400).json({ error: data.error.message || 'เกิดข้อผิดพลาดจาก Meta Graph API', details: data.error });
+      // Query all accounts linked to User Access Token (follows pagination so
+      // accounts with 100+ pages sync completely, not just the first 25).
+      let rawPages: any[];
+      try {
+        rawPages = await fetchAllManagedPages(userAccessToken);
+      } catch (graphErr: any) {
+        return res.status(400).json({
+          error: graphErr?.graphError?.message || graphErr.message || 'เกิดข้อผิดพลาดจาก Meta Graph API',
+          details: graphErr?.graphError
+        });
       }
-
-      const rawPages = data.data || [];
       if (rawPages.length === 0) {
         return res.json({ success: true, pages: [], count: 0, message: 'ไม่พบเพจที่บัญชีนี้เป็นผู้ดูแล (กรุณาตรวจสอบสิทธิ์ pages_show_list)' });
       }

@@ -94,7 +94,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
     sales_sequence_steps: page?.sales_sequence_steps?.length
       ? page.sales_sequence_steps
       : [
-          { id: 'step-1', step_number: 1, type: 'BOTH', title: 'Step 1: ภาพหน้าปก & ทักทายปูเรื่องราว', text_content: page?.product?.opening_text || page?.product?.description || 'สวัสดีค่ะ ยินดีต้อนรับสู่เพจของเรานะคะ 🙏✨ สอบถามรายละเอียดหรือโปรโมชั่นพิเศษทักแชทได้เลยค่ะ', image_url: page?.product?.image_main || page?.product?.images?.main || '' },
+          { id: 'step-1', step_number: 1, type: 'BOTH', title: 'Step 1: ภาพหน้าปก & ทักทายเปิดเรื่องราว', text_content: page?.product?.opening_text || page?.product?.description || 'สวัสดีค่ะ ยินดีต้อนรับสู่เพจของเรานะคะ 🙏✨ สอบถามรายละเอียดหรือโปรโมชั่นพิเศษทักแชทได้เลยค่ะ', image_url: page?.product?.image_main || page?.product?.images?.main || '' },
           { id: 'step-2', step_number: 2, type: 'BOTH', title: 'Step 2: ภาพจุดเด่น / รายละเอียดสินค้า', text_content: page?.product?.detail_text || 'สินค้าคุณภาพเกรดพรีเมียม รับประกันของแท้ 100% มีใบรับรองมาตรฐานค่ะ', image_url: page?.product?.image_detail || page?.product?.images?.detail || '' },
           { id: 'step-3', step_number: 3, type: 'BOTH', title: 'Step 3: ภาพโปรโมชั่น / ของแถมพิเศษ', text_content: page?.product?.promotion_text || 'โปรโมชั่นเปิดตัวพิเศษ ซื้อวันนี้ส่งฟรีเก็บเงินปลายทาง COD ไม่บวกเพิ่มค่ะ', image_url: page?.product?.image_promotion || page?.product?.images?.promotion || '' },
           { id: 'step-4', step_number: 4, type: 'BOTH', title: 'Step 4: ภาพรีวิวจากลูกค้าจริง', text_content: page?.product?.review_text || 'การันตีรีวิวจากผู้ใช้งานจริงทั่วประเทศ ส่งจริง ได้รับของชัวร์ 100% ค่ะ', image_url: page?.product?.image_review || page?.product?.images?.review || '' },
@@ -1704,7 +1704,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                             type="text"
                             value={formData.product.specs?.brand || ''}
                             onChange={e => handleUpdateSpec('brand', e.target.value)}
-                            placeholder="<ctrl42>เช่น GreenFarm Growth+"
+                            placeholder="เช่น GreenFarm Growth+"
                             className="w-full bg-white dark:bg-[#181820] border border-slate-200 dark:border-zinc-800 rounded-lg p-2 text-xs focus:border-indigo-500 outline-none"
                           />
                         </div>
@@ -1930,7 +1930,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
               </div>
 
               <div className="space-y-3">
-                {formData.product.promotions.map((promo, idx) => (
+                {(formData.product.promotions || []).map((promo, idx) => (
                   <div
                     key={promo.id}
                     className="bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-xl p-4 space-y-3 shadow-xs"
