@@ -918,10 +918,19 @@ async function startServer() {
     const host = req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000';
     let origin = `${protocol}://${host}`.replace(/\/$/, '');
 
-    // 1. Strict CSRF State Validation
+    // 1. Surface OAuth errors returned by Meta FIRST (e.g. domain not in App Domains, user cancelled)
+    //    so the admin sees the real cause instead of a confusing CSRF message.
+    if (error) {
+      console.error('[FB OAuth Callback] Error returned by Facebook:', error, error_description);
+      const errMsg = (error_description as string) || (error as string) || 'Facebook login was cancelled';
+      addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', `❌ การยืนยันตัวตน Facebook ล้มเหลว: ${errMsg}`, 'ERROR');
+      return renderPopupResponse(false, errMsg, { origin, error: errMsg });
+    }
+
+    // 2. Strict CSRF State Validation
     if (!state || typeof state !== 'string') {
       addLog('INFO', 'FACEBOOK_OAUTH', 'SYSTEM', '❌ ปฏิเสธการเชื่อมต่อ: ตรวจพบคำขอที่ไม่ปลอดภัยหรือขาด CSRF State Parameter', 'ERROR');
-      return renderPopupResponse(false, 'การยืนยันตัวตนล้มเหลว (CSRF State ไม่ถูกต้องหรือขาดหาย)', { origin, error: 'missing_csrf_state' });
+      return renderPopupResponse(false, 'การยืนยันตัวตนล้มเหลว (CSRF State ไม่ถูกต้องหรือขาดหาย) — มักเกิดเมื่อ Meta ไม่ยอม redirect กลับ (เช่นโดเมนไม่อยู่ใน App Domain/Valid OAuth Redirect URIs)', { origin, error: 'missing_csrf_state' });
     }
 
     let stateData: { origin?: string; callback_url?: string; app_id?: string; nonce?: string; timestamp?: number; sig?: string } = {};
