@@ -419,6 +419,44 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
     }
   };
 
+  // Pull real comments from every active page right now (Graph API poll).
+  const handleScrapeRealComments = async () => {
+    setIsTesting(true);
+    setTestResult(null);
+    try {
+      const res = await fetch('/api/facebook/scrape-comments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      setIsTesting(false);
+      setTestResult(data.message || '❌ ไม่สามารถดูดคอมเมนต์ได้');
+    } catch (err: any) {
+      setIsTesting(false);
+      setTestResult('❌ เกิดข้อผิดพลาดในการดูดคอมเมนต์: ' + err.message);
+    }
+  };
+
+  // Pull real inbox messages from every active page right now (Graph API poll).
+  const handlePollRealInbox = async () => {
+    setIsTesting(true);
+    setTestResult(null);
+    try {
+      const res = await fetch('/api/facebook/poll-inbox', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      setIsTesting(false);
+      setTestResult(data.message || '❌ ไม่สามารถดึงข้อความได้');
+    } catch (err: any) {
+      setIsTesting(false);
+      setTestResult('❌ เกิดข้อผิดพลาดในการดึงข้อความ: ' + err.message);
+    }
+  };
+
   if (!isOpen) return null;
 
   return (
@@ -642,6 +680,34 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
                 <Zap className="w-4 h-4 text-amber-500" />
                 <span>{isTesting ? 'กำลังทดสอบ...' : 'ทดสอบ Ping Webhook'}</span>
               </button>
+            </div>
+
+            {/* Real Comment Scraper + Inbox Poll Buttons */}
+            <div className="p-4 bg-emerald-50/60 dark:bg-emerald-950/20 rounded-2xl border border-emerald-200 dark:border-emerald-800/40 flex flex-col sm:flex-row items-center justify-between gap-3">
+              <div>
+                <h5 className="text-xs font-semibold text-emerald-800 dark:text-emerald-300">ดูดคอมเมนต์จริง & ดึงข้อความจริงจากเพจ</h5>
+                <p className="text-[11px] text-slate-500 dark:text-zinc-400">
+                  ระบบจะดึงคอมเมนต์และข้อความจริงจาก Graph API ทุก 60-90 วินาทีอยู่แล้ว กดปุ่มนี้เพื่อดึงทันที
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={handleScrapeRealComments}
+                  disabled={isTesting}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-2 shadow-xs cursor-pointer"
+                >
+                  <Zap className="w-4 h-4" />
+                  <span>🧲 ดูดคอมเมนต์จริง</span>
+                </button>
+                <button
+                  onClick={handlePollRealInbox}
+                  disabled={isTesting}
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-2 shadow-xs cursor-pointer"
+                >
+                  <Zap className="w-4 h-4" />
+                  <span>📥 ดึงข้อความจริง</span>
+                </button>
+              </div>
             </div>
           </div>
         )}

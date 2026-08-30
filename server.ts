@@ -176,6 +176,26 @@ let deliverLine: ((page: PageConfig, text: string) => Promise<{ success: boolean
 // Mount DATA_FILE to durable storage when hosting on a serverless platform.
 const DATA_FILE = process.env.DATA_FILE || path.join(process.cwd(), 'data', 'superai-v2.8.json');
 const META_GRAPH_API_VERSION = process.env.META_GRAPH_API_VERSION || 'v24.0';
+// Human-like reply pacing: wait ~1.5s before answering so the page does not
+// instant-fire like a bot (Meta anti-spam / BAN prevention). Configurable.
+const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 1500);
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// Dedupe stores: webhook pushes + Graph API polling may deliver the same
+// message/comment twice — never process (or reply to) an event twice.
+const processedMessageIds = new Set<string>();
+const processedCommentIds = new Set<string>();
+function rememberId(store: Set<string>, id: string | undefined | null): boolean {
+  if (!id) return true;
+  if (store.has(id)) return false;
+  store.add(id);
+  if (store.size > 4000) {
+    for (const key of store) {
+      store.delete(key);
+      if (store.size <= 3000) break;
+    }
+  }
+  return true;
+}
 const STORE_SECRET = process.env.ENCRYPTION_SECRET_KEY || process.env.FACEBOOK_APP_SECRET || '';
 function encryptStoredSecret(value: string) {
   if (!value || value.startsWith('store:') || !STORE_SECRET) return value;
@@ -1535,10 +1555,21 @@ async function startServer() {
             return;
           }
 
+          // Dedupe: the same message can arrive via webhook AND inbox polling.
+          const incomingMid = messagingEvent.message?.mid;
+          if (incomingMid && !rememberId(processedMessageIds, incomingMid)) {
+            return;
+          }
+
           if (messagingEvent.message?.text) {
             eventType = 'MESSAGE';
             senderId = messagingEvent.sender?.id || 'UNKNOWN_SENDER';
             messageText = messagingEvent.message.text;
+          } else if (messagingEvent.message?.attachments?.length) {
+            // Customer sent an image/sticker/file — acknowledge instead of staying silent.
+            eventType = 'MESSAGE';
+            senderId = messagingEvent.sender?.id || 'UNKNOWN_SENDER';
+            messageText = '(ลูกค้าส่งรูปภาพหรือไฟล์แนบมา ไม่มีข้อความ ให้ตอบว่าได้รับรูปเรียบร้อยแล้ว พร้อมสอบถามว่าสนใจสินค้าตัวไหน)';
           } else if (messagingEvent.postback?.payload) {
             eventType = 'MESSAGE';
             senderId = messagingEvent.sender?.id || 'UNKNOWN_SENDER';
@@ -1565,6 +1596,11 @@ async function startServer() {
       }
 
       if (eventType === 'UNKNOWN' || !messageText) {
+        return;
+      }
+
+      // Dedupe comment events (webhook feed changes + comment scraper polling).
+      if (eventType === 'COMMENT' && commentId && !rememberId(processedCommentIds, commentId)) {
         return;
       }
 
@@ -1647,6 +1683,7 @@ async function startServer() {
           );
 
           if (commentId) {
+            await sleep(REPLY_DELAY_MS); // human-like pacing before replying publicly
             await sendFacebookCommentReply(page.page_access_token || '', commentId, replyText);
           }
 
@@ -1654,6 +1691,7 @@ async function startServer() {
           const autoInboxMsg = `สวัสดีค่ะคุณลูกค้า สนใจ ${page.product?.product_name || 'สินค้า'} แอดมินส่งรายละเอียดและของแถมพิเศษให้ในแชทนี้แล้วนะคะ 🙏`;
           addLog('AI_REPLY', senderId, pageId, `📨 ส่งข้อความทัก Inbox: "${autoInboxMsg}"`, 'SUCCESS');
 
+          await sleep(REPLY_DELAY_MS);
           await sendFacebookMessage(page.page_access_token || '', senderId, autoInboxMsg);
         }
         return;
@@ -1913,6 +1951,8 @@ ${JSON.stringify(customer, null, 2)}
         );
 
         // Send the AI answer, then the configured sales step (text/image) for this Page.
+        // Human-like pacing: wait ~1.5s so the reply doesn't instant-fire (Meta BAN prevention).
+        await sleep(REPLY_DELAY_MS);
         await sendFacebookMessage(page.page_access_token || '', senderId, replyText);
         await sendConfiguredSequenceStep(page, senderId, Math.min(6, Math.max(1, Number(parsed.sequenceStep) || 1)));
 
@@ -1969,6 +2009,7 @@ ${JSON.stringify(customer, null, 2)}
         console.error('Gemini AI execution error:', aiErr);
         const fallbackReply = `${matchedProduct.opening_text}\n\n${matchedProduct.detail_text}\n\n${matchedProduct.promotion_text}\n\n${matchedProduct.closing_text}`;
         addLog('AI_REPLY', senderId, pageId, `🤖 ตอบกลับตามชีท (Fallback): "${fallbackReply.substring(0, 80)}..."`, 'INFO');
+        await sleep(REPLY_DELAY_MS);
         await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply.trim() || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าได้เลยนะคะ 🙏');
         await sendConfiguredSequenceStep(page, senderId, 1);
       }
@@ -1985,6 +2026,154 @@ ${JSON.stringify(customer, null, 2)}
   app.post('/webhooks/facebook', handleWebhookPost);
   app.post('/api/webhook/facebook', handleWebhookPost);
   app.post('/api/webhooks/facebook', handleWebhookPost);
+
+  // =====================================================================
+  // REAL INBOX & COMMENT POLLING ENGINE
+  // Even when Meta webhook events never arrive (not subscribed / network),
+  // every active page must still answer real inbox messages and moderate
+  // real comments. We pull straight from the Graph API on an interval and
+  // route each new event through the exact same pipeline above.
+  // =====================================================================
+  const fakeRes = () => ({ status: () => ({ json: () => {} }), sendStatus: () => {} } as any);
+
+  async function dispatchSyntheticEvent(body: any) {
+    try {
+      await handleWebhookPost({ body, isInternal: true } as any, fakeRes());
+    } catch (err: any) {
+      addLog('INFO', 'SYSTEM', 'SYSTEM', `Polling dispatch error: ${err.message}`, 'ERROR');
+    }
+  }
+
+  // Pull latest Messenger conversations for a page; every new customer
+  // message is answered through the normal AI reply flow.
+  async function pollPageInbox(page: PageConfig) {
+    const rawToken = decryptToken(page.page_access_token || '');
+    if (!rawToken?.startsWith('EAA')) return { success: false, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
+    try {
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/conversations?platform=messenger&fields=participants,updated_time,messages.limit(4){id,from,message,created_time}&limit=15&access_token=${encodeURIComponent(rawToken)}`;
+      const res = await fetch(url);
+      const data: any = await res.json();
+      if (data.error) throw new Error(data.error.message || 'Graph API error');
+      let dispatched = 0;
+      for (const convo of (data.data || [])) {
+        const messages: any[] = convo.messages?.data || [];
+        // Graph returns newest-first; reverse so replies follow real order.
+        for (const msg of [...messages].reverse()) {
+          if (!msg?.id || !msg.from || msg.from.id === page.page_id) continue; // skip page's own messages
+          if (!msg.message || processedMessageIds.has(msg.id)) continue;
+          dispatched++;
+          await dispatchSyntheticEvent({
+            object: 'page',
+            entry: [{
+              id: page.page_id,
+              messaging: [{
+                sender: { id: msg.from.id },
+                message: { mid: msg.id, text: msg.message },
+                timestamp: Date.parse(msg.created_time) || Date.now()
+              }]
+            }]
+          });
+        }
+      }
+      if (dispatched > 0) {
+        addLog('INFO', 'INBOX_POLL', page.page_id, `📥 ดูดข้อความ Inbox จริง: พบข้อความใหม่ ${dispatched} รายการ และตอบกลับแล้ว`, 'SUCCESS');
+      }
+      return { success: true, dispatched };
+    } catch (err: any) {
+      addLog('INFO', 'INBOX_POLL', page.page_id, `❌ ดูดข้อความ Inbox ไม่สำเร็จ: ${err.message}`, 'ERROR');
+      return { success: false, error: err.message };
+    }
+  }
+
+  // Pull real comments from the page feed; each new comment goes through the
+  // same moderation + auto-reply + inbox-invite flow as webhook events.
+  async function scrapePageComments(page: PageConfig) {
+    const rawToken = decryptToken(page.page_access_token || '');
+    if (!rawToken?.startsWith('EAA')) return { success: false, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
+    try {
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/feed?fields=id,message,permalink_url,comments.limit(50).order(chronological){id,message,from,created_time}&limit=8&access_token=${encodeURIComponent(rawToken)}`;
+      const res = await fetch(url);
+      const data: any = await res.json();
+      if (data.error) throw new Error(data.error.message || 'Graph API error');
+      let scannedPosts = 0;
+      let newComments = 0;
+      for (const post of (data.data || [])) {
+        scannedPosts++;
+        for (const comment of (post.comments?.data || [])) {
+          if (!comment?.id || comment.from?.id === page.page_id) continue; // skip page's own replies
+          if (processedCommentIds.has(comment.id)) continue;
+          newComments++;
+          await dispatchSyntheticEvent({
+            object: 'page',
+            entry: [{
+              id: page.page_id,
+              changes: [{
+                field: 'feed',
+                value: {
+                  item: 'comment',
+                  verb: 'add',
+                  from: { id: comment.from?.id || 'COMMENT_USER', name: comment.from?.name || '' },
+                  message: comment.message || '',
+                  comment_id: comment.id,
+                  post_id: post.id,
+                  created_time: comment.created_time
+                }
+              }]
+            }]
+          });
+        }
+      }
+      if (newComments > 0) {
+        addLog('COMMENT', 'COMMENT_SCRAPER', page.page_id, `🧲 ดูดคอมเมนต์จริงจาก ${scannedPosts} โพสต์: พบคอมเมนต์ใหม่ ${newComments} รายการ`, 'SUCCESS');
+      }
+      return { success: true, scannedPosts, newComments };
+    } catch (err: any) {
+      addLog('INFO', 'COMMENT_SCRAPER', page.page_id, `❌ ดูดคอมเมนต์จริงไม่สำเร็จ: ${err.message}`, 'ERROR');
+      return { success: false, error: err.message };
+    }
+  }
+
+  // Manual trigger: scrape real comments right now (all active pages or one page)
+  app.post('/api/facebook/scrape-comments', async (req: Request, res: Response) => {
+    const { page_id } = req.body || {};
+    const targets = db.pages.filter(p => (page_id ? p.page_id === page_id : p.is_active && p.auto_reply));
+    if (!targets.length) {
+      return res.status(404).json({ success: false, message: 'ไม่พบเพจที่พร้อมดูดคอมเมนต์ (ต้องเปิดใช้งานเพจและเชื่อมต่อ Page Access Token แล้ว)' });
+    }
+    const results: any[] = [];
+    for (const page of targets) {
+      const r = await scrapePageComments(page);
+      results.push({ page_id: page.page_id, page_name: page.page_name, ...r });
+    }
+    const totalNew = results.reduce((sum, r) => sum + (r.newComments || 0), 0);
+    res.json({
+      success: true,
+      message: totalNew > 0
+        ? `🧲 ดูดคอมเมนต์จริงสำเร็จ: พบคอมเมนต์ใหม่ ${totalNew} รายการ ระบบตอบกลับตามกฎที่ตั้งไว้แล้ว`
+        : '✅ ดูดคอมเมนต์จริงสำเร็จ: ยังไม่มีคอมเมนต์ใหม่เข้ามาในตอนนี้',
+      results
+    });
+  });
+
+  // Manual trigger: pull real inbox messages right now
+  app.post('/api/facebook/poll-inbox', async (req: Request, res: Response) => {
+    const { page_id } = req.body || {};
+    const targets = db.pages.filter(p => (page_id ? p.page_id === page_id : p.is_active && p.auto_reply));
+    if (!targets.length) {
+      return res.status(404).json({ success: false, message: 'ไม่พบเพจที่พร้อมดึงข้อความ (ต้องเปิดใช้งานเพจและเชื่อมต่อ Page Access Token แล้ว)' });
+    }
+    const results: any[] = [];
+    for (const page of targets) {
+      const r = await pollPageInbox(page);
+      results.push({ page_id: page.page_id, page_name: page.page_name, ...r });
+    }
+    const total = results.reduce((sum, r) => sum + (r.dispatched || 0), 0);
+    res.json({
+      success: true,
+      message: total > 0 ? `📥 พบข้อความใหม่ ${total} รายการ และระบบตอบกลับแล้ว` : '✅ ดึงข้อความสำเร็จ: ยังไม่มีข้อความใหม่ในตอนนี้',
+      results
+    });
+  });
 
   // 3. Database Data APIs (Read & Write for all Google Sheets tables)
   app.get('/api/data', (req: Request, res: Response) => {
@@ -2918,6 +3107,37 @@ ${String(rawText).slice(0, 12000)}
     app.get('*', (req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
+  }
+
+  // Background polling so every active page answers real messages/comments
+  // even when Meta webhook events never arrive. (Skipped on serverless Vercel
+  // where the manual trigger endpoints above are used instead.)
+  if (process.env.VERCEL !== '1') {
+    let inboxPollRunning = false;
+    setInterval(async () => {
+      if (inboxPollRunning) return;
+      inboxPollRunning = true;
+      try {
+        for (const page of db.pages.filter(p => p.is_active && p.auto_reply)) {
+          await pollPageInbox(page);
+        }
+      } finally {
+        inboxPollRunning = false;
+      }
+    }, 60_000);
+
+    let commentPollRunning = false;
+    setInterval(async () => {
+      if (commentPollRunning) return;
+      commentPollRunning = true;
+      try {
+        for (const page of db.pages.filter(p => p.is_active && p.auto_reply && p.scrape_comments_enabled !== false)) {
+          await scrapePageComments(page);
+        }
+      } finally {
+        commentPollRunning = false;
+      }
+    }, 90_000);
   }
 
   if (process.env.VERCEL !== '1') {
