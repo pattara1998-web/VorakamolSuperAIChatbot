@@ -70,6 +70,68 @@ const db: DatabaseStore = {
   emergencyAlerts: []
 };
 
+// ---------------------------------------------------------------------------
+// Safe Base Page Template Factory
+// INITIAL_PAGES may be an empty array (Strictly Real Data mode), so relying
+// on INITIAL_PAGES[0] directly causes "Cannot read properties of undefined
+// (reading 'page_cover')" during Facebook connection. This factory guarantees
+// a fully-formed PageConfig fallback at all times.
+// ---------------------------------------------------------------------------
+const DEFAULT_PAGE_AVATAR = 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=200&h=200&q=80';
+const DEFAULT_PAGE_COVER = 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80';
+
+function createDefaultPageTemplate(): PageConfig {
+  return {
+    page_id: 'template-default',
+    page_name: 'เพจใหม่',
+    category: 'CHINA',
+    page_access_token: '',
+    verify_token: 'FB_AI_SALES_TOKEN_2026',
+    is_active: true,
+    auto_reply: true,
+    auto_close_ai: true,
+    page_avatar: DEFAULT_PAGE_AVATAR,
+    page_cover: DEFAULT_PAGE_COVER,
+    follower_count: 0,
+    likes_count: 0,
+    inquiries_count: 0,
+    ai_model: 'gemini-3.7-flash',
+    admin_name: 'แอดมิน AI',
+    ai_tone: 'FRIENDLY',
+    ai_custom_instructions: 'ตอบลูกค้าด้วยความสุภาพ แนะนำโปรโมชั่นและเก็บเงินปลายทางทันที',
+    ai_brevity_mode: true,
+    product: {
+      product_id: '',
+      product_name: '',
+      category: 'CHINA',
+      base_price: 0,
+      display_price: 0,
+      description: '',
+      promotions: [],
+      images: { main: '', detail: '', promotion: '', review: '', closing: '' }
+    },
+    sequence: {
+      step1_opening_text: '',
+      step2_product_image: '',
+      step3_promotion_detail: '',
+      step4_promotion_image: '',
+      step5_review_image: '',
+      step6_closing_text: ''
+    },
+    scrape_comments_enabled: false,
+    auto_inbox_with_comment_context: false,
+    hide_toxic_comments: true,
+    toxic_keywords: [],
+    purchase_keywords: [],
+    followup_enabled: false,
+    followup_messages: []
+  };
+}
+
+function getBasePageTemplate(): PageConfig {
+  return INITIAL_PAGES[0] || createDefaultPageTemplate();
+}
+
 let deliverTelegram: ((page: PageConfig, text: string) => Promise<{ success: boolean; [key: string]: any }>) | null = null;
 let deliverLine: ((page: PageConfig, text: string) => Promise<{ success: boolean; [key: string]: any }>) | null = null;
 
@@ -1033,7 +1095,7 @@ async function startServer() {
         return renderPopupResponse(true, 'เชื่อมต่อบัญชีสำเร็จ แต่ไม่พบเพจที่คุณเป็นผู้ดูแลในบัญชีนี้', { origin, count: 0, warning: 'no_pages' });
       }
 
-      const basePage = INITIAL_PAGES[0];
+      const basePage = getBasePageTemplate();
       const syncedPages: PageConfig[] = [];
 
       // 6. Securely Store Pages in Database with AES-256-GCM Encryption
@@ -1144,7 +1206,7 @@ async function startServer() {
         }
 
         const detectedCategory: ProductCategory = data.category?.toUpperCase().includes('RELIG') ? 'AMULET' : data.category?.toUpperCase().includes('AGRI') ? 'AGRICULTURE' : 'CHINA';
-        const basePage = INITIAL_PAGES[0];
+        const basePage = getBasePageTemplate();
         const encryptedPageToken = encryptToken(rawToken);
 
         const newPage: PageConfig = {
@@ -1199,7 +1261,7 @@ async function startServer() {
         return res.json({ success: true, pages: [], count: 0, message: 'ไม่พบเพจที่บัญชีนี้เป็นผู้ดูแล (กรุณาตรวจสอบสิทธิ์ pages_show_list)' });
       }
 
-      const basePage = INITIAL_PAGES[0];
+      const basePage = getBasePageTemplate();
       const syncedPages: PageConfig[] = [];
 
       for (const fbPage of rawPages) {
