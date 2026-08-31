@@ -2358,6 +2358,91 @@ ${JSON.stringify(customer, null, 2)}
     });
   });
 
+  // Chat Inbox API: Fetch conversations for a page (for admin reply UI)
+  app.get('/api/facebook/inbox', async (req: Request, res: Response) => {
+    const page_id = req.query.page_id as string;
+    if (!page_id) {
+      return res.status(400).json({ success: false, message: 'ต้องระบุ page_id' });
+    }
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) {
+      return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    }
+    const rawToken = decryptToken(page.page_access_token || '');
+    if (!rawToken?.startsWith('EAA')) {
+      return res.status(400).json({ success: false, message: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' });
+    }
+    try {
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/conversations?platform=messenger&fields=participants,updated_time,messages.limit(50){id,from,message,created_time,attachments}&limit=25&access_token=${encodeURIComponent(rawToken)}`;
+      const res2 = await fetch(url);
+      const data: any = await res2.json();
+      if (data.error) {
+        addLog('INFO', 'INBOX_API', page_id, `❌ ดึง Inbox ไม่สำเร็จ: ${data.error.message}`, 'ERROR');
+        return res.status(502).json({ success: false, error: data.error });
+      }
+      // Group messages by participant (customer)
+      const conversations: any[] = (data.data || []).map((convo: any) => {
+        const messages: any[] = (convo.messages?.data || []).reverse();
+        const otherParticipant = convo.participants?.data?.find((p: any) => p.id !== page_id);
+        return {
+          thread_id: convo.id,
+          participant: otherParticipant || { id: 'unknown', name: 'ไม่ทราบชื่อ' },
+          updated_time: convo.updated_time,
+          messages: messages.map((m: any) => ({
+            id: m.id,
+            from: m.from,
+            message: m.message || '',
+            created_time: m.created_time,
+            is_from_page: m.from?.id === page_id,
+            attachments: m.attachments?.data || []
+          }))
+        };
+      });
+      addLog('INFO', 'INBOX_API', page_id, `📥 ดึง Inbox สำเร็จ: ${conversations.length} บทสนทนา`, 'SUCCESS');
+      res.json({ success: true, conversations, page_id, page_name: page.page_name });
+    } catch (err: any) {
+      addLog('INFO', 'INBOX_API', page_id, `❌ ดึง Inbox ไม่สำเร็จ: ${err.message}`, 'ERROR');
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // Send Message API: Admin sends message to customer via page
+  app.post('/api/facebook/send-message', async (req: Request, res: Response) => {
+    const { page_id, recipient_id, message } = req.body || {};
+    if (!page_id || !recipient_id || !message) {
+      return res.status(400).json({ success: false, message: 'ต้องระบุ page_id, recipient_id และ message' });
+    }
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) {
+      return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    }
+    const rawToken = decryptToken(page.page_access_token || '');
+    if (!rawToken?.startsWith('EAA')) {
+      return res.status(400).json({ success: false, message: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' });
+    }
+    try {
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`;
+      const fetchRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipient: { id: recipient_id },
+          message: { text: message }
+        })
+      });
+      const data: any = await fetchRes.json();
+      if (data.error) {
+        addLog('INFO', 'SEND_MSG', page_id, `❌ ส่งข้อความไม่สำเร็จ: ${data.error.message}`, 'ERROR');
+        return res.status(502).json({ success: false, error: data.error });
+      }
+      addLog('INFO', 'SEND_MSG', page_id, `✅ ส่งข้อความถึง ${recipient_id} สำเร็จ`, 'SUCCESS');
+      res.json({ success: true, message_id: data.message_id });
+    } catch (err: any) {
+      addLog('INFO', 'SEND_MSG', page_id, `❌ ส่งข้อความไม่สำเร็จ: ${err.message}`, 'ERROR');
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // 3. Database Data APIs (Read & Write for all Google Sheets tables)
   app.get('/api/data', (req: Request, res: Response) => {
     const sanitizedPages = db.pages.map(p => ({

@@ -9,6 +9,7 @@ import { CommentModerationTab } from './components/CommentModerationTab';
 import { FollowUpEngineTab } from './components/FollowUpEngineTab';
 import { OrdersAndLineTab } from './components/OrdersAndLineTab';
 import { SystemDocsTab } from './components/SystemDocsTab';
+import { ChatInboxTab } from './components/ChatInboxTab';
 import { FacebookConnectModal } from './components/FacebookConnectModal';
 import { PageSettingsModal } from './components/PageSettingsModal';
 import { AiApiSettingsModal } from './components/AiApiSettingsModal';
@@ -663,6 +664,14 @@ export default function App() {
             onOpenConnectModal={() => setIsConnectModalOpen(true)}
             onAddNewPage={handleAddNewPage}
             onUpdatePageTag={handleUpdatePageTag}
+          />
+        )}
+
+        {activeTab === 'chat_inbox' && (
+          <ChatInboxTab
+            pages={pages}
+            selectedPageId={selectedPageId}
+            theme={theme}
           />
         )}
 

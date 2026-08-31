@@ -2559,13 +2559,17 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                     </p>
                   </div>
                   <span className="text-xs font-mono font-bold text-slate-700 dark:text-zinc-300">
-                    {(formData.quick_replies || []).length} / 13 ปุ่ม
+                    {(formData.quick_replies || []).length} / 50 ปุ่ม
                   </span>
                 </div>
+                <p className="text-[10px] text-slate-500 dark:text-zinc-500 mt-1">
+                   Facebook Messenger รองรับสูงสุด 13 ปุ่มต่อข้อความ ระบบจะสุ่มเลือก 13 ปุ่มจากทั้งหมดที่ตั้งค่าไว้
+                </p>
 
                 <div className="space-y-2">
                   {(formData.quick_replies || []).map((qr, idx) => (
                     <div key={idx} className="flex items-center gap-2">
+                      <span className="text-[10px] font-mono text-slate-400 dark:text-zinc-500 w-6 text-right">#{idx + 1}</span>
                       <input
                         type="text"
                         placeholder="ชื่อปุ่ม (สูงสุด 20 ตัวอักษร)"
@@ -2603,7 +2607,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                     </div>
                   ))}
 
-                  {(formData.quick_replies || []).length < 13 && (
+                  {(formData.quick_replies || []).length < 50 && (
                     <button
                       type="button"
                       onClick={() => {

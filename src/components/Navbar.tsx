@@ -26,7 +26,8 @@ import {
   Terminal,
   ChevronLeft,
   ChevronRight,
-  SlidersHorizontal
+  SlidersHorizontal,
+  Inbox
 } from 'lucide-react';
 import { PageConfig } from '../types';
 
@@ -89,6 +90,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   
   const navItems: Array<{id: string, label: string, icon: any, badge?: string, count?: number, iconColor?: string}> = [
     { id: 'pages_hub', label: 'ศูนย์รวมเพจ (Pages Hub)', icon: Layers, iconColor: 'text-blue-500' },
+    { id: 'chat_inbox', label: 'แชท Inbox 💬', icon: Inbox, iconColor: 'text-cyan-500' },
     { id: 'dashboard', label: 'แดชบอร์ด & ยอดขาย', icon: LayoutDashboard, badge: 'PRO', iconColor: 'text-indigo-500' },
     { id: 'simulator', label: 'จำลองแชท AI ปิดการขาย', icon: MessageSquare, badge: 'TEST', iconColor: 'text-emerald-500' },
     { id: 'orders', label: 'ออเดอร์ & ขนส่ง (COD)', icon: ShoppingBag, count: totalOrders, iconColor: 'text-amber-500' },
