@@ -184,6 +184,75 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // message/comment twice — never process (or reply to) an event twice.
 const processedMessageIds = new Set<string>();
 const processedCommentIds = new Set<string>();
+
+// Track recent AI replies per sender to prevent repetition
+interface RecentReply {
+  senderId: string;
+  pageId: string;
+  replyText: string;
+  timestamp: number;
+}
+const recentReplies: RecentReply[] = [];
+const MAX_RECENT_REPLIES = 50; // Keep last 50 replies
+const REPLY_MEMORY_WINDOW_MS = 5 * 60 * 1000; // 5 minute window
+
+// Clean old entries from recentReplies
+function cleanRecentReplies() {
+  const now = Date.now();
+  const filtered = recentReplies.filter(r => now - r.timestamp < REPLY_MEMORY_WINDOW_MS);
+  if (filtered.length < recentReplies.length) {
+    while (recentReplies.length > 0) recentReplies.pop();
+    recentReplies.push(...filtered);
+  }
+}
+
+// Check if this reply text is too similar to a recent reply from the same sender/page
+function isRepeatedReply(pageId: string, senderId: string, newText: string): boolean {
+  cleanRecentReplies();
+  const senderReplies = recentReplies.filter(r => r.pageId === pageId && r.senderId === senderId);
+  if (senderReplies.length === 0) return false;
+  
+  // Normalize texts for comparison
+  const normalize = (t: string) => t.replace(/[^\w\s\u0000-\u00FF]/g, '').trim().toLowerCase();
+  const normalizedNew = normalize(newText);
+  if (normalizedNew.length < 10) return false; // Skip short texts
+  
+  // Check similarity with recent replies
+  for (const recent of senderReplies) {
+    const normalizedRecent = normalize(recent.replyText);
+    if (normalizedRecent.length < 10) continue;
+    
+    // Exact match check
+    if (normalizedNew === normalizedRecent) return true;
+    
+    // Substring check (new reply contains old reply or vice versa with 80%+ overlap)
+    if (normalizedNew.includes(normalizedRecent) || normalizedRecent.includes(normalizedNew)) {
+      const shorter = Math.min(normalizedNew.length, normalizedRecent.length);
+      const longer = Math.max(normalizedNew.length, normalizedRecent.length);
+      if (shorter / longer > 0.8) return true; // 80%+ overlap
+    }
+    
+    // Word overlap check (at least 70% of words are the same)
+    const newWords = normalizedNew.split(/\s+/).filter(w => w.length > 2);
+    const recentWords = normalizedRecent.split(/\s+/).filter(w => w.length > 2);
+    if (newWords.length >= 3 && recentWords.length >= 3) {
+      const commonWords = newWords.filter(w => recentWords.includes(w));
+      if (commonWords.length / Math.max(newWords.length, recentWords.length) > 0.7) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Add reply to recent history
+function addRecentReply(pageId: string, senderId: string, replyText: string) {
+  cleanRecentReplies();
+  recentReplies.unshift({ senderId, pageId, replyText, timestamp: Date.now() });
+  if (recentReplies.length > MAX_RECENT_REPLIES) {
+    recentReplies.pop();
+  }
+}
 function rememberId(store: Set<string>, id: string | undefined | null): boolean {
   if (!id) return true;
   if (store.has(id)) return false;
@@ -1995,8 +2064,15 @@ async function startServer() {
 ลักษณะการตอบและบุคลิก:
 - ชื่อแอดมิน: ${adminName}
 - โทนเสียง: ${aiTone}
-- ความยาวคำตอบ: ${brevityMode ? 'ตอบสั้น กระชับ ตรงประเด็น ไม่เยิ่นเย้อ เหมือนคนพิมพ์แชทมือถือจริง' : 'ให้ข้อมูลครบถ้วน ชัดเจน'}
+- ความยาวคำตอบ: ${brevityMode ? 'ตอบสั้น กระชับ ตรงประเด็น ไม่เยิ่นเย้อ เหมือนคนพิมพ์แชทมือถือจริง (สูงสุด 2-3 ประโยค)' : 'ให้ข้อมูลครบถ้วน ชัดเจน แต่ไม่ต้องยาวเกิน 5 ประโยค'}
 - คำสั่งเฉพาะของเพจนี้: ${customInstructions}
+
+⚠️ กฎสำคัญที่สุด - ต้องทำตามนี้ทุกข้อ:
+1. ตอบให้ตรงคำถามของลูกค้าโดยเฉพาะ อย่าตอบวกไปวนมา
+2. ห้ามตอบข้อความเดิมซ้ำถ้าลูกค้าถามคำถามเดิม ให้ปรับวิธีตอบเสมอ
+3. ถ้าลูกค้าถามเรื่องเดิม ให้ตอบเพิ่มเติมจากที่เคยตอบ ไม่ใช่ตอบซ้ำประโยคเดิม
+4. ตอบเหมือนมนุษย์คุยจริง สั้น กระชับ เป็นธรรมชาติ
+5. ห้ามตอบยาวเป็นเรียงความเด็ดขาด
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
@@ -2030,7 +2106,7 @@ ${JSON.stringify((page.product?.promotions || [
 ข้อมูลลูกค้าปัจจุบัน:
 ${JSON.stringify(customer, null, 2)}
 
-กฎเหล็ก:
+กฎเหล็กเพิ่มเติม:
 1. ตอบแบบมนุษย์ที่เป็นแอดมินจริงๆ เท่านั้น ห้ามตอบยาวเป็นเรียงความ และห้ามอ้างอิงว่าเป็น AI
 2. ให้ข้อมูลเฉพาะโปรโมชั่นและสินค้าของเพจนี้ ห้ามแต่งข้อมูล ห้ามเดา
 3. หากเป็นพระเครื่อง: ห้ามสร้างพุทธคุณเอง ให้ใช้ข้อมูลแท้เท่านั้น
@@ -2038,6 +2114,11 @@ ${JSON.stringify(customer, null, 2)}
 5. หากลูกค้าส่งข้อมูลสั่งซื้อหรือส่งชื่อ/ที่อยู่/เบอร์โทร หรือจำนวน: ให้ตรวจจับเป็น ORDER และดึงข้อมูลลูกค้าออกมาให้ครบถ้วน
 6. เรื่องการจัดส่ง: บอกว่า "ส่งฟรี" ได้เฉพาะแพ็กเกจที่ free_shipping = true เท่านั้น แพ็กเกจที่ free_shipping = false ห้ามบอกส่งฟรีเด็ดขาด ให้บอกว่ามีค่าจัดส่งตามจริง
 7. เรื่องของแถม: บอกของแถมเฉพาะแพ็กเกจที่ gift_quantity > 0 หรือมี free_gifts ระบุเท่านั้น แพ็กเกจที่ไม่มีของแถมห้ามบอกว่ามีของแถม
+
+ตัวอย่างการตอบที่ดี (ต้องตอบแบบนี้ทุกครั้ง แต่ไม่ซ้ำรูปแบบ):
+- ถามราคา: "ราคาเริ่มต้น ฿990 ค่ะ มีโปรโมชั่น 2 ชิ้น ฿1,800 ประหยัดเลย 🎁 สนใจกี่ชิ้นคะ?"
+- ถามคุณภาพ: "สินค้ารับประกันคุณภาพค่ะ ส่งตรงจากแหล่งผลิต มีรีวิวเยอะเลยคะ ✨"
+- ปิดการขาย: "สนใจสั่งซื้อได้เลยค่ะ ส่งฟรีเก็บเงินปลายทางนะคะ 📦"
 
 ข้อความที่ลูกค้าส่งมา:
 "${messageText}"
@@ -2087,8 +2168,65 @@ ${JSON.stringify(customer, null, 2)}
         });
 
         const parsed: any = JSON.parse(response.text?.trim() || '{}');
-        const intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
-        const replyText = parsed.replyText || page.sequence?.step1_opening_text || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นแจ้งได้เลยนะคะ 🙏';
+        let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
+        let replyText = parsed.replyText || page.sequence?.step1_opening_text || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นแจ้งได้เลยนะคะ 🙏';
+
+        // Check if AI generated a repeated reply - regenerate with different wording
+        let regenerationCount = 0;
+        const maxRegenerations = 2;
+        while (isRepeatedReply(pageId, senderId, replyText) && regenerationCount < maxRegenerations) {
+          addLog('INFO', senderId, pageId, `⚠️ ตรวจพบ AI ตอบข้อความซ้ำ กำลังสร้างคำตอบใหม่... (ครั้งที่ ${regenerationCount + 1})`, 'INFO');
+          
+          // Re-run AI with instruction to not repeat
+          const freshPrompt = promptContext + `\n\n⚠️ สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม`;
+          
+          try {
+            const regenResponse = await ai.models.generateContent({
+              model: selectedModel,
+              contents: freshPrompt,
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    intent: { type: Type.STRING, description: 'QUESTION หรือ ORDER' },
+                    replyText: { type: Type.STRING, description: 'ข้อความตอบกลับใหม่ ที่ไม่ซ้ำกับครั้งก่อน' },
+                    sequenceStep: { type: Type.NUMBER, description: 'ขั้นตอน Sales Sequence 1-6' },
+                    isOrderDetected: { type: Type.BOOLEAN, description: 'ตรวจพบเจตนาสั่งซื้อและข้อมูลที่อยู่/เบอร์โทรหรือไม่' },
+                    orderData: {
+                      type: Type.OBJECT,
+                      properties: {
+                        customer_name: { type: Type.STRING },
+                        phone_number: { type: Type.STRING },
+                        address: { type: Type.STRING },
+                        product_id: { type: Type.STRING },
+                        quantity: { type: Type.NUMBER },
+                        unit_price: { type: Type.NUMBER },
+                        total_amount: { type: Type.NUMBER }
+                      }
+                    }
+                  },
+                  required: ['intent', 'replyText', 'isOrderDetected']
+                }
+              }
+            });
+            const regenParsed: any = JSON.parse(regenResponse.text?.trim() || '{}');
+            replyText = regenParsed.replyText || replyText;
+            intent = regenParsed.intent === 'ORDER' || regenParsed.isOrderDetected ? 'ORDER' : intent;
+            regenerationCount++;
+          } catch (regenErr) {
+            addLog('AI_REPLY', senderId, pageId, `❌ ไม่สามารถสร้างคำตอบใหม่ได้: ${regenErr}`, 'ERROR');
+            break;
+          }
+        }
+
+        if (isRepeatedReply(pageId, senderId, replyText)) {
+          addLog('AI_REPLY', senderId, pageId, `⚠️ ยังตรวจพบการตอบซ้ำหลังจากพยายาม ${regenerationCount} ครั้ง ใช้ fallback reply`, 'WARNING');
+          replyText = `ขอโทษนะคะที่คุณถามมาค่ะ 😊 สินค้าของเรามีคุณภาพดี ราคาเริ่มต้น ฿${(page.product?.display_price || matchedProduct.display_price || 990).toLocaleString()} เท่านั้นค่ะ มีโปรโมชั่นพิเศษ สนใจดูรายละเอียดเพิ่มเติมไหมคะ?`;
+        }
+
+        // Track this reply to prevent future repetitions
+        addRecentReply(pageId, senderId, replyText);
 
         // Add Log of AI Closing response
         addLog(
@@ -2097,11 +2235,12 @@ ${JSON.stringify(customer, null, 2)}
           pageId,
           `🤖 AI Closing (${selectedModel} | ${adminName}): "${replyText.substring(0, 100)}${replyText.length > 100 ? '...' : ''}"`,
           'SUCCESS',
-          { fullReply: replyText, matchedProduct: page.product?.product_name || matchedProduct.product_name, model: selectedModel }
+          { fullReply: replyText, matchedProduct: page.product?.product_name || matchedProduct.product_name, model: selectedModel, regenerations: regenerationCount }
         );
 
         // Per-page reply delay (configurable, default to global REPLY_DELAY_MS)
-        const pageDelay = page.reply_delay_ms ?? REPLY_DELAY_MS;
+        // Reduced from 1500ms to 800ms for faster response
+        const pageDelay = page.reply_delay_ms ?? Math.min(REPLY_DELAY_MS, 800);
 
         // Check if this is first message from customer (for quick replies)
         const isFirstMessage = customer.order_count === 0 && !customer.last_interaction;
@@ -3380,7 +3519,9 @@ ${String(rawText).slice(0, 12000)}
   // Background polling so every active page answers real messages/comments
   // even when Meta webhook events never arrive. (Skipped on serverless Vercel
   // where the manual trigger endpoints above are used instead.)
+  // OPTIMIZED: Faster polling intervals for near-instant AI response
   if (process.env.VERCEL !== '1') {
+    // Inbox polling: 10 seconds (was 60s) - ensures AI responds within 10-15 seconds
     let inboxPollRunning = false;
     setInterval(async () => {
       if (inboxPollRunning) return;
@@ -3392,8 +3533,9 @@ ${String(rawText).slice(0, 12000)}
       } finally {
         inboxPollRunning = false;
       }
-    }, 60_000);
+    }, 10_000);
 
+    // Comment scraping: 30 seconds (was 90s) - faster comment moderation
     let commentPollRunning = false;
     setInterval(async () => {
       if (commentPollRunning) return;
@@ -3405,7 +3547,7 @@ ${String(rawText).slice(0, 12000)}
       } finally {
         commentPollRunning = false;
       }
-    }, 90_000);
+    }, 30_000);
   }
 
   if (process.env.VERCEL !== '1') {

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { CheckCircle2 } from 'lucide-react';
 import { Navbar } from './components/Navbar';
 import { PagesHubTab } from './components/PagesHubTab';
 import { SalesDashboardTab } from './components/SalesDashboardTab';
@@ -78,6 +79,25 @@ export default function App() {
   const [orders, setOrders] = useState<Order[]>(() => loadLocal('orders', INITIAL_ORDERS));
   const [logs, setLogs] = useState<ActivityLog[]>([]);
   const [emergencyAlerts, setEmergencyAlerts] = useState<any[]>([]);
+  const [isFacebookConnected, setIsFacebookConnected] = useState(false);
+
+  // Check Facebook connection status
+  useEffect(() => {
+    const checkConnection = async () => {
+      try {
+        const res = await fetch('/api/facebook/connection-status');
+        if (res.ok) {
+          const data = await res.json();
+          setIsFacebookConnected(data.connected && data.count > 0);
+        }
+      } catch (err) {
+        console.error('Failed to check connection status:', err);
+      }
+    };
+    checkConnection();
+    const interval = setInterval(checkConnection, 15000);
+    return () => clearInterval(interval);
+  }, []);
 
   const handleImportPages = async (newPages: PageConfig[]) => {
     setPages(newPages);
@@ -716,7 +736,8 @@ export default function App() {
           />
         )}
 
-        {activeTab === 'simulator' && (
+        {/* Live Simulator Tab - Hidden when Facebook is connected (use real chat instead) */}
+        {activeTab === 'simulator' && !isFacebookConnected && (
           <LiveSimulatorTab
             pages={pages}
             selectedPageId={selectedPageId}
@@ -735,6 +756,30 @@ export default function App() {
             }}
             theme={theme}
           />
+        )}
+        
+        {/* Alert when simulator is accessed but Facebook is connected */}
+        {activeTab === 'simulator' && isFacebookConnected && (
+          <div className={`rounded-xl border p-8 text-center ${
+            theme === 'dark' ? 'bg-[#0F0F12] border-zinc-800' : 'bg-white border-slate-200'
+          }`}>
+            <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-emerald-500/10 flex items-center justify-center">
+              <CheckCircle2 className="w-8 h-8 text-emerald-500" />
+            </div>
+            <h3 className={`text-lg font-bold mb-2 ${theme === 'dark' ? 'text-zinc-100' : 'text-slate-900'}`}>
+              จำลองแชทปิดการใช้งาน
+            </h3>
+            <p className={`text-sm max-w-md mx-auto ${theme === 'dark' ? 'text-zinc-400' : 'text-slate-500'}`}>
+              ระบบจำลองแชทถูกปิดใช้งานเพราะคุณเชื่อมต่อ Facebook Page แล้ว
+              บอทจะตอบข้อความจริงจากลูกค้าอัตโนมัติ คุณสามารถดูและตอบแชทได้ที่แท็บ "แชท Inbox 💬"
+            </p>
+            <button
+              onClick={() => setActiveTab('chat_inbox')}
+              className="mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium transition-colors"
+            >
+              ไปที่แชท Inbox 💬
+            </button>
+          </div>
         )}
 
         {activeTab === 'comments' && (

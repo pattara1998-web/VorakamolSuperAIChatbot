@@ -32,9 +32,28 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<{ connected: boolean; count: number; pages: any[] } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const currentPage = pages.find(p => p.page_id === selectedPageId);
+
+  // Fetch connection status
+  useEffect(() => {
+    const fetchConnectionStatus = async () => {
+      try {
+        const res = await fetch('/api/facebook/connection-status');
+        if (res.ok) {
+          const data = await res.json();
+          setConnectionStatus(data);
+        }
+      } catch (err) {
+        console.error('Failed to fetch connection status:', err);
+      }
+    };
+    fetchConnectionStatus();
+    const interval = setInterval(fetchConnectionStatus, 15000); // Check every 15 seconds
+    return () => clearInterval(interval);
+  }, []);
 
   const fetchInbox = async () => {
     if (!selectedPageId) return;
@@ -186,8 +205,44 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
         </div>
       </div>
 
+      {/* Connection Status Banner */}
+      {connectionStatus && connectionStatus.connected && (
+        <div className={`p-3 rounded-xl border flex items-center gap-3 ${
+          theme === 'dark' ? 'bg-emerald-950/30 border-emerald-800/60' : 'bg-emerald-50 border-emerald-200'
+        }`}>
+          <span className="flex h-3 w-3 relative">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+            <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+          </span>
+          <div className="flex-1">
+            <p className={`text-sm font-bold ${theme === 'dark' ? 'text-emerald-200' : 'text-emerald-900'}`}>
+              เชื่อมต่อ Facebook Page แล้ว ({connectionStatus.count} เพจ)
+            </p>
+            <p className={`text-xs ${theme === 'dark' ? 'text-emerald-300/80' : 'text-emerald-700'}`}>
+              ระบบพร้อมตอบข้อความอัตโนมัติ - อัปเดตทุก 10 วินาที
+            </p>
+          </div>
+        </div>
+      )}
+      
+      {!connectionStatus?.connected && pages.length > 0 && (
+        <div className={`p-3 rounded-xl border flex items-center gap-3 ${
+          theme === 'dark' ? 'bg-red-950/30 border-red-800/60' : 'bg-red-50 border-red-200'
+        }`}>
+          <span className="flex h-3 w-3 rounded-full bg-red-500"></span>
+          <div className="flex-1">
+            <p className={`text-sm font-bold ${theme === 'dark' ? 'text-red-200' : 'text-red-900'}`}>
+              ยังไม่ได้เชื่อมต่อ Facebook Page
+            </p>
+            <p className={`text-xs ${theme === 'dark' ? 'text-red-300/80' : 'text-red-700'}`}>
+              กรุณาเชื่อมต่อ Facebook Page ผ่านปุ่ม "เชื่อมต่อ FB" ด้านบน
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Token Warning */}
-      {!isTokenConfigured && (
+      {!isTokenConfigured && !connectionStatus?.connected && (
         <div className={`p-4 rounded-xl border ${
           theme === 'dark' ? 'bg-amber-950/30 border-amber-800/60' : 'bg-amber-50 border-amber-200'
         }`}>
