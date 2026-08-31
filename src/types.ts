@@ -276,6 +276,24 @@ export interface PageConfig {
     message: string;
   }[];
 
+  // Reply delay (ms) — per-page configurable. 0 = instant, 500 = 0.5s, 1500 = 1.5s
+  reply_delay_ms?: number;
+
+  // Bot control: /stop command pauses auto-reply for this page
+  bot_stopped?: boolean;
+
+  // Rate limiting: max replies per sender per hour (prevents spam/nonsense)
+  rate_limit_per_hour?: number; // default 30
+
+  // Messenger Quick Reply buttons (3-4 buttons shown to customer on first message)
+  quick_replies?: {
+    title: string;    // Button label (max 20 chars)
+    payload: string;  // Payload sent when tapped
+  }[];
+
+  // Sales Sequence auto-trigger: fire immediately on first message or "สนใจ"
+  sales_sequence_auto_trigger?: boolean;
+
   // COD Order Summary Format & Selected Fields
   cod_summary_template?: string;
   cod_summary_fields?: CodSummaryFieldsConfig;

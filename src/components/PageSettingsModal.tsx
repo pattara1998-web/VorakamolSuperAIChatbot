@@ -55,7 +55,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
   const originalPageIdRef = React.useRef(page?.page_id);
 
   const [activeSubTab, setActiveSubTab] = useState<
-    'ai_persona' | 'sales_sequence' | 'comments' | 'followup' | 'detailed_specs' | 'product_promos' | 'cod_summary' | 'notifications' | 'facebook'
+    'ai_persona' | 'sales_sequence' | 'comments' | 'followup' | 'detailed_specs' | 'product_promos' | 'cod_summary' | 'notifications' | 'facebook' | 'bot_settings'
   >('ai_persona');
 
   // AI Auto-Key State
@@ -764,7 +764,8 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
             { id: 'product_promos', label: '6. แพ็กเกจโปรโมชั่น (ราคา/แถม)', icon: ShoppingBag },
             { id: 'cod_summary', label: '7. ระบบสรุปยอดลูกค้า (COD)', icon: Copy },
             { id: 'notifications', label: '8. ส่งสรุปไป Telegram / LINE', icon: Bell },
-            { id: 'facebook', label: '9. เชื่อมต่อ Facebook API 🔌', icon: Facebook }
+            { id: 'facebook', label: '9. เชื่อมต่อ Facebook API 🔌', icon: Facebook },
+            { id: 'bot_settings', label: '10. ตั้งค่าบอท ⚙️', icon: Settings }
           ].map(tab => {
             const Icon = tab.icon;
             const isActive = activeSubTab === tab.id;
@@ -2404,6 +2405,269 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                       </p>
                     </div>
                   </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 10: BOT SETTINGS - Reply Delay, Bot Control, Rate Limit, Quick Replies, Sales Sequence Auto-Trigger */}
+          {activeSubTab === 'bot_settings' && (
+            <div className="space-y-6">
+              {/* Reply Delay Setting */}
+              <div className="bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-xl p-5 space-y-4 shadow-xs">
+                <h4 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                  ตั้งค่าเวลาตอบกลับ (Reply Delay)
+                </h4>
+                <p className="text-xs text-slate-500 dark:text-zinc-400">
+                  กำหนดเวลารอก่อนส่งข้อความตอบกลับ (0 = ตอบทันที, 500 = 0.5 วินาที, 1500 = 1.5 วินาที)
+                </p>
+
+                <div className="space-y-3">
+                  <div className="flex items-center gap-4">
+                    <input
+                      type="range"
+                      min="0"
+                      max="5000"
+                      step="100"
+                      value={formData.reply_delay_ms ?? 1500}
+                      onChange={e => setFormData(prev => ({ ...prev, reply_delay_ms: Number(e.target.value) }))}
+                      className="flex-1 h-2 bg-slate-200 dark:bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                    />
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min="0"
+                        max="30000"
+                        step="100"
+                        value={formData.reply_delay_ms ?? 1500}
+                        onChange={e => setFormData(prev => ({ ...prev, reply_delay_ms: Number(e.target.value) }))}
+                        className="w-20 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none text-center font-mono"
+                      />
+                      <span className="text-xs text-slate-500 dark:text-zinc-400">ms</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between text-[10px] text-slate-400 dark:text-zinc-500 font-mono">
+                    <span>0ms (ทันที)</span>
+                    <span>1500ms (1.5 วิ)</span>
+                    <span>5000ms (5 วิ)</span>
+                  </div>
+                  <div className="p-3 bg-indigo-50 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-800/60 rounded-lg">
+                    <span className="text-xs text-indigo-900 dark:text-indigo-200 font-medium">
+                      ⏱️ ปัจจุบัน: {(formData.reply_delay_ms ?? 1500) / 1000} วินาที
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Bot Control */}
+              <div className="bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-xl p-5 space-y-4 shadow-xs">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 flex items-center gap-2">
+                      <Bot className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                      ควบคุมบอท (Bot Control)
+                    </h4>
+                    <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
+                      หยุด/เปิดใช้งานบอทตอบข้อความอัตโนมัติ (หรือใช้คำสั่ง /stop, /start ในแชท)
+                    </p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={!formData.bot_stopped}
+                      onChange={e => setFormData(prev => ({ ...prev, bot_stopped: !e.target.checked }))}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500"></div>
+                  </label>
+                </div>
+                <div className={`p-3 rounded-lg border ${
+                  formData.bot_stopped
+                    ? 'bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800/60'
+                    : 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800/60'
+                }`}>
+                  <span className={`text-xs font-medium ${
+                    formData.bot_stopped
+                      ? 'text-red-900 dark:text-red-200'
+                      : 'text-emerald-900 dark:text-emerald-200'
+                  }`}>
+                    {formData.bot_stopped
+                      ? '⏹️ บอทถูกหยุด - ระบบจะไม่ตอบข้อความอัตโนมัติ'
+                      : '▶️ บอทกำลังทำงาน - ระบบจะตอบข้อความอัตโนมัติ'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Rate Limiting */}
+              <div className="bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-xl p-5 space-y-4 shadow-xs">
+                <h4 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                  จำกัดการตอบกลับ (Rate Limiting)
+                </h4>
+                <p className="text-xs text-slate-500 dark:text-zinc-400">
+                  จำกัดจำนวนข้อความตอบกลับต่อลูกค้าต่อชั่วโมง (ป้องกันบอทตอบมากเกินไปหรือตอบมั่ว)
+                </p>
+
+                <div className="space-y-3">
+                  <div className="flex items-center gap-4">
+                    <input
+                      type="range"
+                      min="5"
+                      max="100"
+                      step="5"
+                      value={formData.rate_limit_per_hour ?? 30}
+                      onChange={e => setFormData(prev => ({ ...prev, rate_limit_per_hour: Number(e.target.value) }))}
+                      className="flex-1 h-2 bg-slate-200 dark:bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                    />
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min="1"
+                        max="1000"
+                        step="1"
+                        value={formData.rate_limit_per_hour ?? 30}
+                        onChange={e => setFormData(prev => ({ ...prev, rate_limit_per_hour: Number(e.target.value) }))}
+                        className="w-20 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none text-center font-mono"
+                      />
+                      <span className="text-xs text-slate-500 dark:text-zinc-400">ครั้ง/ชม.</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between text-[10px] text-slate-400 dark:text-zinc-500 font-mono">
+                    <span>5 ครั้ง/ชม.</span>
+                    <span>30 ครั้ง/ชม.</span>
+                    <span>100 ครั้ง/ชม.</span>
+                  </div>
+                  <div className="p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 rounded-lg">
+                    <span className="text-xs text-amber-900 dark:text-amber-200 font-medium">
+                      🚫 เมื่อเกิน {formData.rate_limit_per_hour ?? 30} ครั้ง/ชั่วโมง บอทจะหยุดตอบและส่งข้อความแจ้งเตือนลูกค้า
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Quick Reply Buttons */}
+              <div className="bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-xl p-5 space-y-4 shadow-xs">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 flex items-center gap-2">
+                      <MessageSquare className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                      ปุ่มลัด Messenger (Quick Reply Buttons)
+                    </h4>
+                    <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
+                      ปุ่มลัดที่แสดงให้ลูกค้ากดเมื่อทักเข้ามาครั้งแรก (สูงสุด 13 ปุ่ม)
+                    </p>
+                  </div>
+                  <span className="text-xs font-mono font-bold text-slate-700 dark:text-zinc-300">
+                    {(formData.quick_replies || []).length} / 13 ปุ่ม
+                  </span>
+                </div>
+
+                <div className="space-y-2">
+                  {(formData.quick_replies || []).map((qr, idx) => (
+                    <div key={idx} className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        placeholder="ชื่อปุ่ม (สูงสุด 20 ตัวอักษร)"
+                        value={qr.title}
+                        onChange={e => {
+                          const newReplies = [...(formData.quick_replies || [])];
+                          newReplies[idx] = { ...newReplies[idx], title: e.target.value };
+                          setFormData(prev => ({ ...prev, quick_replies: newReplies }));
+                        }}
+                        maxLength={20}
+                        className="flex-1 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg px-3 py-2 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Payload (ข้อความที่ส่งเมื่อกด)"
+                        value={qr.payload}
+                        onChange={e => {
+                          const newReplies = [...(formData.quick_replies || [])];
+                          newReplies[idx] = { ...newReplies[idx], payload: e.target.value };
+                          setFormData(prev => ({ ...prev, quick_replies: newReplies }));
+                        }}
+                        className="flex-1 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg px-3 py-2 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const newReplies = (formData.quick_replies || []).filter((_, i) => i !== idx);
+                          setFormData(prev => ({ ...prev, quick_replies: newReplies }));
+                        }}
+                        className="p-2 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 rounded-lg transition-colors"
+                        title="ลบปุ่มนี้"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+
+                  {(formData.quick_replies || []).length < 13 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const newReplies = [...(formData.quick_replies || []), { title: '', payload: '' }];
+                        setFormData(prev => ({ ...prev, quick_replies: newReplies }));
+                      }}
+                      className="w-full py-2.5 border-2 border-dashed border-slate-300 dark:border-zinc-700 hover:border-indigo-500 text-slate-500 dark:text-zinc-400 hover:text-indigo-600 dark:hover:text-indigo-400 rounded-lg text-xs font-bold flex items-center justify-center gap-2 transition-colors"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>เพิ่มปุ่มลัด</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="p-3 bg-indigo-50 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-800/60 rounded-lg">
+                  <span className="text-xs text-indigo-900 dark:text-indigo-200 font-medium">
+                    💡 ตัวอย่าง: "สนใจสินค้า", "ขอดูโปรโมชั่น", "สอบถามราคา", "ติดต่อแอดมิน"
+                  </span>
+                </div>
+              </div>
+
+              {/* Sales Sequence Auto-Trigger */}
+              <div className="bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-xl p-5 space-y-4 shadow-xs">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                      Sales Sequence Auto-Trigger
+                    </h4>
+                    <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
+                      ส่งลำดับการขายทันทีเมื่อลูกค้าทักครั้งแรกหรือพูดว่า "สนใจ"
+                    </p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.sales_sequence_auto_trigger || false}
+                      onChange={e => setFormData(prev => ({ ...prev, sales_sequence_auto_trigger: e.target.checked }))}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500"></div>
+                  </label>
+                </div>
+
+                <div className={`p-3 rounded-lg border ${
+                  formData.sales_sequence_auto_trigger
+                    ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800/60'
+                    : 'bg-slate-50 dark:bg-[#16161C] border-slate-200 dark:border-zinc-800'
+                }`}>
+                  <span className={`text-xs font-medium ${
+                    formData.sales_sequence_auto_trigger
+                      ? 'text-emerald-900 dark:text-emerald-200'
+                      : 'text-slate-700 dark:text-zinc-300'
+                  }`}>
+                    {formData.sales_sequence_auto_trigger
+                      ? '🚀 เปิดใช้งาน - ระบบจะส่ง Sales Sequence ทั้งหมดทันทีเมื่อลูกค้าทักครั้งแรกหรือพูดว่า "สนใจ"'
+                      : '⏸️ ปิดใช้งาน - ระบบจะส่ง Sales Sequence ตามขั้นตอนที่ AI กำหนด'}
+                  </span>
+                </div>
+
+                <div className="p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 rounded-lg">
+                  <span className="text-xs text-amber-900 dark:text-amber-200 font-medium">
+                    ⚠️ คำเตือน: การเปิดใช้งานนี้จะส่งข้อความ Sales Sequence ทั้งหมด (6 ขั้นตอน) ติดต่อกัน อาจทำให้ลูกค้ารู้สึกว่ารบกวน
+                  </span>
                 </div>
               </div>
             </div>

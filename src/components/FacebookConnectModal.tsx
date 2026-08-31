@@ -40,6 +40,14 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
   const [isConnectingFb, setIsConnectingFb] = useState(false);
   const [verifyingPageId, setVerifyingPageId] = useState<string | null>(null);
   const [pageHealthStatus, setPageHealthStatus] = useState<Record<string, any>>({});
+  
+  // Connection status state
+  const [connectionStatus, setConnectionStatus] = useState<{
+    connected: boolean;
+    count: number;
+    pages: { page_id: string; page_name: string; is_active: boolean; auto_reply: boolean; bot_stopped: boolean }[];
+  } | null>(null);
+  const [isCheckingStatus, setIsCheckingStatus] = useState(false);
 
   const [directPageId, setDirectPageId] = useState('');
   const [directPageToken, setDirectPageToken] = useState('');
@@ -49,6 +57,23 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
   const currentOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://your-domain.app';
   const webhookUrl = `${currentOrigin}/api/webhook/facebook`;
   const verifyToken = 'FB_AI_SALES_TOKEN_2026';
+
+  // Check connection status when modal opens
+  useEffect(() => {
+    if (isOpen) {
+      setIsCheckingStatus(true);
+      fetch('/api/facebook/connection-status')
+        .then(res => res.json())
+        .then(data => {
+          setConnectionStatus(data);
+          setIsCheckingStatus(false);
+        })
+        .catch(err => {
+          console.error('Error checking connection status:', err);
+          setIsCheckingStatus(false);
+        });
+    }
+  }, [isOpen]);
 
   // Listen for OAuth completion from popup or URL params
   useEffect(() => {
@@ -515,6 +540,59 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
             <span className="truncate">สถานะ Webhook & Manual</span>
           </button>
         </div>
+
+        {/* Connection Status Indicator */}
+        {connectionStatus && (
+          <div className={`mb-5 p-4 rounded-2xl border ${
+            connectionStatus.connected
+              ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800/60'
+              : 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800/60'
+          }`}>
+            <div className="flex items-center gap-3">
+              {connectionStatus.connected ? (
+                <CheckCircle2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+              ) : (
+                <AlertCircle className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0" />
+              )}
+              <div className="flex-1">
+                <div className="flex items-center gap-2">
+                  <span className={`text-sm font-bold ${
+                    connectionStatus.connected
+                      ? 'text-emerald-900 dark:text-emerald-200'
+                      : 'text-amber-900 dark:text-amber-200'
+                  }`}>
+                    {connectionStatus.connected ? '✅ เชื่อมต่อแล้ว' : '⚠️ ยังไม่ได้เชื่อมต่อ'}
+                  </span>
+                  {connectionStatus.connected && (
+                    <span className="text-[10px] font-mono bg-emerald-100 dark:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300 px-2 py-0.5 rounded-full font-bold">
+                      {connectionStatus.count} เพจ
+                    </span>
+                  )}
+                </div>
+                {connectionStatus.connected && connectionStatus.pages.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {connectionStatus.pages.slice(0, 3).map(p => (
+                      <div key={p.page_id} className="flex items-center gap-2 text-[11px] text-emerald-800 dark:text-emerald-300">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                        <span className="font-medium">{p.page_name}</span>
+                        {p.bot_stopped && (
+                          <span className="text-[9px] bg-red-100 dark:bg-red-900/60 text-red-700 dark:text-red-300 px-1.5 py-0.5 rounded font-bold">
+                            หยุดบอท
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                    {connectionStatus.pages.length > 3 && (
+                      <div className="text-[10px] text-emerald-600 dark:text-emerald-400 italic">
+                        และอีก {connectionStatus.pages.length - 3} เพจ...
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* TAB 1: ONE-CLICK AUTO CONNECT (LIKE KAOJAO) */}
         {activeTab === 'direct_page' && (

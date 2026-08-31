@@ -196,6 +196,35 @@ function rememberId(store: Set<string>, id: string | undefined | null): boolean 
   }
   return true;
 }
+
+// Rate limiting: track replies per sender per hour to prevent bot spam/nonsense.
+// Key: `${pageId}:${senderId}`, Value: { count, windowStart }
+const rateLimitTracker = new Map<string, { count: number; windowStart: number }>();
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const DEFAULT_RATE_LIMIT = 30; // max replies per sender per hour
+
+function checkRateLimit(pageId: string, senderId: string, limit: number): boolean {
+  const key = `${pageId}:${senderId}`;
+  const now = Date.now();
+  const entry = rateLimitTracker.get(key);
+  if (!entry || (now - entry.windowStart) > RATE_LIMIT_WINDOW_MS) {
+    rateLimitTracker.set(key, { count: 1, windowStart: now });
+    return true; // allowed
+  }
+  if (entry.count >= limit) return false; // blocked
+  entry.count++;
+  return true;
+}
+
+// Clean up rate limit tracker periodically (every 2 hours)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitTracker) {
+    if ((now - entry.windowStart) > RATE_LIMIT_WINDOW_MS * 2) {
+      rateLimitTracker.delete(key);
+    }
+  }
+}, 7_200_000);
 const STORE_SECRET = process.env.ENCRYPTION_SECRET_KEY || process.env.FACEBOOK_APP_SECRET || '';
 function encryptStoredSecret(value: string) {
   if (!value || value.startsWith('store:') || !STORE_SECRET) return value;
@@ -724,6 +753,42 @@ async function startServer() {
     }
   }
 
+  // Send Facebook Messenger message with Quick Reply buttons (3-4 buttons)
+  async function sendFacebookQuickReplies(accessToken: string, recipientId: string, text: string, quickReplies: { title: string; payload: string }[]) {
+    const rawToken = decryptToken(accessToken);
+    if (!rawToken || !rawToken.startsWith('EAA')) {
+      return { success: false, simulated: true, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
+    }
+    try {
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipient: { id: recipientId },
+          message: {
+            text,
+            quick_replies: quickReplies.slice(0, 13).map(qr => ({
+              content_type: 'text',
+              title: qr.title.substring(0, 20),
+              payload: qr.payload || qr.title
+            }))
+          }
+        })
+      });
+      const data = await res.json();
+      if (data.error) {
+        addLog('INFO', 'FACEBOOK_API', recipientId, `❌ ส่ง Quick Reply ไม่สำเร็จ (${data.error.code}): ${data.error.message}`, 'ERROR');
+        return { success: false, error: data.error };
+      }
+      addLog('INFO', 'FACEBOOK_API', recipientId, `✅ ส่ง Quick Reply ${quickReplies.length} ปุ่ม สำเร็จ`, 'SUCCESS');
+      return { success: true, messageId: data.message_id };
+    } catch (err: any) {
+      addLog('INFO', 'FACEBOOK_API', recipientId, `❌ Network Error ส่ง Quick Reply: ${err.message}`, 'ERROR');
+      return { success: false, error: err.message };
+    }
+  }
+
   async function sendConfiguredSequenceStep(page: PageConfig, recipientId: string, stepNumber: number) {
     const step = page.sales_sequence_steps?.find(item => item.step_number === stepNumber);
     if (!step) return { sent: false };
@@ -835,6 +900,60 @@ async function startServer() {
 
   deliverTelegram = sendTelegramNotification;
   deliverLine = sendLineNotification;
+
+  // Connection Status API: Check if pages are connected (for UI status indicator)
+  app.get('/api/facebook/connection-status', (req: Request, res: Response) => {
+    const connectedPages = db.pages.filter(p => {
+      const token = decryptToken(p.page_access_token || '');
+      return token && token.startsWith('EAA');
+    });
+    res.json({
+      connected: connectedPages.length > 0,
+      count: connectedPages.length,
+      pages: connectedPages.map(p => ({
+        page_id: p.page_id,
+        page_name: p.page_name,
+        is_active: p.is_active,
+        auto_reply: p.auto_reply,
+        bot_stopped: p.bot_stopped || false
+      }))
+    });
+  });
+
+  // Bot Control API: Start/Stop bot for a page
+  app.post('/api/facebook/bot-control', (req: Request, res: Response) => {
+    const { page_id, action } = req.body || {};
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) {
+      return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    }
+    if (action === 'stop') {
+      page.bot_stopped = true;
+      addLog('INFO', 'BOT_CONTROL', page_id, `⏹️ บอทถูกหยุดโดยคำสั่ง /stop สำหรับเพจ ${page.page_name}`, 'WARNING');
+    } else if (action === 'start') {
+      page.bot_stopped = false;
+      addLog('INFO', 'BOT_CONTROL', page_id, `▶️ บอทถูกเปิดใช้งานอีกครั้งสำหรับเพจ ${page.page_name}`, 'SUCCESS');
+    }
+    persistData();
+    res.json({ success: true, bot_stopped: page.bot_stopped });
+  });
+
+  // Reply Delay Settings API: Get/Set per-page reply delay
+  app.post('/api/facebook/reply-delay', (req: Request, res: Response) => {
+    const { page_id, delay_ms } = req.body || {};
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) {
+      return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    }
+    const delay = Number(delay_ms);
+    if (isNaN(delay) || delay < 0 || delay > 30000) {
+      return res.status(400).json({ success: false, message: 'ค่า delay ต้องอยู่ระหว่าง 0-30000 มิลลิวินาที' });
+    }
+    page.reply_delay_ms = delay;
+    persistData();
+    addLog('INFO', 'SETTINGS', page_id, `⏱️ ตั้งเวลาตอบกลับเป็น ${delay}ms สำหรับเพจ ${page.page_name}`, 'SUCCESS');
+    res.json({ success: true, reply_delay_ms: delay });
+  });
 
   // Real Page Live Health & Connection Verification Endpoint (GET & POST /api/facebook/verify-page)
   app.all(['/api/facebook/verify-page', '/api/facebook/check-status'], async (req: Request, res: Response) => {
@@ -1613,6 +1732,37 @@ async function startServer() {
         addLog('INFO', senderId || 'UNKNOWN', pageId, '⏸️ รับ event แล้ว แต่เพจถูกพักหรือปิด Auto-reply อยู่', 'INFO');
         return;
       }
+
+      // /stop command: Admin can stop bot to prevent auto-reply
+      if (messageText.trim().toLowerCase() === '/stop') {
+        page.bot_stopped = true;
+        persistData();
+        addLog('INFO', 'BOT_CONTROL', pageId, `⏹️ บอทถูกหยุดโดยคำสั่ง /stop จาก ${senderId}`, 'WARNING');
+        await sendFacebookMessage(page.page_access_token || '', senderId, '⏹️ บอทถูกหยุดแล้ว ระบบจะไม่ตอบข้อความอัตโนมัติจนกว่าจะเปิดใช้งานอีกครั้ง');
+        return;
+      }
+      if (messageText.trim().toLowerCase() === '/start') {
+        page.bot_stopped = false;
+        persistData();
+        addLog('INFO', 'BOT_CONTROL', pageId, `▶️ บอทถูกเปิดใช้งานอีกครั้งโดย ${senderId}`, 'SUCCESS');
+        await sendFacebookMessage(page.page_access_token || '', senderId, '▶️ บอทถูกเปิดใช้งานแล้ว ระบบจะตอบข้อความอัตโนมัติอีกครั้ง');
+        return;
+      }
+
+      // Check if bot is stopped for this page
+      if (page.bot_stopped) {
+        addLog('INFO', senderId || 'UNKNOWN', pageId, '⏹️ บอทถูกหยุดไว้ ไม่ตอบข้อความอัตโนมัติ', 'INFO');
+        return;
+      }
+
+      // Rate limiting: prevent bot from replying too much to same sender
+      const rateLimit = page.rate_limit_per_hour || DEFAULT_RATE_LIMIT;
+      if (!checkRateLimit(pageId, senderId, rateLimit)) {
+        addLog('INFO', senderId || 'UNKNOWN', pageId, `🚫 Rate limit exceeded: ${senderId} ส่งข้อความเกิน ${rateLimit} ครั้ง/ชั่วโมง`, 'WARNING');
+        await sendFacebookMessage(page.page_access_token || '', senderId, '🙏 ขออภัยค่ะ ระบบได้รับข้อความจำนวนมาก กรุณารอสักครู่แล้วแอดมินจะตอบกลับให้นะคะ');
+        return;
+      }
+
       if (!(db.settings.geminiApiKey || process.env.GEMINI_API_KEY)) {
         addLog('INFO', senderId || 'UNKNOWN', pageId, '⛔ ไม่ตอบอัตโนมัติ: ยังไม่ได้ตั้งค่า Gemini API key ที่ใช้งานได้', 'ERROR');
         // Send notification to user that API key is not configured
@@ -1950,11 +2100,44 @@ ${JSON.stringify(customer, null, 2)}
           { fullReply: replyText, matchedProduct: page.product?.product_name || matchedProduct.product_name, model: selectedModel }
         );
 
-        // Send the AI answer, then the configured sales step (text/image) for this Page.
-        // Human-like pacing: wait ~1.5s so the reply doesn't instant-fire (Meta BAN prevention).
-        await sleep(REPLY_DELAY_MS);
-        await sendFacebookMessage(page.page_access_token || '', senderId, replyText);
-        await sendConfiguredSequenceStep(page, senderId, Math.min(6, Math.max(1, Number(parsed.sequenceStep) || 1)));
+        // Per-page reply delay (configurable, default to global REPLY_DELAY_MS)
+        const pageDelay = page.reply_delay_ms ?? REPLY_DELAY_MS;
+
+        // Check if this is first message from customer (for quick replies)
+        const isFirstMessage = customer.order_count === 0 && !customer.last_interaction;
+
+        // Check if customer said "สนใจ" or similar purchase intent keywords
+        const purchaseIntentKeywords = ['สนใจ', 'อยากได้', 'ต้องการ', 'ซื้อ', 'ราคา', 'เท่าไหร่'];
+        const hasPurchaseIntent = purchaseIntentKeywords.some(kw => messageText.includes(kw));
+
+        // Sales Sequence Auto-Trigger: fire immediately on first message or "สนใจ"
+        const shouldTriggerSalesSequence = page.sales_sequence_auto_trigger && (isFirstMessage || hasPurchaseIntent);
+
+        // Send the AI answer with human-like pacing
+        await sleep(pageDelay);
+
+        // If quick replies are configured and this is first message, send with buttons
+        if (isFirstMessage && page.quick_replies && page.quick_replies.length > 0) {
+          await sendFacebookQuickReplies(page.page_access_token || '', senderId, replyText, page.quick_replies);
+          addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${page.quick_replies.length} ปุ่ม พร้อมข้อความตอบกลับ`, 'SUCCESS');
+        } else {
+          await sendFacebookMessage(page.page_access_token || '', senderId, replyText);
+        }
+
+        // Send configured sales sequence step
+        const sequenceStep = shouldTriggerSalesSequence ? 1 : Math.min(6, Math.max(1, Number(parsed.sequenceStep) || 1));
+        await sendConfiguredSequenceStep(page, senderId, sequenceStep);
+
+        // If sales sequence auto-trigger is enabled, send full sequence (steps 1-6)
+        if (shouldTriggerSalesSequence && page.sales_sequence_steps && page.sales_sequence_steps.length > 0) {
+          addLog('INFO', senderId, pageId, `🚀 Sales Sequence Auto-Trigger: ส่งลำดับการขายทั้งหมด ${page.sales_sequence_steps.length} ขั้นตอน`, 'SUCCESS');
+          for (const step of page.sales_sequence_steps) {
+            if (step.step_number > 1) {
+              await sleep(pageDelay);
+              await sendConfiguredSequenceStep(page, senderId, step.step_number);
+            }
+          }
+        }
 
         // If ORDER is detected
         if (intent === 'ORDER' || (parsed.orderData && (parsed.orderData.phone_number || parsed.orderData.address))) {
