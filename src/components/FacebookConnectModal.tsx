@@ -58,20 +58,25 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
   const webhookUrl = `${currentOrigin}/api/webhook/facebook`;
   const verifyToken = 'FB_AI_SALES_TOKEN_2026';
 
+  // Helper function to refresh connection status
+  const refreshConnectionStatus = () => {
+    setIsCheckingStatus(true);
+    fetch('/api/facebook/connection-status')
+      .then(res => res.json())
+      .then(data => {
+        setConnectionStatus(data);
+        setIsCheckingStatus(false);
+      })
+      .catch(err => {
+        console.error('Error checking connection status:', err);
+        setIsCheckingStatus(false);
+      });
+  };
+
   // Check connection status when modal opens
   useEffect(() => {
     if (isOpen) {
-      setIsCheckingStatus(true);
-      fetch('/api/facebook/connection-status')
-        .then(res => res.json())
-        .then(data => {
-          setConnectionStatus(data);
-          setIsCheckingStatus(false);
-        })
-        .catch(err => {
-          console.error('Error checking connection status:', err);
-          setIsCheckingStatus(false);
-        });
+      refreshConnectionStatus();
     }
   }, [isOpen]);
 
@@ -97,6 +102,8 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
             })
             .catch(e => console.error('Error fetching data after oauth:', e));
         }
+        // Refresh connection status after successful OAuth
+        setTimeout(() => refreshConnectionStatus(), 500);
       } else if (event.data?.type === 'FB_AUTH_ERROR') {
         setIsConnectingFb(false);
         setTestResult(`❌ การเชื่อมต่อ Facebook ไม่สำเร็จ: ${event.data.error || event.data.message || 'Unknown error'}`);
@@ -120,6 +127,9 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
             }
           })
           .catch(e => console.error('Fetch data after fb_connected error:', e));
+
+        // Refresh connection status after successful OAuth via URL params
+        setTimeout(() => refreshConnectionStatus(), 500);
 
         window.history.replaceState({}, document.title, window.location.pathname);
       } else if (searchParams.has('fb_error')) {
@@ -290,6 +300,8 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
       }
       setTestResult(`🎉 ดึงเพจสำเร็จทั้งหมด ${imported.length} เพจเรียบร้อย! คุณสามารถเลือกเปิด/ปิดการทำงาน AI ของแต่ละเพจได้ที่หน้า ศูนย์รวมเพจ (Pages Hub)`);
       setDirectPageToken('');
+      // Refresh connection status after successful batch import
+      setTimeout(() => refreshConnectionStatus(), 500);
     } catch (err: any) {
       setTestResult(`❌ ข้อผิดพลาดในการดึงเพจ: ${err.message}`);
     } finally {
