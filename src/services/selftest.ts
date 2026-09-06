@@ -705,6 +705,125 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     }
   });
 
+  // ===================== E4. ACCOUNTING & EXPENSES & REPORTS =====================
+  await run('product-cost-fields', 'Accounting', 'สินค้า: บันทึก/อ่าน ต้นทุน + ค่าส่ง', async () => {
+    const pid = `${PREFIX}cost_prod`;
+    try {
+      await dbService.upsertProduct({ product_id: pid, page_id: `${PREFIX}page`, product_name: 'สินค้าต้นทุน', category: 'CHINA', display_price: 1000, cost_price: 350, shipping_cost: 45, specs_json: '{}', custom_specs: '[]' });
+      const rows = await dbService.getProductsByCategory('CHINA');
+      const row = rows.find(r => r.product_id === pid);
+      if (!row) throw new Error('บันทึกแล้วอ่านไม่เจอ');
+      if (Number(row.cost_price) !== 350 || Number(row.shipping_cost) !== 45) throw new Error(`ต้นทุน/ค่าส่งไม่ตรง: ${row.cost_price}/${row.shipping_cost}`);
+      return { detail: `ต้นทุน ฿${row.cost_price} + ค่าส่ง ฿${row.shipping_cost} บันทึก/อ่านถูกต้อง` };
+    } finally {
+      await dbService.executeRaw('DELETE FROM products WHERE product_id = ?', [pid]).catch(() => {});
+    }
+  });
+
+  await run('expenses-crud', 'Accounting', 'ค่าใช้จ่ายรายวัน: บันทึก/อ่าน/reminder', async () => {
+    const pageId = addTestPage();
+    const sender = `${PREFIX}exp_${Date.now()}`;
+    try {
+      // บันทึกค่าใช้จ่าย
+      const save = await fetchJson(baseUrl, '/api/expenses', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, expense_date: new Date().toISOString().slice(0, 10), ad_spend: 250, shipping_cost: 80, other_cost: 20 }) });
+      if (save.status !== 200 || !save.data?.success) throw new Error(`POST expenses HTTP ${save.status}`);
+      // อ่านกลับ
+      const get = await fetchJson(baseUrl, `/api/expenses?page_id=${pageId}`);
+      if (Number(get.data?.ad_spend) !== 250 || Number(get.data?.shipping_cost) !== 80) throw new Error(`อ่านไม่ตรง: ${JSON.stringify(get.data).slice(0, 100)}`);
+      // reminder ต้องเห็นเพจนี้ (มี order วันนี้ → มีกิจกรรม)
+      await dbService.upsertOrder({ order_id: `${PREFIX}exp_order`, page_id: pageId, psid: sender, total_amount: 500, quantity: 1, payment_status: 'PENDING' });
+      const rem = await fetchJson(baseUrl, '/api/expenses/reminder');
+      if (rem.status !== 200 || !rem.data?.success) throw new Error(`reminder HTTP ${rem.status}`);
+      const remPage = (rem.data.pages || []).find((p: any) => p.page_id === pageId);
+      if (!remPage) throw new Error('reminder ไม่เห็นเพจที่มีออเดอร์วันนี้');
+      return { detail: `บันทึก → อ่านกลับ → reminder เห็น ${rem.data.pages.length} เพจที่มีกิจกรรม สำเร็จ` };
+    } finally {
+      removeTestPage(pageId);
+      await dbService.executeRaw('DELETE FROM orders WHERE order_id LIKE ?', [`${PREFIX}exp_order`]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM page_daily_expenses WHERE page_id LIKE ?', [`${pageId}%`]).catch(() => {});
+    }
+  });
+
+  await run('accounting-summary', 'Accounting', 'สรุปกำไร: ยอดขาย - ต้นทุน - ค่าแอด - อื่นๆ ถูกต้อง', async () => {
+    const pageId = addTestPage();
+    const orderId = `${PREFIX}acc_order`;
+    const today = new Date().toISOString().slice(0, 10);
+    try {
+      // ตั้งต้นทุนสินค้าของเพจ = 200/ชิ้น
+      const page = db.pages.find(p => p.page_id === pageId);
+      if (page) (page.product as any).cost_price = 200;
+      persistData();
+      // ออเดอร์ 2 ชิ้น ยอด 1000 → ต้นทุนควร = 400
+      await dbService.upsertOrder({ order_id: orderId, page_id: pageId, psid: `${PREFIX}acc_cus`, total_amount: 1000, quantity: 2, payment_status: 'PENDING' });
+      // ค่าแอด 100 + อื่นๆ 50
+      await fetchJson(baseUrl, '/api/expenses', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, expense_date: today, ad_spend: 100, other_cost: 50 }) });
+      const sum = await fetchJson(baseUrl, `/api/accounting/summary?date=${today}`);
+      if (sum.status !== 200 || !sum.data?.success) throw new Error(`summary HTTP ${sum.status}`);
+      if (Number(sum.data.today.revenue) < 1000) throw new Error(`revenue=${sum.data.today.revenue}`);
+      if (Number(sum.data.today.productCost) < 400) throw new Error(`productCost=${sum.data.today.productCost}`);
+      if (Number(sum.data.today.adSpend) !== 100) throw new Error(`adSpend=${sum.data.today.adSpend}`);
+      return { detail: `ยอดขาย ${sum.data.today.revenue} / ต้นทุน ${sum.data.today.productCost} / แอด ${sum.data.today.adSpend} / กำไร ${sum.data.today.profit} คำนวณถูกต้อง` };
+    } finally {
+      removeTestPage(pageId);
+      await dbService.executeRaw('DELETE FROM orders WHERE order_id = ?', [orderId]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM customers WHERE psid LIKE ?', [`${PREFIX}acc_%`]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM page_daily_expenses WHERE page_id = ?', [pageId]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id LIKE ?', [`${PREFIX}acc_%`]).catch(() => {});
+    }
+  });
+
+  await run('report-schedule', 'Accounting', 'ตารางรายงานอัตโนมัติ: บันทึก/อ่าน/ส่งทันที', async () => {
+    const save = await fetchJson(baseUrl, '/api/reports/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ daily: { enabled: false, time: '06:30' }, interval: { enabled: true, every_hours: 5 } }) });
+    if (save.status !== 200 || !save.data?.success) throw new Error(`save HTTP ${save.status}`);
+    const get = await fetchJson(baseUrl, '/api/reports/schedule');
+    if (get.data?.schedule?.daily?.time !== '06:30') throw new Error(`time=${get.data?.schedule?.daily?.time}`);
+    if (Number(get.data?.schedule?.interval?.every_hours) !== 5) throw new Error(`hours=${get.data?.schedule?.interval?.every_hours}`);
+    const now = await fetchJson(baseUrl, '/api/reports/send-now', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scope: 'daily' }) });
+    if (now.status !== 200 || !now.data?.success) throw new Error(`send-now HTTP ${now.status}`);
+    // คืนค่า default
+    await fetchJson(baseUrl, '/api/reports/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ daily: { enabled: true, time: '00:00' }, interval: { enabled: false, every_hours: 3 } }) });
+    return { detail: `บันทึก 06:30 + ทุก 5 ชม. → อ่านกลับถูกต้อง → ส่งทันทีได้ (${now.data.sent || 0} ช่องทาง) → คืนค่าเริ่มต้นแล้ว` };
+  });
+
+  await run('broadcast-validation', 'Broadcast', 'Broadcast: ปฏิเสธ input ไม่ครบ/เพจไม่มี token', async () => {
+    const pageId = addTestPage();
+    try {
+      const noTargets = await fetchJson(baseUrl, '/api/broadcast/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, targets: [] }) });
+      if (noTargets.status !== 400) throw new Error(`targets ว่าง ควร 400 ได้ ${noTargets.status}`);
+      const withTargets = await fetchJson(baseUrl, '/api/broadcast/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, targets: ['x', 'y'], text: 'hi' }) });
+      if (withTargets.status !== 400 && withTargets.status !== 401) throw new Error(`เพจไม่มี token ควรถูกปฏิเสธ ได้ ${withTargets.status}`);
+      return { detail: 'targets ว่าง + เพจไม่มี token → ปฏิเสธถูกต้อง' };
+    } finally {
+      removeTestPage(pageId);
+    }
+  });
+
+  await run('cleanup-fake-pages', 'Page Hub', 'กวาดเพจปลอมออกจากระบบ', async () => {
+    addTestPage(); // ชื่อ 'เพจสำหรับทดสอบระบบ' อยู่ในรายการเพจปลอม
+    const res = await fetchJson(baseUrl, '/api/pages/cleanup-fake', { method: 'POST' }, 30000);
+    if (res.status !== 200 || !res.data?.success) throw new Error(`HTTP ${res.status}`);
+    if (Number(res.data.removed) < 1) throw new Error(`กวาดได้ ${res.data.removed} หน้า (ควร >= 1)`);
+    const stillThere = db.pages.find(p => p.page_id === `${PREFIX}page`);
+    if (stillThere) throw new Error('เพจปลอมยังอยู่ใน memory');
+    return { detail: `กวาดออก ${res.data.removed} หน้า • เหลือเพจจริง ${res.data.remaining} หน้า` };
+  });
+
+  await run('avatar-cached-redirect', 'Meta Inbox', 'รูปลูกค้าแบบ cache → redirect ถูกตัว', async () => {
+    const pageId = addTestPage();
+    const sender = `${PREFIX}avc_${Date.now()}`;
+    try {
+      // ใส่รูป cache เป็น URL ภายใน (ไม่พึ่งเน็ตภายนอก)
+      await dbService.updateConversationState(pageId, sender, { participant_pic: `${baseUrl}/api/health` });
+      const res = await fetch(`${baseUrl}/api/inbox/avatar?page_id=${pageId}&sender_id=${sender}`, { redirect: 'manual' } as any);
+      const loc = res.headers.get('location') || '';
+      if (res.status !== 302 || !loc.includes('/api/health')) throw new Error(`HTTP ${res.status} loc=${loc.slice(0, 60)}`);
+      return { detail: 'cache มีรูป → 302 redirect ไปยังรูปที่ cache ไว้ ถูกต้อง' };
+    } finally {
+      removeTestPage(pageId);
+      await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [sender]).catch(() => {});
+    }
+  });
+
   // ===================== F. BACKUP =====================
   await run('backup-create-list', 'สำรองข้อมูล', 'Backup: สร้าง/ดูรายการ', async () => {
     const create = await fetchJson(baseUrl, '/api/backup/create', { method: 'POST' }, 30000);

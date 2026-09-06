@@ -2175,28 +2175,32 @@ async function startServer() {
   app.get('/api/accounting/summary', async (req: Request, res: Response) => {
     const today = (req.query.date as string) || new Date().toISOString().slice(0, 10);
 
-    const calc = (orderList: any[]) => {
+    const calc = (orderRows: any[]) => {
       let revenue = 0, productCost = 0, shipping = 0, orderCount = 0;
-      for (const o of orderList) {
-        if (o.is_cancelled || o.payment_status === 'CANCELLED') continue;
+      for (const o of orderRows) {
+        if (Number(o.is_cancelled) === 1 || o.payment_status === 'CANCELLED') continue;
         const qty = Number(o.quantity) || 1;
-        const amount = Number(o.total_amount) || 0;
-        revenue += amount;
+        revenue += Number(o.total_amount) || 0;
         orderCount++;
         // ต้นทุนจากสินค้าของเพจนั้น (cost_price + shipping_cost ต่อชิ้น)
         const page = db.pages.find(p => p.page_id === o.page_id);
         const prod: any = page?.product || {};
-        const cost = Number(prod.cost_price) || 0;
-        const ship = Number(prod.shipping_cost) || 0;
-        productCost += cost * qty;
-        shipping += ship * qty;
+        productCost += (Number(prod.cost_price) || 0) * qty;
+        shipping += (Number(prod.shipping_cost) || 0) * qty;
       }
       return { revenue, productCost, shipping, orderCount };
     };
 
-    const todaysOrders = db.orders.filter(o => String(o.created_at || '').startsWith(today));
+    // อ่านออเดอร์จาก PostgreSQL โดยตรง — ที่มาเดียวของความจริง
+    const todaysOrders = await dbService.executeRaw(
+      "SELECT page_id, quantity, total_amount, COALESCE(is_cancelled, 0) AS is_cancelled, payment_status FROM orders WHERE created_at >= ?",
+      [today]
+    );
+    const allRows = await dbService.executeRaw(
+      "SELECT page_id, quantity, total_amount, COALESCE(is_cancelled, 0) AS is_cancelled, payment_status FROM orders"
+    );
     const todayCalc = calc(todaysOrders);
-    const allCalc = calc(db.orders);
+    const allCalc = calc(allRows);
 
     const expensesToday = await dbService.getExpensesForDate(today);
     const adSpend = expensesToday.reduce((s, e) => s + (Number(e.ad_spend) || 0), 0);
@@ -2227,8 +2231,8 @@ async function startServer() {
       },
       perPage: db.pages.map(p => {
         const e = expensesToday.find(x => x.page_id === p.page_id);
-        const pageOrders = todaysOrders.filter(o => o.page_id === p.page_id);
-        const pageRevenue = pageOrders.reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
+        const pageOrders = todaysOrders.filter((o: any) => o.page_id === p.page_id);
+        const pageRevenue = pageOrders.reduce((s: number, o: any) => s + (Number(o.total_amount) || 0), 0);
         return {
           page_id: p.page_id,
           page_name: p.page_name,
@@ -2256,10 +2260,12 @@ async function startServer() {
       [today]
     );
     const chatPages = new Set(chatRows.map(r => r.page_id));
-    // เพจที่มีออเดอร์วันนี้
-    for (const o of db.orders) {
-      if (String(o.created_at || '').startsWith(today) && o.page_id) chatPages.add(o.page_id);
-    }
+    // เพจที่มีออเดอร์วันนี้ (อ่านจาก PostgreSQL — แม่นยำที่สุด)
+    const orderPages = await dbService.executeRaw(
+      "SELECT DISTINCT page_id FROM orders WHERE created_at >= ? AND COALESCE(is_cancelled, 0) = 0 AND page_id IS NOT NULL",
+      [today]
+    );
+    for (const r of orderPages) chatPages.add(r.page_id);
 
     const pages = [...chatPages]
       .map(pid => db.pages.find(p => p.page_id === pid))
@@ -6392,10 +6398,13 @@ startServer()
     const shipPaid = expenses.reduce((s, e) => s + (Number(e.shipping_cost) || 0), 0);
     const otherCost = expenses.reduce((s, e) => s + (Number(e.other_cost) || 0), 0);
 
-    const todayOrders = db.orders.filter(o => String(o.created_at || '').startsWith(dateStr) && !o.is_cancelled);
-    const revenue = todayOrders.reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
+    const todayOrders = await dbService.executeRaw(
+      "SELECT page_id, quantity, total_amount FROM orders WHERE created_at >= ? AND COALESCE(is_cancelled, 0) = 0",
+      [dateStr]
+    );
+    const revenue = todayOrders.reduce((s: number, o: any) => s + (Number(o.total_amount) || 0), 0);
     let productCost = 0;
-    for (const o of todayOrders) {
+    for (const o of todayOrders as any[]) {
       const page = db.pages.find(p => p.page_id === o.page_id);
       const cost = Number((page?.product as any)?.cost_price) || 0;
       productCost += cost * (Number(o.quantity) || 1);
