@@ -78,7 +78,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
   const [newPageName, setNewPageName] = useState('');
   const [newPageCategory, setNewPageCategory] = useState<ProductCategory>('AMULET');
   const [newProductName, setNewProductName] = useState('');
-  const [newProductPrice, setNewProductPrice] = useState('990');
+  const [newProductPrice, setNewProductPrice] = useState('');
   const [newAdminName, setNewAdminName] = useState('น้ำหวาน');
 
   const copyPageId = (id: string) => {
@@ -112,6 +112,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
       conversion,
       avgTicket,
       topProduct: p.product?.product_name || p.page_name,
+      hasProductData: Boolean(p.product?.product_name && (p.product?.display_price > 0 || p.product?.description)),
       adminName: p.admin_name || 'น้ำหวาน',
       model: p.ai_model || 'gemini-3.6-flash',
       // Real Facebook pages: load the avatar through the server proxy (fresh
@@ -189,8 +190,8 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
         product_id: `PROD-${Date.now().toString().slice(-4)}`,
         product_name: newProductName || `${newPageName} - รุ่นพิเศษ`,
         category: newPageCategory,
-        base_price: Number(newProductPrice) || 990,
-        display_price: Number(newProductPrice) || 990,
+        base_price: Number(newProductPrice) || 0,
+        display_price: Number(newProductPrice) || 0,
         shipping_duration: 'จัดส่ง 1-2 วันถึงหน้าบ้าน',
         description: `สินค้าพรีเมียมประจำเพจ ${newPageName}`,
         promotions: [
@@ -198,8 +199,8 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
             id: `promo-1-${Date.now()}`,
             name: 'โปรโมชั่น 1 ชิ้น (ชุดมาตรฐาน)',
             quantity: 1,
-            price: Number(newProductPrice) || 990,
-            original_price: (Number(newProductPrice) || 990) + 500,
+            price: Number(newProductPrice) || 0,
+            original_price: (Number(newProductPrice) || 0) + 500,
             description: 'จัดส่งฟรี มีเก็บเงินปลายทาง',
             is_popular: false
           },
@@ -207,8 +208,8 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
             id: `promo-2-${Date.now()}`,
             name: 'โปรโมชั่นพิเศษ 2 ชิ้น (เซ็ตสุดคุ้ม)',
             quantity: 2,
-            price: Math.round((Number(newProductPrice) || 990) * 1.8),
-            original_price: (Number(newProductPrice) || 990) * 2 + 800,
+            price: Math.round((Number(newProductPrice) || 0) * 1.8),
+            original_price: (Number(newProductPrice) || 0) * 2 + 800,
             description: 'ประหยัดสุดคุ้ม จัดส่งฟรี',
             is_popular: true
           }
@@ -627,15 +628,27 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
                       <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-200/60 dark:border-zinc-800/60 text-xs">
                         <div>
                           <span className="text-[10px] text-slate-500 block">แอดมิน AI:</span>
-                          <span className="font-bold truncate block text-indigo-700 dark:text-indigo-400">
-                            {item.adminName}
-                          </span>
+                          {p.admin_name ? (
+                            <span className="font-bold truncate block text-indigo-700 dark:text-indigo-400">
+                              {item.adminName}
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 mt-0.5 px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 dark:bg-zinc-800 text-slate-500 dark:text-zinc-400 border border-slate-200 dark:border-zinc-700">
+                              ยังไม่ได้ตั้งค่า
+                            </span>
+                          )}
                         </div>
                         <div>
-                          <span className="text-[10px] text-slate-500 block">ราคาขายเริ่มต้น:</span>
-                          <span className="font-mono font-bold text-amber-600 dark:text-amber-400">
-                            ฿{(p.product?.display_price || 990).toLocaleString()}
-                          </span>
+                          <span className="text-[10px] text-slate-500 block">ราคาขาย:</span>
+                          {item.hasProductData ? (
+                            <span className="font-mono font-bold text-amber-600 dark:text-amber-400">
+                              ฿{(p.product?.display_price || 0).toLocaleString()}
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 mt-0.5 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800/50">
+                              ⚠️ ยังไม่มีข้อมูล
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>
