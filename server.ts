@@ -1028,21 +1028,37 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
   const started = Date.now();
 
   if (provider === 'GEMINI') {
-    const model = getProviderModel('GEMINI');
+    const configuredModel = getProviderModel('GEMINI');
+    // ลำดับลอง: โมเดลที่ตั้งไว้ก่อน → จากนั้น fallback สำหรับคีย์ฟรี
+    const candidates = [...new Set([configuredModel, ...GEMINI_GENERATION_FALLBACKS])];
     // สื่อแนบ (รูป/เสียง/วิดีโอ base64) -> ส่งเข้า Gemini Vision พร้อม prompt
     const contents: any = options.mediaParts?.length
       ? [{ text: fullPrompt }, ...options.mediaParts.map(m => ({ inlineData: m }))]
       : fullPrompt;
-    const response = await generateWithFastRetry(getGemini(), model, {
-      contents,
-      config: {
-        responseMimeType: 'application/json',
-        temperature,
-        maxOutputTokens,
-        responseSchema: AI_REPLY_SCHEMA
+    let lastErr: any = null;
+    for (const model of candidates) {
+      try {
+        const response = await generateWithFastRetry(getGemini(), model, {
+          contents,
+          config: {
+            responseMimeType: 'application/json',
+            temperature,
+            maxOutputTokens,
+            responseSchema: AI_REPLY_SCHEMA
+          }
+        }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
+        // โมเดลนี้ยิงได้จริง — จำไว้เป็นค่าเริ่มต้นของครั้งต่อไป
+        if (model !== db.settings.geminiModel) {
+          db.settings.geminiModel = model;
+        }
+        return { parsed: JSON.parse(response.text?.trim() || '{}'), model, latencyMs: Date.now() - started };
+      } catch (err: any) {
+        lastErr = err;
+        // โมเดลนี้ไม่พร้อมใช้/โควต้าหมด -> สลับโมเดลถัดไป | error อื่น (network/key) -> โยนต่อ
+        if (!isModelOrQuotaError(err)) throw err;
       }
-    }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
-    return { parsed: JSON.parse(response.text?.trim() || '{}'), model, latencyMs: Date.now() - started };
+    }
+    throw lastErr || new Error('GEMINI_ALL_MODELS_FAILED');
   }
 
   const info = AI_PROVIDERS[provider];
@@ -1061,6 +1077,22 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
     });
 
   return { parsed: parseLooseJson(raw), model, latencyMs: Date.now() - started };
+}
+
+// Free-tier friendly fallback chain: คีย์ฟรีมักไม่มีสิทธิ์ generate กับโมเดลใหม่
+// (แม้ list โมเดลจะเห็น) — เมื่อเจอ 404/not-available/429 ให้สลับโมเดลถัดไปทันที
+// และจำโมเดลที่ใช้ได้ไว้ใน settings เพื่อไม่ต้องเสียเวลาลองใหม่ทุกข้อความ
+const GEMINI_GENERATION_FALLBACKS = [
+  'gemini-3.6-flash',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-flash-latest',
+  'gemini-2.0-flash-lite'
+];
+
+function isModelOrQuotaError(err: any): boolean {
+  const msg = String(err?.message || err);
+  return /404|NOT_FOUND|no longer available|not supported|not found|429|RESOURCE_EXHAUSTED|quota|does not have access|permission/i.test(msg);
 }
 
 // Shared Gemini response schema for the chat-brain reply (kept in one place so
@@ -2047,8 +2079,28 @@ async function startServer() {
       if (p !== 'GEMINI' && info.needsKey) headers['Authorization'] = `Bearer ${getProviderApiKey(p)}`;
       await fetchJsonWithTimeout(probeUrl, { method: 'GET', headers }, 10000);
 
-      if (typeof model === 'string' && model.trim()) {
-        (db.settings as any)[info.modelSetting] = model.trim();
+      let chosenModel = typeof model === 'string' && model.trim() ? model.trim() : '';
+      let note = '';
+      if (p === 'GEMINI') {
+        // คีย์ฟรีมักไม่มีสิทธิ์ generate กับโมเดลใหม่ — ยิงจริงหาโมเดลที่ใช้ได้
+        const validator = new GoogleGenAI({ apiKey: getProviderApiKey('GEMINI') });
+        const cand = [...new Set([chosenModel, DEFAULT_GEMINI_MODEL, ...GEMINI_GENERATION_FALLBACKS].filter(Boolean))];
+        let workingModel = '';
+        for (const m of cand) {
+          try {
+            await validator.models.generateContent({ model: m, contents: 'Reply only: OK', config: { maxOutputTokens: 2 } });
+            workingModel = m;
+            break;
+          } catch (e: any) {
+            if (!isModelOrQuotaError(e)) throw e;
+          }
+        }
+        if (!workingModel) throw new Error('คีย์นี้ไม่สามารถใช้โมเดลใดได้เลย (ตรวจสอบโควต้า/สิทธิ์)');
+        chosenModel = workingModel;
+        if (chosenModel !== model) note = ` (โมเดลที่เลือกไว้คีย์ฟรีใช้ไม่ได้ — ระบบเลือก ${workingModel} ให้อัตโนมัติ)`;
+      }
+      if (chosenModel) {
+        (db.settings as any)[info.modelSetting] = chosenModel;
       }
       db.settings.aiProvider = p;
       db.settings.aiSettingsUpdatedAt = new Date().toISOString();
@@ -2057,7 +2109,7 @@ async function startServer() {
         success: true,
         provider: p,
         model: getProviderModel(p),
-        message: `บันทึกสำเร็จ — ระบบจะใช้ ${info.label} โมเดล ${getProviderModel(p)} ตอบแชทลูกค้า`
+        message: `บันทึกสำเร็จ — ระบบจะใช้ ${info.label} โมเดล ${getProviderModel(p)} ตอบแชทลูกค้า${note}`
       });
     } catch (err: any) {
       persistData();
