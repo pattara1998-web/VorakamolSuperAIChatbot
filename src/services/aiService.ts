@@ -1,8 +1,7 @@
-import * as dbService from './database.js';
-
 /**
- * AI Service - Product context fetcher for AI prompts.
- * Uses SQLite database via the database service layer.
+ * AI Service - Product context fetcher for AI prompts (browser side).
+ * Talks to the Express API instead of touching the database directly —
+ * PostgreSQL access lives on the server (server.ts) only.
  */
 
 interface ProductContext {
@@ -14,7 +13,10 @@ interface ProductContext {
 
 export async function getProductContext(pageId: string): Promise<ProductContext[]> {
   try {
-    const products = dbService.getProductsByPage(pageId);
+    const res = await fetch(`/api/products?page_id=${encodeURIComponent(pageId)}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    const products: any[] = Array.isArray(data) ? data : data.products || [];
     return products.map((p: any) => ({
       name: p.product_name || '',
       description: p.detail_text || p.description || '',
@@ -25,12 +27,4 @@ export async function getProductContext(pageId: string): Promise<ProductContext[
     console.error('[AI Service] Failed to fetch product context:', err);
     return [];
   }
-}
-
-export function getProductForAiPrompt(pageId: string, category: string): any {
-  const products = dbService.getProductsByPage(pageId);
-  if (products.length > 0) return products[0];
-
-  const categoryProducts = dbService.getProductsByCategory(category.toUpperCase());
-  return categoryProducts[0] || null;
 }

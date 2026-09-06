@@ -2,9 +2,9 @@ import * as dbService from './database.js';
 import type { PageConfig, Order, Customer, ActivityLog, EmergencyAlert, ProductAmulet, ProductChina, ProductOtop, ProductAgriculture } from '../types.js';
 
 /**
- * Database Bridge: Synchronizes the in-memory store with SQLite.
- * - On startup: loads all data from SQLite into memory
- * - On persist: writes all in-memory data back to SQLite
+ * Database Bridge: Synchronizes the in-memory store with PostgreSQL.
+ * - On startup: loads all data from PostgreSQL into memory
+ * - On persist: writes all in-memory data back to PostgreSQL
  * This allows gradual migration without breaking existing logic.
  */
 
@@ -25,14 +25,14 @@ export interface DatabaseStore {
   };
 }
 
-export function loadFromDatabase(db: DatabaseStore): boolean {
+export async function loadFromDatabase(db: DatabaseStore): Promise<boolean> {
   try {
-    dbService.getDb(); // initialize
+    await dbService.initDatabase(); // initialize + create tables
 
-    const dbPages = dbService.getAllPages();
+    const dbPages = await dbService.getAllPages();
     if (dbPages.length > 0) {
       db.pages = dbPages.map(row => dbService.dbPageToPageConfig(row));
-      console.log(`[DB Bridge] Loaded ${db.pages.length} pages from SQLite`);
+      console.log(`[DB Bridge] Loaded ${db.pages.length} pages from PostgreSQL`);
     }
 
     const categories: [string, keyof DatabaseStore][] = [
@@ -42,35 +42,35 @@ export function loadFromDatabase(db: DatabaseStore): boolean {
       ['AGRICULTURE', 'agriculture']
     ];
     for (const [cat, key] of categories) {
-      const products = dbService.getProductsByCategory(cat);
+      const products = await dbService.getProductsByCategory(cat);
       if (products.length > 0) {
         (db as any)[key] = products.map(p => ({
           ...p,
           custom_specs: safeParseJson(p.custom_specs, []),
           specs_json: undefined
         }));
-        console.log(`[DB Bridge] Loaded ${(db as any)[key].length} ${cat} products from SQLite`);
+        console.log(`[DB Bridge] Loaded ${(db as any)[key].length} ${cat} products from PostgreSQL`);
       }
     }
 
-    const dbCustomers = dbService.getAllCustomers();
+    const dbCustomers = await dbService.getAllCustomers();
     if (dbCustomers.length > 0) {
       db.customers = dbCustomers.map(c => ({ ...c, tags: safeParseJson(c.tags, []) }));
-      console.log(`[DB Bridge] Loaded ${db.customers.length} customers from SQLite`);
+      console.log(`[DB Bridge] Loaded ${db.customers.length} customers from PostgreSQL`);
     }
 
-    const dbOrders = dbService.getAllOrders();
+    const dbOrders = await dbService.getAllOrders();
     if (dbOrders.length > 0) {
       db.orders = dbOrders;
-      console.log(`[DB Bridge] Loaded ${db.orders.length} orders from SQLite`);
+      console.log(`[DB Bridge] Loaded ${db.orders.length} orders from PostgreSQL`);
     }
 
-    const dbLogs = dbService.getRecentLogs(250);
+    const dbLogs = await dbService.getRecentLogs(250);
     if (dbLogs.length > 0) {
       db.logs = dbLogs.map(l => ({ ...l, details: safeParseJson(l.details, {}) }));
     }
 
-    const dbAlerts = dbService.getEmergencyAlerts();
+    const dbAlerts = await dbService.getEmergencyAlerts();
     if (dbAlerts.length > 0) {
       db.emergencyAlerts = dbAlerts.map(a => ({
         ...a,
@@ -79,9 +79,9 @@ export function loadFromDatabase(db: DatabaseStore): boolean {
       }));
     }
 
-    const geminiKey = dbService.getSetting('gemini_apiKey');
-    const geminiModel = dbService.getSetting('gemini_model');
-    const geminiUpdatedAt = dbService.getSetting('gemini_apiKeyUpdatedAt');
+    const geminiKey = await dbService.getSetting('gemini_apiKey');
+    const geminiModel = await dbService.getSetting('gemini_model');
+    const geminiUpdatedAt = await dbService.getSetting('gemini_apiKeyUpdatedAt');
     if (geminiKey) {
       db.settings.geminiApiKey = geminiKey;
     }
@@ -94,16 +94,16 @@ export function loadFromDatabase(db: DatabaseStore): boolean {
 
     return true;
   } catch (err) {
-    console.error('[DB Bridge] Failed to load from SQLite:', err);
+    console.error('[DB Bridge] Failed to load from PostgreSQL:', err);
     return false;
   }
 }
 
-export function saveToDatabase(db: DatabaseStore): void {
+export async function saveToDatabase(db: DatabaseStore): Promise<void> {
   try {
     // Pages
     for (const page of db.pages) {
-      dbService.upsertPage(flattenPage(page));
+      await dbService.upsertPage(flattenPage(page));
     }
 
     // Products
@@ -113,7 +113,7 @@ export function saveToDatabase(db: DatabaseStore): void {
     for (const [key, cat] of productMaps) {
       const products = db[key] as any[];
       for (const product of products) {
-        dbService.upsertProduct({
+        await dbService.upsertProduct({
           ...product,
           category: cat,
           custom_specs: JSON.stringify(product.custom_specs || []),
@@ -124,7 +124,7 @@ export function saveToDatabase(db: DatabaseStore): void {
 
     // Customers
     for (const customer of db.customers) {
-      dbService.upsertCustomer({
+      await dbService.upsertCustomer({
         ...customer,
         tags: JSON.stringify(customer.tags || [])
       });
@@ -132,34 +132,34 @@ export function saveToDatabase(db: DatabaseStore): void {
 
     // Orders
     for (const order of db.orders) {
-      dbService.upsertOrder(order);
+      await dbService.upsertOrder(order);
     }
 
     // Settings
     if (db.settings.geminiApiKey) {
-      dbService.setSetting('gemini_apiKey', db.settings.geminiApiKey);
+      await dbService.setSetting('gemini_apiKey', db.settings.geminiApiKey);
     }
     if (db.settings.geminiModel) {
-      dbService.setSetting('gemini_model', db.settings.geminiModel);
+      await dbService.setSetting('gemini_model', db.settings.geminiModel);
     }
     if (db.settings.geminiApiKeyUpdatedAt) {
-      dbService.setSetting('gemini_apiKeyUpdatedAt', db.settings.geminiApiKeyUpdatedAt);
+      await dbService.setSetting('gemini_apiKeyUpdatedAt', db.settings.geminiApiKeyUpdatedAt);
     }
 
     // Cleanup old data
-    dbService.cleanupOldLogs(250);
-    dbService.cleanupOldChatHistory(30);
+    await dbService.cleanupOldLogs(250);
+    await dbService.cleanupOldChatHistory(30);
   } catch (err) {
-    console.error('[DB Bridge] Failed to save to SQLite:', err);
+    console.error('[DB Bridge] Failed to save to PostgreSQL:', err);
   }
 }
 
-export function migrateFromJsonIfEmpty(jsonData: any): void {
+export async function migrateFromJsonIfEmpty(jsonData: any): Promise<void> {
   try {
-    const existingPages = dbService.getAllPages();
+    const existingPages = await dbService.getAllPages();
     if (existingPages.length === 0 && jsonData && Object.keys(jsonData).length > 0) {
-      console.log('[DB Bridge] SQLite is empty, migrating from JSON data...');
-      dbService.migrateFromJson(jsonData);
+      console.log('[DB Bridge] PostgreSQL is empty, migrating from JSON data...');
+      await dbService.migrateFromJson(jsonData);
     }
   } catch (err) {
     console.error('[DB Bridge] JSON migration failed:', err);

@@ -1,12 +1,21 @@
 # Render Blueprint — Vorakamol SuperAI Chatbot
 # Docs: https://render.com/docs/blueprint-spec
 #
-# This file provisions a single Node Web Service that runs BOTH:
-#   - the React (Vite) dashboard, served statically from /dist
-#   - the Express API + Facebook Webhook, from the bundled dist/server.cjs
+# This file provisions:
+#   - a PostgreSQL database (all persistent data: pages, customers, orders,
+#     chat history, logs, settings)
+#   - a Node Web Service that runs BOTH:
+#     - the React (Vite) dashboard, served statically from /dist
+#     - the Express API + Facebook Webhook, from the bundled dist/server.cjs
 #
 # Usage: push this repo to GitHub → in Render Dashboard choose "New +" →
 #        "Blueprint" → connect the repo. Render reads this file automatically.
+
+databases:
+  - name: vorakamol-superai-db
+    databaseName: superai
+    plan: free
+    region: singapore # same region as the web service for low latency
 
 services:
   - type: web
@@ -26,10 +35,17 @@ services:
       # Required so the server serves the built /dist assets instead of Vite dev middleware
       - key: NODE_ENV
         value: production
-      # Where the in-memory store persists its JSON snapshot.
+      # PostgreSQL connection string, wired automatically to the database above.
+      # NOTE: Render free-tier Postgres expires after 30 days — upgrade the
+      # plan, or point DATABASE_URL at Neon/Supabase (permanent free tiers) by
+      # setting it manually in the Render Dashboard instead.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: vorakamol-superai-db
+          property: connectionString
+      # Where the in-memory store writes its JSON backup snapshot.
       # NOTE: the free-tier filesystem is EPHEMERAL (wiped on redeploy/restart).
-      # For durable data, attach a Render Disk (paid plans) at /var/data and
-      # change this to /var/data/superai-v2.8.json
+      # PostgreSQL is the durable store; this file is only a local backup.
       - key: DATA_FILE
         value: data/superai-v2.8.json
       # --- Secrets: fill these in the Render Dashboard after first deploy ---

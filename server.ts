@@ -318,9 +318,9 @@ function pushHistory(pageId: string, senderId: string, role: 'customer' | 'admin
   list.push({ role, text: String(text || '').slice(0, 600), timestamp: Date.now() });
   if (list.length > HISTORY_MAX_PER_SENDER) list.splice(0, list.length - HISTORY_MAX_PER_SENDER);
   conversationHistory.set(key, list);
-  // Also persist to SQLite ChatHistory table
+  // Also persist to PostgreSQL ChatHistory table (fire-and-forget)
   try {
-    dbService.addChatMessage(pageId, senderId, role, text);
+    dbService.addChatMessage(pageId, senderId, role, text).catch(() => { /* non-critical */ });
   } catch { /* non-critical */ }
   // Broadcast real-time update via SSE
   try {
@@ -328,24 +328,26 @@ function pushHistory(pageId: string, senderId: string, role: 'customer' | 'admin
   } catch { /* non-critical */ }
 }
 function getRecentHistory(pageId: string, senderId: string, limit = 8): HistoryEntry[] {
+  const list = conversationHistory.get(`${pageId}:${senderId}`) || [];
+  return list.slice(-limit);
+}
+
+// Restore conversation memory from PostgreSQL after a server restart (the
+// in-memory map starts empty). Await this once in the webhook handler before
+// building the AI prompt so the very first message still has full context.
+async function seedHistoryFromDb(pageId: string, senderId: string): Promise<void> {
   const key = `${pageId}:${senderId}`;
-  let list = conversationHistory.get(key);
-  if (!list || list.length === 0) {
-    // After a server restart the in-memory map is empty and the AI would act
-    // like it never spoke to this customer — seed it from SQLite chat_history.
-    try {
-      const rows = dbService.getRecentChatHistory(pageId, senderId, 12);
-      if (rows && rows.length > 0) {
-        list = rows.map(r => ({
-          role: r.role === 'admin' ? 'admin' as const : 'customer' as const,
-          text: String(r.text || '').slice(0, 600),
-          timestamp: Date.parse(r.created_at) || Date.now()
-        }));
-        conversationHistory.set(key, list);
-      }
-    } catch { /* non-critical: empty memory just means a fresh conversation */ }
-  }
-  return (list || []).slice(-limit);
+  if (conversationHistory.has(key)) return;
+  try {
+    const rows = await dbService.getRecentChatHistory(pageId, senderId, 12);
+    if (rows && rows.length > 0) {
+      conversationHistory.set(key, rows.map(r => ({
+        role: r.role === 'admin' ? 'admin' as const : 'customer' as const,
+        text: String(r.text || '').slice(0, 600),
+        timestamp: Date.parse(r.created_at) || Date.now()
+      })));
+    }
+  } catch { /* non-critical: empty memory just means a fresh conversation */ }
 }
 function getRecentAdminReplies(pageId: string, senderId: string, limit = 4): string[] {
   return getRecentHistory(pageId, senderId, 20)
@@ -483,17 +485,26 @@ function decryptStoredSecret(value: string) {
     return '';
   }
 }
-function loadPersistedData() {
+// ---------------------------------------------------------------------------
+// Database bootstrap. Production points DATABASE_URL at a hosted PostgreSQL
+// (Render / Neon / Supabase). Without DATABASE_URL the database layer runs the
+// same SQL on PGlite (real Postgres as WASM, persisted under data/pglite) so
+// local development needs zero external setup.
+// ---------------------------------------------------------------------------
+async function loadPersistedData() {
   try {
-    // 1. Try loading from SQLite first (primary database)
-    const sqliteLoaded = dbBridge.loadFromDatabase(db);
-    if (sqliteLoaded) {
-      console.log('[Store] Loaded data from SQLite database');
-      // Still check JSON for migration if SQLite was empty
+    // 1. PostgreSQL (primary database)
+    await dbService.initDatabase();
+    // One-time import from the legacy SQLite file (data/superai.db) if PG is empty
+    const migrated = await dbService.migrateFromSqliteIfEmpty(path.join(process.cwd(), 'data', 'superai.db'));
+    const pgLoaded = await dbBridge.loadFromDatabase(db);
+    if (pgLoaded) {
+      console.log(`[Store] Loaded data from PostgreSQL database${migrated ? ' (migrated from legacy SQLite)' : ''}`);
+      // Still check JSON for migration if PostgreSQL was empty
       if (fs.existsSync(DATA_FILE)) {
         try {
           const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) as Partial<DatabaseStore>;
-          dbBridge.migrateFromJsonIfEmpty(saved);
+          await dbBridge.migrateFromJsonIfEmpty(saved);
         } catch { /* JSON migration is best-effort */ }
       }
       // Apply env var fallback for Gemini key
@@ -503,7 +514,7 @@ function loadPersistedData() {
       return;
     }
 
-    // 2. Fallback: load from JSON file if SQLite fails
+    // 2. Fallback: load from JSON file if PostgreSQL fails
     if (!fs.existsSync(DATA_FILE)) return;
     const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) as Partial<DatabaseStore>;
     for (const key of ['pages', 'amulet', 'china', 'otop', 'agriculture', 'customers', 'orders', 'logs', 'emergencyAlerts'] as const) {
@@ -517,29 +528,33 @@ function loadPersistedData() {
         geminiApiKey: savedKey || process.env.GEMINI_API_KEY || db.settings.geminiApiKey || ''
       };
     }
-    // Migrate JSON data into SQLite for future loads
-    dbBridge.migrateFromJsonIfEmpty(saved);
+    // Migrate JSON data into PostgreSQL for future loads
+    await dbBridge.migrateFromJsonIfEmpty(saved);
   } catch (error) {
     console.error('[Store] Could not load persisted data:', error);
   }
 }
-function persistData() {
-  try {
-    // Save to JSON file (backward compatibility)
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    const persistable = { ...db, settings: { ...db.settings, geminiApiKey: encryptStoredSecret(db.settings.geminiApiKey) } };
-    fs.writeFileSync(DATA_FILE, JSON.stringify(persistable), 'utf8');
-  } catch (error) {
-    console.error('[Store] Could not persist data to JSON. Configure a writable DATA_FILE for production:', error);
-  }
-  try {
-    // Save to SQLite (primary database)
-    dbBridge.saveToDatabase(db);
-  } catch (error) {
-    console.error('[Store] Could not persist data to SQLite:', error);
-  }
+// Serialized persistence queue: concurrent webhook events must not race their
+// Postgres write-backs. persistData() only enqueues; the promise chains.
+let persistQueue: Promise<void> = Promise.resolve();
+function persistData(): void {
+  persistQueue = persistQueue.then(async () => {
+    try {
+      // Save to PostgreSQL (primary database)
+      await dbBridge.saveToDatabase(db);
+    } catch (error) {
+      console.error('[Store] Could not persist data to PostgreSQL:', error);
+    }
+    try {
+      // Local JSON snapshot (cheap backup alongside the database)
+      fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+      const persistable = { ...db, settings: { ...db.settings, geminiApiKey: encryptStoredSecret(db.settings.geminiApiKey) } };
+      fs.writeFileSync(DATA_FILE, JSON.stringify(persistable), 'utf8');
+    } catch (error) {
+      console.error('[Store] Could not persist JSON backup:', error);
+    }
+  });
 }
-loadPersistedData();
 
 const PRODUCT_CORE_FIELDS = new Set([
   'product_id', 'page_id', 'product_name', 'category', 'display_price', 'price_1', 'price_2', 'price_3',
@@ -810,6 +825,9 @@ app.use(express.json({ limit: '25mb', verify: (req: any, _res, buffer) => { req.
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 async function startServer() {
+
+  // Load the persisted store (PostgreSQL) before accepting any traffic.
+  await loadPersistedData();
 
   // CORS middleware for iframe & cross-origin safety
   app.use((req, res, next) => {
@@ -2327,8 +2345,8 @@ async function startServer() {
 
       // ตัดรอบ command: Admin resets order counter
       if (messageText.trim() === 'ตัดรอบ' || messageText.trim().toLowerCase() === '/cutround') {
-        const prevCounter = dbService.getDispatchCounter(pageId);
-        dbService.resetDispatchCounter(pageId);
+        const prevCounter = await dbService.getDispatchCounter(pageId);
+        await dbService.resetDispatchCounter(pageId);
         addLog('INFO', 'ADMIN', pageId, `🔔 ตัดรอบออเดอร์! รีเซ็ตตัวนับจาก ${prevCounter} → 1`, 'SUCCESS');
         dbBridge.broadcastSSE('round_cut', { page_id: pageId, previous_counter: prevCounter });
         await sendFacebookMessage(page.page_access_token || '', senderId, `🔔 ตัดรอบเรียบร้อยค่ะ! ตัวนับออเดอร์รีเซ็ตเป็น 1 (รอบก่อนหน้าถึง ${prevCounter - 1})`);
@@ -2447,14 +2465,16 @@ async function startServer() {
       // Handle MESSENGER MESSAGE Event
       const intentHint: IntentHint = classifyIntentInstant(messageText);
       addLog('MESSAGE', senderId, pageId, `📩 ลูกค้าทักแชท [intent:${intentHint}]: "${messageText}"`, 'INFO', { senderId, pageId, intentHint });
+      // Restore conversation memory from PostgreSQL if the server restarted
+      await seedHistoryFromDb(pageId, senderId);
       // Remember the customer's message in conversation memory BEFORE any
       // mutation so first-message detection below stays truthful.
       const isNewCustomer = !db.customers.some(c => c.psid === senderId);
       pushHistory(pageId, senderId, 'customer', messageText);
 
       // Customer Memory: Check if returning customer with order history
-      const customerOrderCount = dbService.getCustomerOrderCount(senderId);
-      const customerTotalSpent = dbService.getCustomerTotalSpent(senderId);
+      const customerOrderCount = await dbService.getCustomerOrderCount(senderId);
+      const customerTotalSpent = await dbService.getCustomerTotalSpent(senderId);
       const isReturningCustomer = customerOrderCount > 0;
       let customerStarRating = 0;
       if (customerOrderCount >= 10) customerStarRating = 5;
@@ -2939,7 +2959,7 @@ ${JSON.stringify((page.product?.promotions || [
           addLog('ORDER', senderId, pageId, `🎉 บันทึกคำสั่งซื้อใหม่! รหัส ${newOrder.order_id} ยอดรวม ฿${totalAmount.toLocaleString()}`, 'SUCCESS', newOrder);
 
           // Order Dispatch: รันเลขออเดอร์และส่งไป LINE/Telegram
-          const dispatchNumber = dbService.incrementDispatchCounter(pageId);
+          const dispatchNumber = await dbService.incrementDispatchCounter(pageId);
           newOrder.dispatch_number = dispatchNumber;
 
           // Dispatch formatted order message to configured channel
@@ -3806,14 +3826,14 @@ ${JSON.stringify(categorySummary, null, 2)}
   // ================================================================
   // Custom Buttons CRUD API
   // ================================================================
-  app.get('/api/buttons', (req: Request, res: Response) => {
+  app.get('/api/buttons', async (req: Request, res: Response) => {
     const pageId = req.query.page_id as string;
     if (!pageId) return res.status(400).json({ error: 'page_id required' });
-    const buttons = dbService.getCustomButtons(pageId);
+    const buttons = await dbService.getCustomButtons(pageId);
     res.json({ success: true, buttons });
   });
 
-  app.post('/api/buttons', (req: Request, res: Response) => {
+  app.post('/api/buttons', async (req: Request, res: Response) => {
     const { page_id, title, payload, button_type, sort_order } = req.body;
     if (!page_id || !title) return res.status(400).json({ error: 'page_id and title required' });
     if (title.length > 20) return res.status(400).json({ error: 'Quick Reply title must be 20 characters or less' });
@@ -3824,10 +3844,10 @@ ${JSON.stringify(categorySummary, null, 2)}
 
     try {
       const id = `btn_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      dbService.addCustomButton({ id, page_id, title, payload: payload || title, button_type: button_type || 'QUICK_REPLY', sort_order: sort_order || 0 });
+      await dbService.addCustomButton({ id, page_id, title, payload: payload || title, button_type: button_type || 'QUICK_REPLY', sort_order: sort_order || 0 });
 
       // Also update in-memory page quick_replies
-      const allButtons = dbService.getCustomButtons(page_id);
+      const allButtons = await dbService.getCustomButtons(page_id);
       page.quick_replies = allButtons.map(b => ({ title: b.title, payload: b.payload }));
       persistData();
       dbBridge.broadcastSSE('buttons_updated', { page_id, buttons: allButtons }, page_id);
@@ -3838,17 +3858,17 @@ ${JSON.stringify(categorySummary, null, 2)}
     }
   });
 
-  app.put('/api/buttons/:id', (req: Request, res: Response) => {
+  app.put('/api/buttons/:id', async (req: Request, res: Response) => {
     const { id } = req.params;
     const updates = req.body;
     if (updates.title && updates.title.length > 20) return res.status(400).json({ error: 'Quick Reply title must be 20 characters or less' });
     try {
-      dbService.updateCustomButton(id, updates);
+      await dbService.updateCustomButton(id, updates);
 
       if (req.body.page_id) {
         const page = db.pages.find(p => p.page_id === req.body.page_id);
         if (page) {
-          const allButtons = dbService.getCustomButtons(req.body.page_id);
+          const allButtons = await dbService.getCustomButtons(req.body.page_id);
           page.quick_replies = allButtons.map(b => ({ title: b.title, payload: b.payload }));
           persistData();
           dbBridge.broadcastSSE('buttons_updated', { page_id: req.body.page_id, buttons: allButtons }, req.body.page_id);
@@ -3861,15 +3881,15 @@ ${JSON.stringify(categorySummary, null, 2)}
     }
   });
 
-  app.delete('/api/buttons/:id', (req: Request, res: Response) => {
+  app.delete('/api/buttons/:id', async (req: Request, res: Response) => {
     const { id } = req.params;
     const pageId = req.query.page_id as string;
     try {
-      dbService.deleteCustomButton(id);
+      await dbService.deleteCustomButton(id);
       if (pageId) {
         const page = db.pages.find(p => p.page_id === pageId);
         if (page) {
-          const allButtons = dbService.getCustomButtons(pageId);
+          const allButtons = await dbService.getCustomButtons(pageId);
           page.quick_replies = allButtons.map(b => ({ title: b.title, payload: b.payload }));
           persistData();
           dbBridge.broadcastSSE('buttons_updated', { page_id: pageId, buttons: allButtons }, pageId);
@@ -3998,12 +4018,12 @@ ${JSON.stringify(categorySummary, null, 2)}
   // ================================================================
   // Chat History API (for admin review)
   // ================================================================
-  app.get('/api/chat-history', (req: Request, res: Response) => {
+  app.get('/api/chat-history', async (req: Request, res: Response) => {
     const { page_id, sender_id, limit } = req.query;
     if (!page_id || !sender_id) {
       return res.status(400).json({ error: 'page_id and sender_id required' });
     }
-    const history = dbService.getChatHistoryForInbox(page_id as string, sender_id as string, Number(limit) || 50);
+    const history = await dbService.getChatHistoryForInbox(page_id as string, sender_id as string, Number(limit) || 50);
     res.json({ success: true, history });
   });
 
@@ -4024,12 +4044,12 @@ ${JSON.stringify(categorySummary, null, 2)}
   // ================================================================
   // CUSTOMER MEMORY API - จำลูกค้าเก่า/ใหม่, ดาว, ประวัติสั่งซื้อ
   // ================================================================
-  app.get('/api/customer/memory', (req: Request, res: Response) => {
+  app.get('/api/customer/memory', async (req: Request, res: Response) => {
     const { psid, page_id } = req.query;
     if (!psid) return res.status(400).json({ error: 'psid required' });
 
-    const orderCount = dbService.getCustomerOrderCount(psid as string);
-    const totalSpent = dbService.getCustomerTotalSpent(psid as string);
+    const orderCount = await dbService.getCustomerOrderCount(psid as string);
+    const totalSpent = await dbService.getCustomerTotalSpent(psid as string);
     const isReturning = orderCount > 0;
     const customer = db.customers.find(c => c.psid === psid);
     const recentOrders = db.orders.filter(o => o.psid === psid && o.payment_status !== 'CANCELLED').slice(0, 5);
@@ -4065,19 +4085,19 @@ ${JSON.stringify(categorySummary, null, 2)}
   // ================================================================
   // ORDER DISPATCH COUNTER API - รันเลขออเดอร์, ตัดรอบ
   // ================================================================
-  app.get('/api/orders/dispatch-counter', (req: Request, res: Response) => {
+  app.get('/api/orders/dispatch-counter', async (req: Request, res: Response) => {
     const pageId = req.query.page_id as string;
     if (!pageId) return res.status(400).json({ error: 'page_id required' });
-    const counter = dbService.getDispatchCounter(pageId);
-    const activeOrders = dbService.getActiveOrdersByPage(pageId);
+    const counter = await dbService.getDispatchCounter(pageId);
+    const activeOrders = await dbService.getActiveOrdersByPage(pageId);
     res.json({ success: true, page_id: pageId, current_number: counter, active_orders_count: activeOrders.length });
   });
 
-  app.post('/api/orders/cut-round', (req: Request, res: Response) => {
+  app.post('/api/orders/cut-round', async (req: Request, res: Response) => {
     const { page_id } = req.body;
     if (!page_id) return res.status(400).json({ error: 'page_id required' });
-    const prevCounter = dbService.getDispatchCounter(page_id);
-    dbService.resetDispatchCounter(page_id);
+    const prevCounter = await dbService.getDispatchCounter(page_id);
+    await dbService.resetDispatchCounter(page_id);
     addLog('INFO', 'ADMIN', page_id, `🔔 ตัดรอบออเดอร์! รีเซ็ตตัวนับจาก ${prevCounter} → 1`, 'SUCCESS');
     dbBridge.broadcastSSE('round_cut', { page_id, previous_counter: prevCounter });
     res.json({ success: true, message: `ตัดรอบเรียบร้อย! ตัวneyรีเซ็ตเป็น 1 (รอบก่อนหน้าถึง ${prevCounter - 1})` });
@@ -4154,7 +4174,7 @@ ${JSON.stringify(categorySummary, null, 2)}
 
     // Save dispatched message record
     const msgId = telegramMsgId || lineMsgId || `disp_${Date.now()}`;
-    dbService.saveDispatchedMessage({
+    await dbService.saveDispatchedMessage({
       message_id: msgId,
       page_id: page.page_id,
       channel: channel === 'BOTH' ? 'TELEGRAM' : channel,
@@ -4173,11 +4193,11 @@ ${JSON.stringify(categorySummary, null, 2)}
     if (!order) return { success: false, error: 'Order not found' };
 
     // Mark order as cancelled in DB
-    dbService.cancelOrder(orderId);
+    await dbService.cancelOrder(orderId);
     order.payment_status = 'CANCELLED';
 
     // Find the dispatched message for this order
-    const dispatchedMsg = dbService.getDispatchedMessageByOrderId(orderId);
+    const dispatchedMsg = await dbService.getDispatchedMessageByOrderId(orderId);
 
     // Try to delete the original message (Telegram supports this)
     if (dispatchedMsg && dispatchedMsg.channel === 'TELEGRAM') {
@@ -4200,7 +4220,7 @@ ${JSON.stringify(categorySummary, null, 2)}
 
     // Mark dispatched message as cancelled
     if (dispatchedMsg) {
-      dbService.markDispatchedMessageCancelled(dispatchedMsg.message_id);
+      await dbService.markDispatchedMessageCancelled(dispatchedMsg.message_id);
     }
 
     // Send cancellation notice to chat
@@ -4231,12 +4251,12 @@ ${JSON.stringify(categorySummary, null, 2)}
   });
 
   // API: Get dispatch status for a page
-  app.get('/api/orders/dispatch-status', (req: Request, res: Response) => {
+  app.get('/api/orders/dispatch-status', async (req: Request, res: Response) => {
     const pageId = req.query.page_id as string;
     if (!pageId) return res.status(400).json({ error: 'page_id required' });
-    const counter = dbService.getDispatchCounter(pageId);
-    const activeOrders = dbService.getActiveOrdersByPage(pageId);
-    const dispatchedMsgs = dbService.getDispatchedMessages(pageId, true);
+    const counter = await dbService.getDispatchCounter(pageId);
+    const activeOrders = await dbService.getActiveOrdersByPage(pageId);
+    const dispatchedMsgs = await dbService.getDispatchedMessages(pageId, true);
     const totalRevenue = activeOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
     res.json({
       success: true,
