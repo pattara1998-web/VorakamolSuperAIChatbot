@@ -65,6 +65,12 @@ async function q(sql: string, params: any[] = []): Promise<any> {
 
 const PG_NOW_DEFAULT = `to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
 
+/** Raw query escape hatch (used by the self-test suite for cleanup). */
+export async function executeRaw(sql: string, params: any[] = []): Promise<any[]> {
+  const res = await q(sql, params);
+  return res.rows;
+}
+
 export async function initDatabase(): Promise<void> {
   const d = await getDriver();
   // Health probe — fails fast with a clear error if the engine is unreachable.

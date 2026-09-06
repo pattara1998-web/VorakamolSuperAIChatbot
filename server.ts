@@ -28,6 +28,7 @@ import {
 import * as dbBridge from './src/services/dbBridge.ts';
 import * as dbService from './src/services/database.ts';
 import * as auth from './src/services/auth.ts';
+import { runSelfTests, type SelfTestReport } from './src/services/selftest.ts';
 
 dotenv.config();
 
@@ -1599,6 +1600,42 @@ async function startServer() {
         : `ยืนยันไม่สำเร็จ: ${err.message}`;
       res.status(400).json({ success: false, message: hint });
     }
+  });
+
+  // ================================================================
+  // SELF-TEST SUITE (ปุ่ม 🧪 Test — ระบบทดสอบตัวเองทุกฟังก์ชัน)
+  // ================================================================
+
+  let lastSelfTestReport: SelfTestReport | null = null;
+  let selfTestRunning = false;
+
+  app.post('/api/selftest', async (req: Request, res: Response) => {
+    if (selfTestRunning) return res.status(409).json({ success: false, message: 'การทดสอบกำลังรันอยู่ กรุณารอสักครู่' });
+    selfTestRunning = true;
+    try {
+      const report = await runSelfTests({ baseUrl: `http://127.0.0.1:${PORT}`, db, persistData });
+      lastSelfTestReport = report;
+      res.json({ success: true, report });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: `รันการทดสอบไม่สำเร็จ: ${err.message}` });
+    } finally {
+      selfTestRunning = false;
+    }
+  });
+
+  // Markdown รายงานล่าสุด สำหรับดาวน์โหลด/ดูย้อนหลัง
+  app.get('/api/selftest/last-report', (req: Request, res: Response) => {
+    if (!lastSelfTestReport) return res.status(404).json({ success: false, message: 'ยังไม่เคยรันการทดสอบ' });
+    res.set('Content-Type', 'text/markdown; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="selftest-report.md"`);
+    const lines: string[] = [];
+    lines.push(`# รายงานผลการทดสอบระบบ`);
+    lines.push(`- วันที่: ${lastSelfTestReport.startedAt}`);
+    lines.push(`- ผลรวม: ผ่าน ${lastSelfTestReport.summary.pass} / เตือน ${lastSelfTestReport.summary.warn} / พัง ${lastSelfTestReport.summary.fail}`);
+    for (const r of lastSelfTestReport.results) {
+      lines.push(`- [${r.status}] ${r.group} / ${r.name}: ${r.detail}${r.error ? ` | error: ${r.error}` : ''}${r.fixHint ? ` | วิธีแก้: ${r.fixHint}` : ''}`);
+    }
+    res.send(lines.join('\n'));
   });
 
   // AES-256-GCM Token Encryption and Decryption Helpers

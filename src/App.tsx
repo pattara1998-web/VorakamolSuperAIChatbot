@@ -14,6 +14,7 @@ import { ChatInboxTab } from './components/ChatInboxTab';
 import { FacebookConnectModal } from './components/FacebookConnectModal';
 import { PageSettingsModal } from './components/PageSettingsModal';
 import { AiApiSettingsModal } from './components/AiApiSettingsModal';
+import { SelfTestModal } from './components/SelfTestModal';
 import { AiAdminCopilot } from './components/AiAdminCopilot';
 import { SecurityLockScreen } from './components/SecurityLockScreen';
 import { LoginScreen } from './components/LoginScreen';
@@ -43,6 +44,7 @@ export default function App() {
   const [isConnectModalOpen, setIsConnectModalOpen] = useState(false);
   const [isPageSettingsOpen, setIsPageSettingsOpen] = useState(false);
   const [isAiSettingsOpen, setIsAiSettingsOpen] = useState(false);
+  const [isSelfTestOpen, setIsSelfTestOpen] = useState(false);
   const [settingsPageId, setSettingsPageId] = useState<string>('AMULET_PAGE_ID');
   const [theme, setTheme] = useState<'dark' | 'light'>('light');
   const [isLocked, setIsLocked] = useState<boolean>(() => {
@@ -705,6 +707,7 @@ export default function App() {
         onOpenConnectModal={() => setIsConnectModalOpen(true)}
         onOpenPageSettings={handleOpenPageSettings}
         onOpenAiSettings={() => setIsAiSettingsOpen(true)}
+          onOpenSelfTest={() => setIsSelfTestOpen(true)}
         totalOrders={orders.length}
         theme={theme}
         onToggleTheme={toggleTheme}
@@ -888,6 +891,13 @@ export default function App() {
       <AiApiSettingsModal
         isOpen={isAiSettingsOpen}
         onClose={() => setIsAiSettingsOpen(false)}
+        theme={theme}
+      />
+
+      {/* Self-Test Modal (ปุ่ม 🧪 Test) */}
+      <SelfTestModal
+        isOpen={isSelfTestOpen}
+        onClose={() => setIsSelfTestOpen(false)}
         theme={theme}
       />
 

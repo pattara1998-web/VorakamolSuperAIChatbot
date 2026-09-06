@@ -2,6 +2,7 @@ import * as React from 'react';
 import { useState, useRef, useEffect } from 'react';
 import { AlertCircle } from 'lucide-react';
 import {
+  FlaskConical,
   Bot,
   Facebook,
   CheckCircle2,
@@ -43,6 +44,7 @@ interface NavbarProps {
   onOpenConnectModal: () => void;
   onOpenPageSettings: (pageId: string) => void;
   onOpenAiSettings: () => void;
+  onOpenSelfTest: () => void;
   totalOrders: number;
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
@@ -61,6 +63,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenConnectModal,
   onOpenPageSettings,
   onOpenAiSettings,
+  onOpenSelfTest,
   totalOrders,
   theme,
   onToggleTheme,
@@ -168,6 +171,13 @@ export const Navbar: React.FC<NavbarProps> = ({
           </span>
         </div>
         <div className="flex items-center gap-2 md:gap-4 shrink-0">
+          <button
+            onClick={onOpenSelfTest}
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md font-semibold transition-colors cursor-pointer text-xs whitespace-nowrap bg-violet-500/10 hover:bg-violet-500/20 text-violet-600 dark:text-violet-400 border border-violet-500/20"
+          >
+            <FlaskConical className="w-3 h-3 shrink-0" />
+            <span className="hidden sm:inline">Test</span>
+          </button>
           <button
             onClick={onOpenAiSettings}
             className={`flex items-center gap-1.5 px-2 py-0.5 rounded-md font-semibold transition-colors cursor-pointer text-xs whitespace-nowrap ${
