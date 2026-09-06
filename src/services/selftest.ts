@@ -385,14 +385,17 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     return { detail: 'อ่านประวัติแชทสำหรับ Inbox สำเร็จ' };
   });
 
-  await run('ai-providers', 'AI Provider', 'GET /api/ai/providers มีครบ 5 เจ้า', async () => {
+  await run('ai-providers', 'AI Provider', 'GET /api/ai/providers มีครบ 3 เจ้าที่คัดแล้ว', async () => {
     const { status, data } = await fetchJson(baseUrl, '/api/ai/providers');
     if (status !== 200) throw new Error(`HTTP ${status}`);
     const ids = (data.providers || []).map((p: any) => p.id);
-    for (const need of ['GEMINI', 'OPENAI', 'QWEN', 'ZAI', 'LMSTUDIO']) {
+    for (const need of ['GEMINI', 'ZAI', 'LMSTUDIO']) {
       if (!ids.includes(need)) throw new Error(`ขาด provider: ${need}`);
     }
-    return { detail: `ครบ 5 เจ้า • current=${data.current}` };
+    for (const gone of ['OPENAI', 'QWEN']) {
+      if (ids.includes(gone)) throw new Error(`ยังเหลือ provider ที่ตัดออก: ${gone}`);
+    }
+    return { detail: `ครบ 3 เจ้า (Gemini/Z.AI/LM Studio) • current=${data.current}` };
   });
 
   await run('ai-configured', 'AI Provider', 'Provider ปัจจุบันพร้อมใช้งาน (โปรบการเชื่อมต่อจริง)', async () => {

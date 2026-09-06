@@ -172,8 +172,6 @@ export const AiApiSettingsModal: React.FC<AiApiSettingsModalProps> = ({ isOpen, 
           <div className="grid grid-cols-3 gap-1.5">
             {(providers.length ? providers : [
               { id: 'GEMINI', label: 'Google Gemini' },
-              { id: 'OPENAI', label: 'OpenAI' },
-              { id: 'QWEN', label: 'Qwen' },
               { id: 'ZAI', label: 'Z.AI (GLM)' },
               { id: 'LMSTUDIO', label: 'LM Studio' }
             ]).map(p => (

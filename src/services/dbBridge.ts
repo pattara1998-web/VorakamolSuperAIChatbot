@@ -23,11 +23,7 @@ export interface DatabaseStore {
     geminiApiKeyUpdatedAt?: string;
     geminiModel?: string;
     // Multi-provider AI configuration
-    aiProvider?: string; // 'GEMINI' | 'OPENAI' | 'QWEN' | 'ZAI' | 'LMSTUDIO'
-    openaiApiKey?: string;
-    openaiModel?: string;
-    qwenApiKey?: string;
-    qwenModel?: string;
+    aiProvider?: string; // 'GEMINI' | 'ZAI' | 'LMSTUDIO'
     zaiApiKey?: string;
     zaiModel?: string;
     lmStudioBaseUrl?: string;
@@ -39,8 +35,6 @@ export interface DatabaseStore {
 // Every AI-provider setting is stored in the settings table under these keys.
 export const PROVIDER_SETTING_KEYS = [
   'aiProvider',
-  'openaiApiKey', 'openaiModel',
-  'qwenApiKey', 'qwenModel',
   'zaiApiKey', 'zaiModel',
   'lmStudioBaseUrl', 'lmStudioModel',
   'aiSettingsUpdatedAt'

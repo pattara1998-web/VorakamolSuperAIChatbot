@@ -48,11 +48,7 @@ interface DatabaseStore {
     geminiApiKeyUpdatedAt?: string;
     geminiModel?: string;
     // Multi-provider AI configuration
-    aiProvider?: string; // 'GEMINI' | 'OPENAI' | 'QWEN' | 'ZAI' | 'LMSTUDIO'
-    openaiApiKey?: string;
-    openaiModel?: string;
-    qwenApiKey?: string;
-    qwenModel?: string;
+    aiProvider?: string; // 'GEMINI' | 'ZAI' | 'LMSTUDIO'
     zaiApiKey?: string;
     zaiModel?: string;
     lmStudioBaseUrl?: string;
@@ -844,7 +840,7 @@ function resolveAiModel(preferred?: string): string {
 // table (see POST /api/settings/ai). Every non-Gemini provider speaks the
 // OpenAI chat-completions dialect, so one caller covers them all.
 // ---------------------------------------------------------------------------
-type AiProvider = 'GEMINI' | 'OPENAI' | 'QWEN' | 'ZAI' | 'LMSTUDIO';
+type AiProvider = 'GEMINI' | 'ZAI' | 'LMSTUDIO';
 
 interface ProviderInfo {
   label: string;
@@ -867,26 +863,6 @@ const AI_PROVIDERS: Record<AiProvider, ProviderInfo> = {
     defaultModel: DEFAULT_GEMINI_MODEL,
     fastModel: 'gemini-2.5-flash-lite',
     setupHint: 'สร้างคีย์ฟรีได้ที่ aistudio.google.com/apikey'
-  },
-  OPENAI: {
-    label: 'OpenAI (ChatGPT)',
-    baseUrl: 'https://api.openai.com/v1',
-    needsKey: true,
-    keySetting: 'openaiApiKey',
-    modelSetting: 'openaiModel',
-    defaultModel: 'gpt-4o-mini',
-    fastModel: 'gpt-4o-mini',
-    setupHint: 'สร้างคีย์ได้ที่ platform.openai.com/api-keys'
-  },
-  QWEN: {
-    label: 'Alibaba Qwen (DashScope)',
-    baseUrl: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
-    needsKey: true,
-    keySetting: 'qwenApiKey',
-    modelSetting: 'qwenModel',
-    defaultModel: 'qwen-plus',
-    fastModel: 'qwen-turbo',
-    setupHint: 'สร้างคีย์ได้ที่ dashscope.console.aliyun.com (ใช้ Region International)'
   },
   ZAI: {
     label: 'Z.AI / Zhipu (GLM)',
@@ -919,9 +895,7 @@ function getProviderApiKey(provider: AiProvider): string {
   if (provider === 'GEMINI') return db.settings.geminiApiKey || process.env.GEMINI_API_KEY || '';
   if (provider === 'LMSTUDIO') return '';
   const key = (db.settings as any)[AI_PROVIDERS[provider].keySetting] || '';
-  // Env fallbacks so a key can be configured without touching the UI
-  if (!key && provider === 'OPENAI') return process.env.OPENAI_API_KEY || '';
-  if (!key && provider === 'QWEN') return process.env.QWEN_API_KEY || '';
+  // Env fallback so a key can be configured without touching the UI
   if (!key && provider === 'ZAI') return process.env.ZAI_API_KEY || '';
   return key;
 }
@@ -1524,13 +1498,9 @@ async function startServer() {
       geminiModel: db.settings.geminiModel || DEFAULT_GEMINI_MODEL,
       aiProvider: getCurrentProvider(),
       aiSettingsUpdatedAt: db.settings.aiSettingsUpdatedAt || null,
-      openaiApiKeyConfigured: Boolean(getProviderApiKey('OPENAI')),
-      qwenApiKeyConfigured: Boolean(getProviderApiKey('QWEN')),
       zaiApiKeyConfigured: Boolean(getProviderApiKey('ZAI')),
       lmStudioBaseUrl: getLmStudioBaseUrl(),
       lmStudioModel: db.settings.lmStudioModel || '',
-      openaiModel: db.settings.openaiModel || AI_PROVIDERS.OPENAI.defaultModel,
-      qwenModel: db.settings.qwenModel || AI_PROVIDERS.QWEN.defaultModel,
       zaiModel: db.settings.zaiModel || AI_PROVIDERS.ZAI.defaultModel
     });
   });
