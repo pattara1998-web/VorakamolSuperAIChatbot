@@ -627,6 +627,9 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     ];
     const payload = { data: { customers: testCustomers }, mode: 'merge' };
     try {
+      // เคลียร์เศษจากรอบก่อนทั้ง memory และ DB เพื่อผลลัพธ์ที่แน่นอน
+      db.customers = db.customers.filter(c => !c.psid.startsWith(PREFIX + 'imp_'));
+      await dbService.executeRaw("DELETE FROM customers WHERE psid LIKE 'selftest_imp_%'");
       // รอบที่ 1: นำเข้าใหม่
       const r1 = await fetchJson(baseUrl, '/api/backup/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       if (r1.status !== 200 || !r1.data?.success) throw new Error(`import#1 HTTP ${r1.status}`);
@@ -642,7 +645,9 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
       if (Number(inDb[0]?.cnt) !== 2) throw new Error(`ใน DB มี ${inDb[0]?.cnt} แถว (ควร 2)`);
       return { detail: 'นำเข้า 2 คน → นำเข้าซ้ำ = อัปเดตทับ (0 เพิ่ม) — ข้อมูลใน DB ไม่ซ้ำ' };
     } finally {
+      db.customers = db.customers.filter(c => !c.psid.startsWith(PREFIX + 'imp_'));
       await dbService.executeRaw("DELETE FROM customers WHERE psid LIKE 'selftest_imp_%'").catch(() => {});
+      persistData();
     }
   });
 
