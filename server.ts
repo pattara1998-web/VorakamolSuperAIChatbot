@@ -198,7 +198,7 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // Hard cap on any single AI call so a hung Gemini request can never leave a
 // customer waiting for minutes — we race the call against a timer and, on
 // timeout, retry once on the lite model before falling back to a template.
-const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 9000);
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 12000);
 const AI_FAST_RETRY_MS = Number(process.env.AI_FAST_RETRY_MS || 6000);
 const AI_FAST_MODEL = process.env.AI_FAST_MODEL || 'gemini-2.5-flash-lite';
 function withTimeout<T>(promise: Promise<T>, ms: number, label = 'AI'): Promise<T> {
@@ -215,8 +215,10 @@ async function generateWithFastRetry(ai: any, primaryModel: string, params: any,
   try {
     return await withTimeout(ai.models.generateContent({ ...params, model: primaryModel }), primaryMs);
   } catch (primaryErr: any) {
+    // ถ้าโมเดลด่วนถูก Google ปิดไปแล้ว (deprecated) ใช้โมเดลหลักยิงซ้ำด้วย timeout สั้นแทน
+    const fastModel = DEPRECATED_GEMINI_MODELS.has(AI_FAST_MODEL) ? primaryModel : AI_FAST_MODEL;
     try {
-      return await withTimeout(ai.models.generateContent({ ...params, model: AI_FAST_MODEL }), fastMs);
+      return await withTimeout(ai.models.generateContent({ ...params, model: fastModel }), fastMs);
     } catch {
       throw primaryErr;
     }
@@ -1015,17 +1017,24 @@ function parseLooseJson(raw: string): any {
  * GEMINI uses the native SDK with a strict response schema and a fast-retry
  * on the lite model; every other provider uses the OpenAI-compatible caller.
  */
-async function generateAiJson(prompt: string, options: { temperature?: number; maxOutputTokens?: number; extraInstruction?: string } = {}): Promise<{ parsed: any; model: string; latencyMs: number }> {
+async function generateAiJson(prompt: string, options: { temperature?: number; maxOutputTokens?: number; extraInstruction?: string; mediaParts?: Array<{ mimeType: string; data: string }> } = {}): Promise<{ parsed: any; model: string; latencyMs: number }> {
   const provider = getCurrentProvider();
   const temperature = options.temperature ?? 0.9;
   const maxOutputTokens = options.maxOutputTokens ?? 500;
-  const fullPrompt = options.extraInstruction ? `${prompt}\n\n${options.extraInstruction}` : prompt;
+  let fullPrompt = options.extraInstruction ? `${prompt}\n\n${options.extraInstruction}` : prompt;
+  if (options.mediaParts?.length) {
+    fullPrompt += '\n\n(หมายเหตุ: ลูกค้าแนบสื่อมาด้วย แต่ provider นี้ยังไม่รองรับการอ่านสื่อ — ตอบตามบริบทของบทสนทนาและขอให้ลูกค้าพิมพ์อธิบายเพิ่ม)';
+  }
   const started = Date.now();
 
   if (provider === 'GEMINI') {
     const model = getProviderModel('GEMINI');
+    // สื่อแนบ (รูป/เสียง/วิดีโอ base64) -> ส่งเข้า Gemini Vision พร้อม prompt
+    const contents: any = options.mediaParts?.length
+      ? [{ text: fullPrompt }, ...options.mediaParts.map(m => ({ inlineData: m }))]
+      : fullPrompt;
     const response = await generateWithFastRetry(getGemini(), model, {
-      contents: fullPrompt,
+      contents,
       config: {
         responseMimeType: 'application/json',
         temperature,
@@ -3108,6 +3117,8 @@ async function startServer() {
 
       // Step 2 in n8n: Event Router
       let eventType: 'MESSAGE' | 'COMMENT' | 'UNKNOWN' = 'UNKNOWN';
+      // สื่อที่ลูกค้าส่งมา (รูป/เสียง/วิดีโอ) — ส่งต่อให้ AI วิเคราะห์
+      let incomingMedia: { url: string; kind: 'image' | 'audio' | 'video' | 'file' } | null = null;
       let senderId = '';
       let pageId = '';
       let messageText = '';
@@ -3148,10 +3159,22 @@ async function startServer() {
             // 20-char title so the full configured text reaches the AI.
             messageText = messagingEvent.message.quick_reply?.payload || messagingEvent.message.text;
           } else if (messagingEvent.message?.attachments?.length) {
-            // Customer sent an image/sticker/file — acknowledge instead of staying silent.
+            // Customer sent an image/voice/video — AI จะดู/ฟังสื่อจริง (Gemini Vision)
             eventType = 'MESSAGE';
             senderId = messagingEvent.sender?.id || 'UNKNOWN_SENDER';
-            messageText = '(ลูกค้าส่งรูปภาพหรือไฟล์แนบมา ไม่มีข้อความ ให้ตอบว่าได้รับรูปเรียบร้อยแล้ว พร้อมสอบถามว่าสนใจสินค้าตัวไหน)';
+            const att = messagingEvent.message.attachments[0];
+            const mediaUrl = att?.payload?.url || '';
+            const attType = String(att?.type || 'file').toLowerCase();
+            if (mediaUrl && (attType === 'image' || attType === 'audio' || attType === 'video')) {
+              incomingMedia = { url: mediaUrl, kind: attType as any };
+              messageText = attType === 'image'
+                ? '(ลูกค้าส่งรูปภาพมา — วิเคราะห์รูปและตอบสนองอย่างเป็นธรรมชาติเหมือนแอดมินคนจริง)'
+                : attType === 'audio'
+                ? '(ลูกค้าส่งข้อความเสียงมา — ฟังเสียงแล้วตอบตามที่ลูกค้าพูด)'
+                : '(ลูกค้าส่งวิดีโอมา — ดูวิดีโอแล้วตอบสนองอย่างเป็นธรรมชาติ)';
+            } else {
+              messageText = '(ลูกค้าส่งไฟล์แนบมา ไม่มีข้อความ ให้ตอบว่าได้รับไฟล์เรียบร้อยแล้ว พร้อมสอบถามว่าสนใจสินค้าตัวไหน)';
+            }
           } else if (messagingEvent.postback?.payload) {
             eventType = 'MESSAGE';
             senderId = messagingEvent.sender?.id || 'UNKNOWN_SENDER';
@@ -3540,7 +3563,7 @@ async function startServer() {
         ? usedReplies.map(r => `- "${r}"`).join('\n')
         : '(ยังไม่มีคำตอบก่อนหน้า)';
 
-      const promptContext = `
+      let promptContext = `
 คุณคือ "${adminName}" ซึ่งเป็นแอดมินร้านค้าเพจ Facebook: "${page.page_name}"
 ลักษณะการตอบและบุคลิก:
 - ชื่อแอดมิน: ${adminName}
@@ -3615,9 +3638,29 @@ ${JSON.stringify((page.product?.promotions || [
 `;
 
       try {
+        // ลูกค้าส่งสื่อมา? ดาวน์โหลดเป็น base64 เพื่อส่งเข้า Gemini Vision/Audio
+        let mediaParts: Array<{ mimeType: string; data: string }> | undefined;
+        if (incomingMedia) {
+          try {
+            const mediaController = new AbortController();
+            const mediaTimer = setTimeout(() => mediaController.abort(), 15000);
+            const mRes: any = await fetch(incomingMedia.url, { signal: mediaController.signal });
+            clearTimeout(mediaTimer);
+            if (mRes.ok) {
+              const mBuf = Buffer.from(await mRes.arrayBuffer());
+              if (mBuf.length <= 15 * 1024 * 1024) {
+                const mimeMap: Record<string, string> = {
+                  image: 'image/jpeg', audio: 'audio/mpeg', video: 'video/mp4', file: 'application/octet-stream'
+                };
+                mediaParts = [{ mimeType: mimeMap[incomingMedia.kind] || 'application/octet-stream', data: mBuf.toString('base64') }];
+                promptContext += `\n(ลูกค้าแนบ${incomingMedia.kind === 'image' ? 'รูปภาพ' : incomingMedia.kind === 'audio' ? 'ข้อความเสียง' : 'วิดีโอ'}มาด้วย — วิเคราะห์สื่อนั้นแล้วตอบสนองอย่างเป็นธรรมชาติ ถ้าเป็นเสียงให้ถอดความหมายที่ลูกค้าพูดและตอบตามนั้น)`;
+              }
+            }
+          } catch { /* ดาวน์โหลดสื่อไม่ได้ -> ตอบตามข้อความ canned */ }
+        }
         // Provider-aware AI call: capped by the timeout race inside
         // generateAiJson (primary model + fast retry) before any fallback.
-        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.9, maxOutputTokens: 500 });
+        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.9, maxOutputTokens: 500, mediaParts });
         const selectedModel = usedModel;
 
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';

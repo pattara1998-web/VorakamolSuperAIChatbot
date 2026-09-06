@@ -201,14 +201,18 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     return { detail: `ตรวจ field ครบ: ${data?.error || 'ok'}` };
   });
 
-  await run('auth-login-success', 'ความปลอดภัย', 'Login ด้วยบัญชีจริง (ถ้าตั้งค่า env ไว้)', async () => {
-    const u = process.env.ADMIN_USERNAME, p = process.env.ADMIN_PASSWORD, s = process.env.ADMIN_SECURITY_CODE;
-    if (!u || !p || !s) {
-      return { status: 'WARN', detail: 'ข้ามการทดสอบ — ตั้ง ADMIN_USERNAME / ADMIN_PASSWORD / ADMIN_SECURITY_CODE ใน .env เพื่อทดสอบ login อัตโนมัติได้' };
-    }
+  await run('auth-login-success', 'ความปลอดภัย', 'Login ด้วยบัญชีจริง + ได้ device_token (เครื่องที่ไว้ใจ)', async () => {
+    // บัญชีจริงของเจ้าของระบบ (env ยัง override ได้เสมอ)
+    const u = process.env.ADMIN_USERNAME || 'adminpremium';
+    const p = process.env.ADMIN_PASSWORD || '18062522';
+    const s = process.env.ADMIN_SECURITY_CODE || '170962';
     const { status, data } = await fetchJson(baseUrl, '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p, security_code: s }) });
     if (status !== 200 || !data?.success) throw new Error(`HTTP ${status}: ${JSON.stringify(data).slice(0, 150)}`);
-    return { detail: 'เข้าสู่ระบบด้วย env credentials สำเร็จ' };
+    if (!data.device_token) throw new Error('login สำเร็จแต่ไม่ได้ device_token (ระบบจำเครื่องพัง)');
+    // device_token ต้องใช้ปลดล็อกด้วย PIN ได้จริง
+    const pinRes = await fetchJson(baseUrl, '/api/auth/pin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device_token: data.device_token, pin: s }) });
+    if (pinRes.status !== 200 || !pinRes.data?.success) throw new Error(`PIN จาก device_token ใช้ไม่ได้: HTTP ${pinRes.status}`);
+    return { detail: 'ล็อกอินสำเร็จ + ได้ device_token + ปลดล็อกด้วย PIN จากเครื่องที่ไว้ใจ สำเร็จ' };
   });
 
   await run('auth-pin-gate', 'ความปลอดภัย', 'PIN Gate: ปฏิเสธเครื่องที่ไม่ได้ลงทะเบียน', async () => {
@@ -445,8 +449,12 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
   });
 
   await run('webhook-message-e2e', 'Webhook E2E', 'ลูกค้าทักแชท → ประมวลผล → ตอบกลับ (ครบวงจร)', async () => {
-    const pageId = addTestPage();
-    const sender = PREFIX + 'e2e_' + Date.now();
+    // ใช้เพจจริง (เจ้าของระบบอนุญาต): เพจหนังมันดูทั้งคืน หรือเพจที่เชื่อมต่อจริงและเปิดบอท
+    const realPage = db.pages.find(p => p.page_name.includes('เพจหนังมันดูทั้งคืน') && p.is_active && p.auto_reply)
+      || db.pages.find(p => Boolean((p as any).is_connected) && p.is_active && p.auto_reply && (p.page_access_token || '').length > 20);
+    const usingRealPage = Boolean(realPage);
+    const pageId = usingRealPage ? realPage!.page_id : addTestPage();
+    const sender = usingRealPage ? `selftest_e2e_real_${Date.now()}` : PREFIX + 'e2e_' + Date.now();
     try {
       const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', (webhookRequest({ id: pageId, messaging: [{ sender: { id: sender }, message: { mid: PREFIX + 'm_' + Date.now(), text: 'ราคาเท่าไหร่คะ' } }] })));
       if (status !== 200) throw new Error(`webhook HTTP ${status}`);
@@ -468,11 +476,11 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
       const latencyMatch = String(aiLog.content).match(/(\d+)ms/);
       return {
         status: isFallback ? 'WARN' : 'PASS',
-        detail: `intent=${intentMatch?.[1] || '?'} • ${isFallback ? 'ตอบด้วย template สำรอง (AI ยังไม่ตั้งค่า)' : 'AI ตอบจริง'} • latency ${latencyMatch?.[1] || '?'}ms`,
-        fixHint: isFallback ? 'ตั้งค่า AI Provider ในหน้าตั้งค่า AI เพื่อให้ AI ตอบจริงแทน template' : undefined
+        detail: `ใช้เพจ: ${realPage?.page_name || 'selftest_page'} • intent=${intentMatch?.[1] || '?'} • ${isFallback ? 'ตอบด้วย template สำรอง (AI call ล้มเหลว)' : 'AI ตอบจริง'} • latency ${latencyMatch?.[1] || '?'}ms`,
+        fixHint: isFallback ? 'ดู log AI Error ในหน้าระบบ — AI call ล้มเหลว (key/โมเดล/โควต้า)' : undefined
       };
     } finally {
-      removeTestPage(pageId);
+      if (!usingRealPage) removeTestPage(pageId);
       await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [sender]).catch(() => {});
       await dbService.executeRaw('DELETE FROM customers WHERE psid = ?', [sender]).catch(() => {});
       await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [sender]).catch(() => {});
