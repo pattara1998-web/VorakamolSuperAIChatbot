@@ -114,7 +114,11 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
       topProduct: p.product?.product_name || p.page_name,
       adminName: p.admin_name || 'น้ำหวาน',
       model: p.ai_model || 'gemini-3.6-flash',
-      avatar: p.page_avatar || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=200&h=200&q=80',
+      // Real Facebook pages: load the avatar through the server proxy (fresh
+      // Graph URL) — stored CDN URLs expire and made pictures disappear.
+      avatar: /^\d+$/.test(p.page_id)
+        ? `/api/pages/${p.page_id}/avatar`
+        : (p.page_avatar || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=200&h=200&q=80'),
       cover: p.page_cover || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1200&q=80',
       followers: p.follower_count || 0,
       likes: p.likes_count || 0
@@ -496,6 +500,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
                 <div className="h-24 w-full relative bg-slate-100 dark:bg-zinc-900 overflow-hidden">
                   <img
                     src={item.cover}
+                    onError={(e) => { (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1200&q=80'; }}
                     alt={p.page_name}
                     className="w-full h-full object-cover object-center group-hover:scale-105 transition-transform duration-500"
                     referrerPolicy="no-referrer"
@@ -542,6 +547,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
                       <div className="relative">
                         <img
                           src={item.avatar}
+                          onError={(e) => { (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=200&h=200&q=80'; }}
                           alt={p.page_name}
                           className="w-16 h-16 rounded-2xl object-cover border-2 border-white dark:border-zinc-800 shadow-md bg-slate-100"
                           referrerPolicy="no-referrer"
@@ -688,6 +694,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
                         <div className="flex items-center gap-3">
                           <img
                             src={item.avatar}
+                            onError={(e) => { (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=200&h=200&q=80'; }}
                             alt={p.page_name}
                             className="w-9 h-9 rounded-xl object-cover border border-slate-200 dark:border-zinc-700 bg-slate-100 shrink-0"
                             referrerPolicy="no-referrer"

@@ -58,9 +58,21 @@ async function fetchJson(baseUrl: string, path: string, init: RequestInit = {}, 
   }
 }
 
-/** Build a Meta-style webhook payload without hand-writing nested braces. */
-function webhookBody(entry: Record<string, any>): string {
-  return JSON.stringify({ object: 'page', entry: [entry] });
+import crypto from 'crypto';
+
+/**
+ * Build a Meta-style webhook payload WITHOUT hand-writing nested braces,
+ * signed with X-Hub-Signature-256 when the server has META_APP_SECRET —
+ * production rejects unsigned webhooks with 403.
+ */
+function webhookRequest(entry: Record<string, any>): { method: string; body: string; headers: Record<string, string> } {
+  const body = JSON.stringify({ object: 'page', entry: [entry] });
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const secret = process.env.META_APP_SECRET || process.env.FACEBOOK_APP_SECRET || '';
+  if (secret) {
+    headers['X-Hub-Signature-256'] = 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
+  }
+  return { method: 'POST', headers, body };
 }
 
 export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> {
@@ -400,7 +412,7 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
 
   // ===================== E. WEBHOOK END-TO-END =====================
   await run('webhook-unknown-page', 'Webhook E2E', 'Webhook เพจที่ไม่มีในระบบ → ปฏิเสธอย่างนุ่มนวล', async () => {
-    const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: webhookBody({ id: PREFIX + 'ghost', messaging: [{ sender: { id: 'x' }, message: { mid: PREFIX + 'm1', text: 'hi' } }] }) });
+    const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', (webhookRequest({ id: PREFIX + 'ghost', messaging: [{ sender: { id: 'x' }, message: { mid: PREFIX + 'm1', text: 'hi' } }] })));
     if (status !== 200) throw new Error(`HTTP ${status} — Meta ต้องได้ 200 เสมอ`);
     return { detail: 'ตอบ 200 EVENT_RECEIVED โดยไม่ประมวลผล (Meta ไม่ retry)' };
   });
@@ -409,7 +421,7 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     const pageId = addTestPage();
     try {
       const before = (await fetchJson(baseUrl, '/api/data')).data.logs.length;
-      await fetchJson(baseUrl, '/api/webhook/facebook', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: webhookBody({ id: pageId, messaging: [{ sender: { id: pageId }, message: { mid: PREFIX + 'echo_' + Date.now(), text: 'echo', is_echo: true } }] }) });
+      await fetchJson(baseUrl, '/api/webhook/facebook', (webhookRequest({ id: pageId, messaging: [{ sender: { id: pageId }, message: { mid: PREFIX + 'echo_' + Date.now(), text: 'echo', is_echo: true } }] })));
       await new Promise(r => setTimeout(r, 800));
       const afterLogs = (await fetchJson(baseUrl, '/api/data')).data.logs;
       // assertion: no NEW customer-message log created by the echo
@@ -425,7 +437,7 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     const pageId = addTestPage();
     const sender = PREFIX + 'e2e_' + Date.now();
     try {
-      const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: webhookBody({ id: pageId, messaging: [{ sender: { id: sender }, message: { mid: PREFIX + 'm_' + Date.now(), text: 'ราคาเท่าไหร่คะ' } }] }) });
+      const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', (webhookRequest({ id: pageId, messaging: [{ sender: { id: sender }, message: { mid: PREFIX + 'm_' + Date.now(), text: 'ราคาเท่าไหร่คะ' } }] })));
       if (status !== 200) throw new Error(`webhook HTTP ${status}`);
       // Give the async pipeline (AI call or fallback) time to finish
       await new Promise(r => setTimeout(r, 6000));
@@ -454,7 +466,7 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     const pageId = addTestPage();
     const sender = PREFIX + 'cmt_' + Date.now();
     try {
-      const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: webhookBody({ id: pageId, changes: [{ field: 'feed', value: { item: 'comment', from: { id: sender }, message: 'สนใจค่ะ ราคาเท่าไหร่', comment_id: PREFIX + 'c_' + Date.now(), post_id: PREFIX + 'p1' } }] }) });
+      const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', (webhookRequest({ id: pageId, changes: [{ field: 'feed', value: { item: 'comment', from: { id: sender }, message: 'สนใจค่ะ ราคาเท่าไหร่', comment_id: PREFIX + 'c_' + Date.now(), post_id: PREFIX + 'p1' } }] })));
       if (status !== 200) throw new Error(`HTTP ${status}`);
       await new Promise(r => setTimeout(r, 4000));
       const logs = (await fetchJson(baseUrl, '/api/data')).data.logs;

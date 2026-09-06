@@ -356,7 +356,7 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
         const cleanToken = directPageToken.trim();
         const pageId = directPageId.trim();
 
-        const graphUrl = `https://graph.facebook.com/v19.0/${encodeURIComponent(pageId)}?fields=id,name,picture{url},category,followers_count,fan_count&access_token=${encodeURIComponent(cleanToken)}`;
+        const graphUrl = `https://graph.facebook.com/v19.0/${encodeURIComponent(pageId)}?fields=id,name,picture{url},cover{source},category,followers_count,fan_count&access_token=${encodeURIComponent(cleanToken)}`;
         const res = await fetch(graphUrl);
         const fbData = await res.json();
 

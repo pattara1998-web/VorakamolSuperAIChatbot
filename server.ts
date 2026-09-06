@@ -152,7 +152,7 @@ function getBasePageTemplate(): PageConfig {
 // Accounts with hundreds of pages MUST follow cursor pagination (paging.next),
 // otherwise the hub silently shows a fraction of the user's pages.
 async function fetchAllManagedPages(userAccessToken: string): Promise<any[]> {
-  const fields = 'id,name,picture{url},category,access_token,followers_count,fan_count';
+  const fields = 'id,name,picture{url},cover{source},category,access_token,followers_count,fan_count';
   const collected: any[] = [];
   let url: string | null =
     `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?access_token=${encodeURIComponent(userAccessToken)}&fields=${encodeURIComponent(fields)}&limit=100`;
@@ -2368,7 +2368,7 @@ async function startServer() {
           ai_model: existing?.ai_model || 'gemini-3.6-flash',
           category: cat,
           page_avatar: fbPage.picture?.data?.url || existing?.page_avatar || basePage.page_avatar,
-          page_cover: existing?.page_cover || basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
+          page_cover: fbPage.cover?.source || existing?.page_cover || basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
           follower_count: fbPage.followers_count || fbPage.fan_count || existing?.follower_count || 15000,
           likes_count: fbPage.fan_count || existing?.likes_count || 12000,
           inquiries_count: existing?.inquiries_count || 0,
@@ -2426,7 +2426,7 @@ async function startServer() {
       // If single page token & ID provided
       if (pageAccessToken && singlePageId) {
         const rawToken = decryptToken(pageAccessToken);
-        const pageGraphUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${singlePageId}?access_token=${encodeURIComponent(rawToken)}&fields=id,name,picture{url},category,followers_count,fan_count`;
+        const pageGraphUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${singlePageId}?access_token=${encodeURIComponent(rawToken)}&fields=id,name,picture{url},cover{source},category,followers_count,fan_count`;
         const resp = await fetch(pageGraphUrl);
         const data = await resp.json();
         if (data.error) {
@@ -2460,7 +2460,7 @@ async function startServer() {
           ai_model: 'gemini-3.6-flash',
           category: detectedCategory,
           page_avatar: data.picture?.data?.url || basePage.page_avatar,
-          page_cover: basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
+          page_cover: data.cover?.source || basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
           follower_count: data.followers_count || data.fan_count || 12000,
           likes_count: data.fan_count || 10000,
           inquiries_count: 0,
@@ -2532,7 +2532,7 @@ async function startServer() {
           ai_model: existing?.ai_model || 'gemini-3.6-flash',
           category: cat,
           page_avatar: fbPage.picture?.data?.url || existing?.page_avatar || basePage.page_avatar,
-          page_cover: existing?.page_cover || basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
+          page_cover: fbPage.cover?.source || existing?.page_cover || basePage.page_cover || 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=1200&q=80',
           follower_count: fbPage.followers_count || fbPage.fan_count || existing?.follower_count || 15000,
           likes_count: fbPage.fan_count || existing?.likes_count || 12000,
           inquiries_count: existing?.inquiries_count || 0,
@@ -4371,6 +4371,16 @@ ${JSON.stringify(categorySummary, null, 2)}
   // ================================================================
   // Connection Status with isConnected flag
   // ================================================================
+  // Fresh page avatar proxy: Facebook CDN URLs stored in the DB expire after
+  // a while, which made page profile pictures disappear from the UI. Redirect
+  // to a live Graph API picture URL generated with the stored page token.
+  app.get('/api/pages/:pageId/avatar', (req: Request, res: Response) => {
+    const page = db.pages.find(p => p.page_id === req.params.pageId);
+    const raw = page ? decryptToken(page.page_access_token || '') : '';
+    if (!raw || !raw.startsWith('EAA')) return res.status(404).json({ error: 'NO_PAGE_TOKEN' });
+    res.redirect(302, `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(page!.page_id)}/picture?type=normal&access_token=${encodeURIComponent(raw)}`);
+  });
+
   app.post('/api/pages/set-connected', (req: Request, res: Response) => {
     const { page_id, is_connected } = req.body;
     const page = db.pages.find(p => p.page_id === page_id);
