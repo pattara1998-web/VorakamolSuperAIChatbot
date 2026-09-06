@@ -368,12 +368,26 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     return { detail: `ครบ 5 เจ้า • current=${data.current}` };
   });
 
-  await run('ai-configured', 'AI Provider', 'Provider ปัจจุบันพร้อมใช้งาน', async () => {
+  await run('ai-configured', 'AI Provider', 'Provider ปัจจุบันพร้อมใช้งาน (โปรบการเชื่อมต่อจริง)', async () => {
     const { data } = await fetchJson(baseUrl, '/api/health');
     const providers = (await fetchJson(baseUrl, '/api/ai/providers')).data;
     const cur = providers.providers.find((p: any) => p.id === providers.current);
     if (!data.ai_configured) {
       return { status: 'WARN', detail: `ยังไม่ได้ตั้งค่า ${cur?.label || providers.current} — เปิดหน้า "ตั้งค่า AI" ใส่คีย์/เลือกโมเดลก่อน`, fixHint: 'เปิดหน้าตั้งค่า AI แล้วใส่ API Key หรือเลือกโมเดล LM Studio' };
+    }
+    // LM Studio: "ตั้งค่าแล้ว" ไม่พอ — ต้องโปรบว่าโปรแกรมในเครื่องเปิดอยู่จริง
+    if (providers.current === 'LMSTUDIO') {
+      let base = String(db.settings.lmStudioBaseUrl || process.env.LMSTUDIO_BASE_URL || 'http://localhost:1234').replace(/\/+$/, '');
+      if (!/\/v\d+$/.test(base)) base += '/v1';
+      try {
+        const res = await fetch(`${base}/models`, { signal: AbortSignal.timeout(3000) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const list = await res.json();
+        const count = (list.data || []).length;
+        return { detail: `LM Studio เชื่อมต่อได้จริง (${base}) • มีโมเดลโหลดอยู่ ${count} ตัว • ใช้: ${cur?.model || '-'}` };
+      } catch (err: any) {
+        return { status: 'WARN', detail: `ตั้งค่า LM Studio ไว้แต่เชื่อมต่อไม่ได้ (${base}): ${err.message} — ลูกค้าจะได้รับข้อความสำรองแทน AI`, fixHint: 'เปิดโปรแกรม LM Studio → Developer → Start Server (พอร์ต 1234) หรือเปลี่ยน provider เป็นคลาวด์ (Gemini/OpenAI/Qwen/Z.AI)' };
+      }
     }
     return { detail: `${cur?.label || providers.current} พร้อมทำงาน • โมเดล: ${cur?.model || '-'}` };
   });
