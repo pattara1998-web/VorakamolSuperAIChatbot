@@ -338,6 +338,14 @@ function pushHistory(pageId: string, senderId: string, role: 'customer' | 'admin
   try {
     dbBridge.broadcastSSE('new_message', { page_id: pageId, sender_id: senderId, role, text: text.slice(0, 200), timestamp: new Date().toISOString() }, pageId);
   } catch { /* non-critical */ }
+  // Meta-style inbox state: unread badge + preview per conversation
+  try {
+    if (role === 'customer') {
+      dbService.recordIncomingMessage(pageId, senderId, text.slice(0, 200)).catch(() => { /* non-critical */ });
+    } else {
+      dbService.recordOutgoingMessage(pageId, senderId, text.slice(0, 200)).catch(() => { /* non-critical */ });
+    }
+  } catch { /* non-critical */ }
 }
 function getRecentHistory(pageId: string, senderId: string, limit = 8): HistoryEntry[] {
   const list = conversationHistory.get(`${pageId}:${senderId}`) || [];
@@ -1501,6 +1509,198 @@ async function startServer() {
     } catch (error: any) {
       res.status(400).json({ success: false, message: `ไม่สามารถยืนยัน Gemini API key ได้: ${error.message || 'โปรดตรวจสอบคีย์และโควต้าการใช้งาน'}` });
     }
+  });
+
+  // ================================================================
+  // PAGE TOGGLE (เปิด/ปิดเพจ และ เปิด/ปิด AI ตอบแชท ต่อเพจ)
+  // ================================================================
+  app.post('/api/pages/toggle', (req: Request, res: Response) => {
+    const { page_id, field, value } = req.body || {};
+    const allowed = ['is_active', 'auto_reply'];
+    if (!page_id || !allowed.includes(field) || typeof value !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'ต้องระบุ page_id, field (is_active|auto_reply) และ value เป็น boolean' });
+    }
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    (page as any)[field] = value;
+    dbService.updatePageField(page_id, field, value ? 1 : 0).catch(() => {});
+    persistData();
+    dbBridge.broadcastSSE('page_toggled', { page_id, field, value }, page_id);
+    const label = field === 'is_active'
+      ? (value ? 'เปิดใช้งานเพจแล้ว — บอทพร้อมตอบแชท' : 'ปิดใช้งานเพจแล้ว — บอทจะไม่ตอบแชทเพจนี้')
+      : (value ? 'เปิด AI ตอบอัตโนมัติแล้ว' : 'ปิด AI ตอบอัตโนมัติแล้ว — แอดมินตอบเองทั้งหมด');
+    addLog('INFO', 'PAGE_TOGGLE', page_id, `${value ? 'ON' : 'OFF'} ${label}`, value ? 'SUCCESS' : 'WARNING');
+    res.json({ success: true, page_id, field, value, message: label });
+  });
+
+  // ================================================================
+  // META BUSINESS SUITE-STYLE INBOX (local Postgres + Graph API merge)
+  // ================================================================
+
+  // Conversation list with unread/starred/blocked state
+  app.get('/api/inbox/conversations', async (req: Request, res: Response) => {
+    const page_id = req.query.page_id as string;
+    if (!page_id) return res.status(400).json({ success: false, message: 'ต้องระบุ page_id' });
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+
+    // Local: aggregate chat_history per sender
+    const msgs = await dbService.executeRaw(
+      'SELECT sender_id, text, role, created_at FROM chat_history WHERE page_id = ? ORDER BY created_at DESC LIMIT 500',
+      [page_id]
+    );
+    const states = await dbService.listConversationStates(page_id);
+    const stateMap = new Map(states.map((s: any) => [s.sender_id, s]));
+    const bySender = new Map<string, any>();
+    for (const m of msgs) {
+      if (!bySender.has(m.sender_id)) {
+        bySender.set(m.sender_id, { sender_id: m.sender_id, last_text: m.text, last_at: m.created_at, last_role: m.role });
+      }
+    }
+    const conversations: any[] = [...bySender.values()].map(c => {
+      const st: any = stateMap.get(c.sender_id) || {};
+      return {
+        thread_id: c.sender_id,
+        participant: { id: c.sender_id, name: st.participant_name || ('ลูกค้า ' + String(c.sender_id).slice(-4)) },
+        updated_time: c.last_at,
+        preview: c.last_text,
+        last_role: c.last_role,
+        unread: Boolean(st.is_unread),
+        unread_count: Number(st.unread_count) || (st.is_unread ? 1 : 0),
+        starred: Boolean(st.is_starred),
+        blocked: Boolean(st.is_blocked),
+        source: 'local'
+      };
+    });
+
+    // Graph augment (best-effort): real customer names + threads that never hit our webhook
+    const rawToken = decryptToken(page.page_access_token || '');
+    if (rawToken?.startsWith('EAA')) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 8000);
+        const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/conversations?platform=messenger&fields=participants,updated_time,snippet,messages.limit(1){message}&limit=25&access_token=${encodeURIComponent(rawToken)}`;
+        const g = await fetch(url, { signal: controller.signal });
+        clearTimeout(timer);
+        const gd: any = await g.json();
+        if (!gd.error) {
+          for (const convo of (gd.data || [])) {
+            const other = convo.participants?.data?.find((p: any) => p.id !== page_id);
+            if (!other) continue;
+            const graphPreview = convo.snippet || convo.messages?.data?.[0]?.message || '';
+            const existing = conversations.find(c => c.thread_id === other.id);
+            if (existing) {
+              if (other.name) existing.participant.name = other.name;
+              if (new Date(convo.updated_time) > new Date(existing.updated_time)) {
+                existing.updated_time = convo.updated_time;
+                existing.preview = graphPreview || existing.preview;
+              }
+              existing.graph_thread_id = convo.id;
+            } else {
+              const st: any = stateMap.get(other.id) || {};
+              conversations.push({
+                thread_id: other.id,
+                participant: { id: other.id, name: other.name || ('ลูกค้า ' + String(other.id).slice(-4)) },
+                updated_time: convo.updated_time,
+                preview: graphPreview,
+                last_role: 'customer',
+                unread: Boolean(st.is_unread),
+                unread_count: Number(st.unread_count) || 0,
+                starred: Boolean(st.is_starred),
+                blocked: Boolean(st.is_blocked),
+                source: 'graph'
+              });
+            }
+          }
+        }
+      } catch { /* Graph unreachable/slow -> local-only list is fine */ }
+    }
+
+    // Blocked conversations sink to the bottom, newest first otherwise
+    conversations.sort((a, b) =>
+      (a.blocked ? 1 : 0) - (b.blocked ? 1 : 0) ||
+      new Date(b.updated_time).getTime() - new Date(a.updated_time).getTime()
+    );
+    res.json({
+      success: true,
+      conversations,
+      page_id,
+      page_name: page.page_name,
+      auto_reply: Boolean(page.auto_reply),
+      is_active: Boolean(page.is_active)
+    });
+  });
+
+  // Messages of one conversation: Graph history when possible, local otherwise
+  app.get('/api/inbox/messages', async (req: Request, res: Response) => {
+    const page_id = req.query.page_id as string;
+    const sender_id = req.query.sender_id as string;
+    if (!page_id || !sender_id) return res.status(400).json({ success: false, message: 'ต้องระบุ page_id และ sender_id' });
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+
+    const localRows = await dbService.getChatHistoryForInbox(page_id, sender_id, 50);
+    const localMessages = localRows.map(m => ({
+      id: 'local_' + m.id,
+      from: { id: m.role === 'admin' ? page_id : sender_id, name: m.role === 'admin' ? page.page_name : undefined },
+      message: m.text,
+      created_time: m.created_at,
+      is_from_page: m.role !== 'customer',
+      attachments: [] as any[]
+    }));
+
+    // Best-effort Graph history (real Messenger thread, richer than local)
+    let messages: any[] = localMessages;
+    let source = 'local';
+    const rawToken = decryptToken(page.page_access_token || '');
+    if (rawToken?.startsWith('EAA')) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 8000);
+        const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/conversations?platform=messenger&user_id=${encodeURIComponent(sender_id)}&fields=messages.limit(50){id,from,message,created_time,attachments}&access_token=${encodeURIComponent(rawToken)}`;
+        const g = await fetch(url, { signal: controller.signal });
+        clearTimeout(timer);
+        const gd: any = await g.json();
+        const convo = gd?.data?.[0];
+        if (!gd.error && convo?.messages?.data) {
+          messages = (convo.messages.data as any[]).map(m => ({
+            id: m.id,
+            from: m.from || { id: sender_id },
+            message: m.message || '',
+            created_time: m.created_time,
+            is_from_page: m.from?.id === page_id,
+            attachments: m.attachments?.data || []
+          })).reverse();
+          source = 'graph';
+        }
+      } catch { /* fall back to local history */ }
+    }
+
+    // Best-effort: mark seen on Messenger + clear local unread badge
+    if (rawToken?.startsWith('EAA')) {
+      fetch(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: { id: sender_id }, sender_action: 'mark_seen' })
+      }).catch(() => {});
+    }
+    await dbService.updateConversationState(page_id, sender_id, { is_unread: 0, unread_count: 0 }).catch(() => {});
+
+    res.json({ success: true, messages, source, page_id, sender_id });
+  });
+
+  // Star / block / unread flags for one conversation
+  app.post('/api/inbox/state', async (req: Request, res: Response) => {
+    const { page_id, sender_id, is_starred, is_blocked, mark_read, mark_unread } = req.body || {};
+    if (!page_id || !sender_id) return res.status(400).json({ success: false, message: 'ต้องระบุ page_id และ sender_id' });
+    const patch: Record<string, any> = {};
+    if (is_starred !== undefined) patch.is_starred = is_starred ? 1 : 0;
+    if (is_blocked !== undefined) patch.is_blocked = is_blocked ? 1 : 0;
+    if (mark_read) { patch.is_unread = 0; patch.unread_count = 0; }
+    if (mark_unread) patch.is_unread = 1;
+    await dbService.updateConversationState(page_id, sender_id, patch);
+    dbBridge.broadcastSSE('inbox_state_changed', { page_id, sender_id }, page_id);
+    res.json({ success: true, page_id, sender_id, ...patch });
   });
 
   // ================================================================
@@ -2739,6 +2939,13 @@ async function startServer() {
         return;
       }
 
+      // Blocked customer: never auto-reply (admin blocked them in the Inbox)
+      const blockedState = await dbService.getConversationState(pageId, senderId).catch(() => null);
+      if (blockedState?.is_blocked) {
+        addLog('INFO', senderId, pageId, `🚫 ข้ามข้อความจาก ${senderId} (ลูกค้าถูกบล็อกไว้ใน Inbox)`, 'INFO');
+        return;
+      }
+
       // /stop command: Admin can stop bot to prevent auto-reply
       if (messageText.trim().toLowerCase() === '/stop') {
         page.bot_stopped = true;
@@ -3587,10 +3794,22 @@ ${JSON.stringify((page.product?.promotions || [
       });
       const data: any = await fetchRes.json();
       if (data.error) {
-        addLog('INFO', 'SEND_MSG', page_id, `❌ ส่งข้อความไม่สำเร็จ: ${data.error.message}`, 'ERROR');
-        return res.status(502).json({ success: false, error: data.error });
+        const code = Number(data.error.code || 0);
+        const subcode = Number(data.error.error_subcode || 0);
+        // 10/551/2018108: Messenger 24-hour window closed or no open thread
+        const hint = (code === 10 || code === 551 || subcode === 2018108)
+          ? ' Messenger เปิดให้ตอบกลับได้ภายใน 24 ชม. หลังลูกค้าทักเท่านั้น — รอลูกค้าทักก่อน หรือใช้ Message Tag ที่อนุญาต'
+          : '';
+        addLog('INFO', 'SEND_MSG', page_id, `❌ ส่งข้อความไม่สำเร็จ: ${data.error.message}${hint}`, 'ERROR');
+        return res.status(502).json({ success: false, error: data.error, message: data.error.message + hint });
       }
       addLog('INFO', 'SEND_MSG', page_id, `✅ ส่งข้อความถึง ${recipient_id} สำเร็จ`, 'SUCCESS');
+      // Record in the local inbox (Postgres) so the conversation stays visible
+      try {
+        await dbService.addChatMessage(page_id, recipient_id, 'admin', message);
+        await dbService.recordOutgoingMessage(page_id, recipient_id, message.slice(0, 200));
+        dbBridge.broadcastSSE('new_message', { page_id, sender_id: recipient_id, role: 'admin', text: message.slice(0, 200), timestamp: new Date().toISOString() }, page_id);
+      } catch { /* non-critical */ }
       res.json({ success: true, message_id: data.message_id });
     } catch (err: any) {
       addLog('INFO', 'SEND_MSG', page_id, `❌ ส่งข้อความไม่สำเร็จ: ${err.message}`, 'ERROR');

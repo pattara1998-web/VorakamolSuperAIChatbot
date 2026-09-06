@@ -593,10 +593,23 @@ export default function App() {
     }
   };
 
-  const handleTogglePageStatus = (pageId: string, isActive: boolean) => {
-    const updatedPages = pages.map(p => (p.page_id === pageId ? { ...p, is_active: isActive } : p));
-    setPages(updatedPages);
-    handleSaveToBackend('pages', updatedPages);
+  const handleTogglePageStatus = async (pageId: string, isActive: boolean) => {
+    // Optimistic update, then the lightweight dedicated endpoint (1 page, 1 field)
+    setPages(prev => prev.map(p => (p.page_id === pageId ? { ...p, is_active: isActive } : p)));
+    try {
+      const res = await fetch('/api/pages/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page_id: pageId, field: 'is_active', value: isActive })
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.message);
+    } catch {
+      // Fallback to the full-collection save so the toggle never silently fails
+      const updatedPages = pages.map(p => (p.page_id === pageId ? { ...p, is_active: isActive } : p));
+      setPages(updatedPages);
+      handleSaveToBackend('pages', updatedPages);
+    }
   };
 
   const handleBulkToggle = (enable: boolean) => {
@@ -741,6 +754,7 @@ export default function App() {
           <ChatInboxTab
             pages={pages}
             selectedPageId={selectedPageId}
+            setSelectedPageId={setSelectedPageId}
             theme={theme}
           />
         )}

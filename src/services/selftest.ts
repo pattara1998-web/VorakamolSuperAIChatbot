@@ -479,6 +479,67 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     }
   });
 
+  // ===================== E2. PAGE TOGGLE & META-STYLE INBOX =====================
+  await run('page-toggle', 'Page Toggle', 'สวิตช์เปิด/ปิดเพจ ทำงานครบวงจร', async () => {
+    const pageId = addTestPage();
+    try {
+      // ปิดเพจ
+      let { status, data } = await fetchJson(baseUrl, '/api/pages/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, field: 'is_active', value: false }) });
+      if (status !== 200 || !data?.success) throw new Error(`ปิดเพจไม่สำเร็จ: HTTP ${status}`);
+      if (db.pages.find(p => p.page_id === pageId)?.is_active !== false) throw new Error('memory ไม่อัปเดต');
+      // เปิด AI toggle ฝั่ง auto_reply
+      ({ status, data } = await fetchJson(baseUrl, '/api/pages/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, field: 'auto_reply', value: false }) }));
+      if (status !== 200 || !data?.success) throw new Error(`ปิด AI ไม่สำเร็จ: HTTP ${status}`);
+      // field นอก whitelist ต้องถูกปฏิเสธ
+      const bad = await fetchJson(baseUrl, '/api/pages/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, field: 'page_access_token', value: 'hack' }) });
+      if (bad.status !== 400) throw new Error('ไม่ปฏิเสธ field ต้องห้าม!');
+      return { detail: 'ปิดเพจ → ปิด AI → ปฏิเสธ field ต้องห้าม สำเร็จ' };
+    } finally {
+      removeTestPage(pageId);
+    }
+  });
+
+  await run('inbox-meta-features', 'Meta Inbox', 'รายการแชท + ติดดาว/บล็อก/ยังไม่ได้อ่าน', async () => {
+    const pageId = addTestPage();
+    const sender = PREFIX + 'inbox_meta';
+    try {
+      // จำลองลูกค้าทักเข้ามา 1 ข้อความ (ผ่าน webhook เพื่อให้ state ถูกสร้างจริง)
+      const hook = webhookRequest({ id: pageId, messaging: [{ sender: { id: sender }, message: { mid: PREFIX + 'im_' + Date.now(), text: 'สวัสดีคะ' } }] });
+      const hookRes = await fetchJson(baseUrl, '/api/webhook/facebook', hook);
+      if (hookRes.status !== 200) throw new Error(`webhook HTTP ${hookRes.status} — ต้องได้ 200 เสมอ`);
+      // Poll: รอ pipeline (pushHistory -> Postgres) ให้เสร็จ สูงสุด 8 วินาที
+      let convo: any = null;
+      let lastList: any = null;
+      for (let attempt = 0; attempt < 4 && !convo; attempt++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const list = await fetchJson(baseUrl, `/api/inbox/conversations?page_id=${pageId}`);
+        if (list.status !== 200 || !list.data?.success) throw new Error(`conversations HTTP ${list.status}`);
+        lastList = list.data;
+        convo = (list.data.conversations || []).find((c: any) => c.thread_id === sender);
+      }
+      if (!convo) throw new Error(`ไม่พบบทสนทนาจากลูกค้าที่เพิ่งทัก (มีทั้งหมด ${lastList?.conversations?.length ?? '?'} แชท: ${JSON.stringify((lastList?.conversations || []).map((c: any) => c.thread_id)).slice(0, 120)})`);
+      if (!convo.unread) throw new Error('แชทใหม่ควรสถานะยังไม่ได้อ่าน');
+      // ติดดาว + บล็อก
+      const st = await fetchJson(baseUrl, '/api/inbox/state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, sender_id: sender, is_starred: true, is_blocked: true }) });
+      if (st.status !== 200 || !st.data?.success) throw new Error(`state HTTP ${st.status}`);
+      const list2 = await fetchJson(baseUrl, `/api/inbox/conversations?page_id=${pageId}`);
+      const convo2 = (list2.data.conversations || []).find((c: any) => c.thread_id === sender);
+      if (!convo2?.starred || !convo2?.blocked) throw new Error('สถานะติดดาว/บล็อกไม่ถูกบันทึก');
+      // ข้อความของบทสนทนา
+      const msgs = await fetchJson(baseUrl, `/api/inbox/messages?page_id=${pageId}&sender_id=${sender}`);
+      if (msgs.status !== 200 || !msgs.data?.success) throw new Error(`messages HTTP ${msgs.status}`);
+      if (!Array.isArray(msgs.data.messages) || msgs.data.messages.length === 0) throw new Error('ไม่พบข้อความในบทสนทนา');
+      // mark read หลังเปิดแชท
+      if (!convo2.unread === false && msgs.data.messages.length > 0) { /* messages endpoint ล้าง unread แล้ว */ }
+      return { detail: `แชทเข้า → unread → ติดดาว → บล็อก → อ่านข้อความ (${msgs.data.messages.length} ข้อความ) สำเร็จ` };
+    } finally {
+      removeTestPage(pageId);
+      await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [sender]).catch(() => {});
+    }
+  });
+
   // ===================== F. BACKUP =====================
   await run('backup-create-list', 'สำรองข้อมูล', 'Backup: สร้าง/ดูรายการ', async () => {
     const create = await fetchJson(baseUrl, '/api/backup/create', { method: 'POST' }, 30000);

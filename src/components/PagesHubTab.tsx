@@ -126,7 +126,13 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
   });
 
   // Filter pages
-  const filteredPages = pageStats.filter(item => {
+  // เพจที่เปิดใช้งานอยู่ขึ้นบนก่อน — เพจที่ปิดใช้งานเรียงไปด้านล่างสุด
+  const sortedPageStats = [...pageStats].sort((a, b) =>
+    (a.page.is_active === b.page.is_active) ? 0 : (a.page.is_active ? -1 : 1)
+  );
+  const disabledPageCount = pages.filter(p => !p.is_active).length;
+
+  const filteredPages = sortedPageStats.filter(item => {
     const p = item.page;
     const matchesSearch =
       p.page_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -276,6 +282,16 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
                 <span className="text-slate-500 dark:text-zinc-400 block text-[11px]">AI กำลังทำงาน</span>
                 <span className="text-sm font-black font-mono text-emerald-600 dark:text-emerald-400">
                   {totalActivePages} / {pages.length} เพจ
+                </span>
+              </div>
+            </div>
+
+            <div className={`border rounded-xl px-4 py-2.5 flex items-center gap-3 ${disabledPageCount > 0 ? 'bg-amber-50 dark:bg-amber-950/30 border-amber-300 dark:border-amber-800/60' : 'bg-slate-50 dark:bg-[#141418] border-slate-200 dark:border-zinc-800'}`}>
+              <Power className={`w-4 h-4 ${disabledPageCount > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-slate-400'}`} />
+              <div>
+                <span className="text-slate-500 dark:text-zinc-400 block text-[11px]">เพจที่ปิดการใช้งาน</span>
+                <span className={`text-sm font-black font-mono ${disabledPageCount > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-slate-400'}`}>
+                  {disabledPageCount} หน้า
                 </span>
               </div>
             </div>
@@ -490,8 +506,17 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
             const isActive = p.is_active;
 
             return (
+              <React.Fragment key={p.page_id}>
+              {/* ป้ายกำกับก่อนกลุ่มเพจที่ปิดการใช้งาน */}
+              {!isActive && (filteredPages.find(x => !x.page.is_active)?.page.page_id === p.page_id) && (
+                <div className="col-span-full flex items-center gap-3 py-2">
+                  <span className="text-xs font-bold text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
+                    <Power className="w-3.5 h-3.5" /> เพจที่ปิดการใช้งาน ({disabledPageCount} หน้า) — บอทไม่ตอบแชทเหล่านี้
+                  </span>
+                  <span className="flex-1 h-px bg-amber-200 dark:bg-amber-900/40" />
+                </div>
+              )}
               <div
-                key={p.page_id}
                 className={`group bg-white dark:bg-[#0F0F12] border rounded-2xl overflow-hidden shadow-xs hover:shadow-lg transition-all duration-200 flex flex-col ${
                   isActive ? 'border-slate-200 dark:border-zinc-800' : 'border-slate-200/60 opacity-80'
                 }`}
@@ -524,17 +549,21 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
 
                   {/* Status Indicator & Power Toggle on top-right */}
                   <div className="absolute top-3 right-3 flex items-center gap-1.5">
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold backdrop-blur-md border flex items-center gap-1 shadow-xs ${
+                      isActive ? 'bg-emerald-500/90 text-white border-emerald-600' : 'bg-slate-800/90 text-zinc-300 border-slate-700'
+                    }`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${isActive ? 'bg-white animate-pulse' : 'bg-slate-400'}`} />
+                      {isActive ? 'AI Online' : 'ปิดอยู่'}
+                    </span>
+                    {/* Toggle switch เปิด/ปิดการใช้งานเพจ */}
                     <button
                       onClick={() => onTogglePageStatus(p.page_id, !isActive)}
-                      className={`px-2.5 py-1 rounded-full text-[11px] font-bold backdrop-blur-md border flex items-center gap-1.5 shadow-xs transition-all ${
-                        isActive
-                          ? 'bg-emerald-500 text-white border-emerald-600 hover:bg-emerald-600'
-                          : 'bg-slate-800/90 text-white border-slate-700 hover:bg-slate-700'
+                      className={`w-11 h-6 rounded-full relative transition-colors shadow-xs border ${
+                        isActive ? 'bg-emerald-500 border-emerald-600' : 'bg-slate-400 dark:bg-zinc-600 border-slate-500 dark:border-zinc-500'
                       }`}
-                      title={isActive ? 'คลิกเพื่อพักการทำงานของ AI' : 'คลิกเพื่อเปิดใช้งาน AI'}
+                      title={isActive ? 'ปิดใช้งานเพจนี้ — บอทจะไม่ตอบแชท' : 'เปิดใช้งานเพจนี้ — บอทกลับมาตอบแชท'}
                     >
-                      <span className={`w-2 h-2 rounded-full ${isActive ? 'bg-white animate-pulse' : 'bg-slate-400'}`} />
-                      <span>{isActive ? 'AI Online' : 'Paused'}</span>
+                      <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all ${isActive ? 'left-5' : 'left-0.5'}`} />
                     </button>
                   </div>
                 </div>
@@ -662,6 +691,7 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
                   </div>
                 </div>
               </div>
+              </React.Fragment>
             );
           })}
         </div>

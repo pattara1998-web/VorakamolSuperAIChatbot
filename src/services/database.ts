@@ -293,6 +293,20 @@ async function initTables() {
       FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS conversation_state (
+      page_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      is_starred INTEGER DEFAULT 0,
+      is_blocked INTEGER DEFAULT 0,
+      is_unread INTEGER DEFAULT 0,
+      unread_count INTEGER DEFAULT 0,
+      last_message_at TEXT DEFAULT '',
+      last_message_text TEXT DEFAULT '',
+      participant_name TEXT DEFAULT '',
+      updated_at TEXT DEFAULT ${PG_NOW_DEFAULT},
+      PRIMARY KEY (page_id, sender_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_products_page ON products(page_id);
     CREATE INDEX IF NOT EXISTS idx_customers_page ON customers(page_id);
     CREATE INDEX IF NOT EXISTS idx_orders_page ON orders(page_id);
@@ -735,6 +749,78 @@ export async function getActiveOrdersByPage(pageId: string): Promise<any[]> {
 export async function getPageRevenue(pageId: string): Promise<number> {
   const res = await q('SELECT COALESCE(SUM(total_amount), 0)::float8 AS total FROM orders WHERE page_id = ? AND is_cancelled = 0 AND payment_status != ?', [pageId, 'CANCELLED']);
   return res.rows[0]?.total ?? 0;
+}
+
+// ===================== CONVERSATION STATE (Meta-style inbox) =====================
+
+export interface ConversationStateRow {
+  page_id: string;
+  sender_id: string;
+  is_starred: number;
+  is_blocked: number;
+  is_unread: number;
+  unread_count: number;
+  last_message_at: string;
+  last_message_text: string;
+  participant_name: string;
+  updated_at: string;
+}
+
+export async function getConversationState(pageId: string, senderId: string): Promise<ConversationStateRow | undefined> {
+  const res = await q('SELECT * FROM conversation_state WHERE page_id = ? AND sender_id = ? LIMIT 1', [pageId, senderId]);
+  return res.rows[0] ?? undefined;
+}
+
+export async function listConversationStates(pageId: string): Promise<ConversationStateRow[]> {
+  const res = await q('SELECT * FROM conversation_state WHERE page_id = ?', [pageId]);
+  return res.rows;
+}
+
+/** Partial update - only patched columns change on conflict. */
+export async function updateConversationState(pageId: string, senderId: string, patch: Partial<ConversationStateRow>): Promise<void> {
+  const patchKeys = Object.keys(patch).filter(k => !['page_id', 'sender_id'].includes(k));
+  const cols: Record<string, any> = { page_id: pageId, sender_id: senderId, ...patch, updated_at: new Date().toISOString() };
+  const allKeys = Object.keys(cols);
+  const placeholders = allKeys.map((_, i) => `$${i + 1}`).join(', ');
+  const updateSet = patchKeys.length > 0
+    ? patchKeys.map(k => `${k} = EXCLUDED.${k}`).join(', ')
+    : 'updated_at = EXCLUDED.updated_at';
+  await q(
+    `INSERT INTO conversation_state (${allKeys.join(', ')}) VALUES (${placeholders})
+     ON CONFLICT (page_id, sender_id) DO UPDATE SET ${updateSet}`,
+    allKeys.map(k => (cols as any)[k] ?? null)
+  );
+}
+
+/** Customer message arrived: bump unread + preview atomically. */
+export async function recordIncomingMessage(pageId: string, senderId: string, text: string, participantName = ''): Promise<void> {
+  const now = new Date().toISOString();
+  await q(
+    `INSERT INTO conversation_state (page_id, sender_id, is_unread, unread_count, last_message_at, last_message_text, participant_name, updated_at)
+     VALUES (?, ?, 1, 1, ?, ?, ?, ?)
+     ON CONFLICT (page_id, sender_id) DO UPDATE SET
+       is_unread = 1,
+       unread_count = conversation_state.unread_count + 1,
+       last_message_at = EXCLUDED.last_message_at,
+       last_message_text = EXCLUDED.last_message_text,
+       participant_name = COALESCE(NULLIF(EXCLUDED.participant_name, ''), conversation_state.participant_name),
+       updated_at = EXCLUDED.updated_at`,
+    [pageId, senderId, now, String(text || '').slice(0, 200), String(participantName || '').slice(0, 100), now]
+  );
+}
+
+/** Admin/AI replied: update preview, conversation stays read. */
+export async function recordOutgoingMessage(pageId: string, senderId: string, text: string): Promise<void> {
+  const now = new Date().toISOString();
+  await q(
+    `INSERT INTO conversation_state (page_id, sender_id, is_unread, unread_count, last_message_at, last_message_text, updated_at)
+     VALUES (?, ?, 0, 0, ?, ?, ?)
+     ON CONFLICT (page_id, sender_id) DO UPDATE SET
+       last_message_at = EXCLUDED.last_message_at,
+       last_message_text = EXCLUDED.last_message_text,
+       updated_at = EXCLUDED.updated_at`,
+    [pageId, senderId, now, String(text || '').slice(0, 200), now]
+  );
 }
 
 // ===================== DATA MIGRATION (JSON -> PostgreSQL) =====================
