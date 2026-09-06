@@ -4065,6 +4065,195 @@ ${JSON.stringify((page.product?.promotions || [
   });
 
   // Full Database Backup Export API
+  // ================================================================
+  // DATABASE STATUS & SYNC (PostgreSQL — อัตโนมัติ ไม่ต้องตั้งค่าเอง)
+  // ================================================================
+  app.get('/api/database/status', (req: Request, res: Response) => {
+    const dbUrl = process.env.DATABASE_URL || '';
+    let host = 'local (PGlite embedded)';
+    if (dbUrl) {
+      try {
+        const u = new URL(dbUrl);
+        host = u.hostname + (u.port ? ':' + u.port : '');
+      } catch { host = 'configured'; }
+    }
+    res.json({
+      success: true,
+      engine: 'PostgreSQL',
+      mode: dbUrl ? 'DATABASE_URL (คลาวด์)' : 'PGlite local (embedded)',
+      host,
+      database: dbUrl ? (dbUrl.split('/').pop() || '').split('?')[0] : 'superai',
+      counts: {
+        pages: db.pages.length,
+        customers: db.customers.length,
+        orders: db.orders.length,
+        products: db.amulet.length + db.china.length + db.otop.length + db.agriculture.length,
+        logs: db.logs.length
+      },
+      uptimeSec: Math.round(process.uptime())
+    });
+  });
+
+  // บังคับเขียนข้อมูลในหน่วยความจำทั้งหมดลง PostgreSQL ทันที (ซิงค์ 1 ทาง)
+  app.post('/api/database/sync', async (req: Request, res: Response) => {
+    const started = Date.now();
+    try {
+      await dbBridge.saveToDatabase(db);
+      const ms = Date.now() - started;
+      addLog('INFO', 'DATABASE', 'SYSTEM', `SYNC ซิงค์ข้อมูลลง PostgreSQL สำเร็จ (${ms}ms)`, 'SUCCESS');
+      res.json({
+        success: true,
+        durationMs: ms,
+        counts: {
+          pages: db.pages.length,
+          customers: db.customers.length,
+          orders: db.orders.length,
+          products: db.amulet.length + db.china.length + db.otop.length + db.agriculture.length
+        },
+        message: `ซิงค์ลง PostgreSQL สำเร็จ (${ms}ms)`
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: `ซิงค์ไม่สำเร็จ: ${err.message}` });
+    }
+  });
+
+  // ================================================================
+  // BACKUP IMPORT (นำเข้า JSON — กันข้อมูลซ้ำด้วย upsert ตาม primary key
+  // นำเข้ากี่ครั้งก็ไม่ซ้ำ: มีอยู่แล้ว = อัปเดตทับ, ไม่มี = เพิ่มใหม่)
+  // ================================================================
+  app.post('/api/backup/import', async (req: Request, res: Response) => {
+    try {
+      const body = req.body || {};
+      const data = body.data || body; // รองรับทั้ง {data:{...}} และแบบ flat
+      const mode = body.mode === 'overwrite' ? 'overwrite' : 'merge';
+      if (!data || typeof data !== 'object') {
+        return res.status(400).json({ success: false, message: 'ไม่พบข้อมูลในไฟล์ที่นำเข้า' });
+      }
+      const isMasked = (t: any) => !t || String(t).includes('•••');
+      const result: Record<string, any> = {};
+
+      // ---------- PAGES (กัน token โดน mask ทับของจริง) ----------
+      if (Array.isArray(data.pages)) {
+        let added = 0, updated = 0, keptTokens = 0;
+        for (const imp of data.pages) {
+          if (!imp?.page_id) continue;
+          const incoming = { ...imp };
+          const existing = db.pages.find(p => p.page_id === imp.page_id);
+          if (existing && isMasked(incoming.page_access_token)) {
+            incoming.page_access_token = existing.page_access_token; // เก็บ token เดิมไว้
+            keptTokens++;
+          }
+          if (existing) {
+            db.pages[db.pages.indexOf(existing)] = { ...existing, ...incoming };
+            updated++;
+          } else {
+            db.pages.unshift(incoming);
+            added++;
+          }
+          await dbService.upsertPage(dbBridge.flattenPage(incoming as any)).catch(() => {});
+        }
+        result.pages = { added, updated, keptTokens };
+      }
+
+      // ---------- CUSTOMERS (upsert ตาม psid) ----------
+      if (Array.isArray(data.customers)) {
+        let added = 0, updated = 0;
+        for (const imp of data.customers) {
+          if (!imp?.psid) continue;
+          const existing = db.customers.find(c => c.psid === imp.psid);
+          if (existing) {
+            db.customers[db.customers.indexOf(existing)] = { ...existing, ...imp };
+            updated++;
+          } else {
+            db.customers.unshift(imp);
+            added++;
+          }
+          await dbService.upsertCustomer(imp).catch(() => {});
+        }
+        result.customers = { added, updated };
+      }
+
+      // ---------- ORDERS (upsert ตาม order_id) ----------
+      if (Array.isArray(data.orders)) {
+        let added = 0, updated = 0;
+        for (const imp of data.orders) {
+          if (!imp?.order_id) continue;
+          const existing = db.orders.find(o => o.order_id === imp.order_id);
+          if (existing) {
+            db.orders[db.orders.indexOf(existing)] = { ...existing, ...imp };
+            updated++;
+          } else {
+            db.orders.unshift(imp);
+            added++;
+          }
+          await dbService.upsertOrder(imp).catch(() => {});
+        }
+        result.orders = { added, updated };
+      }
+
+      // ---------- PRODUCTS (upsert ตาม product_id + category) ----------
+      const productCats: Array<[string, any[]]> = [
+        ['amulet', db.amulet], ['china', db.china], ['otop', db.otop], ['agriculture', db.agriculture]
+      ];
+      for (const [cat, arr] of productCats) {
+        const rows = data[cat];
+        if (!Array.isArray(rows)) continue;
+        let added = 0, updated = 0;
+        for (const row of rows) {
+          if (!row?.product_id) continue;
+          const normalized = { ...row, category: cat.toUpperCase() };
+          const idx = arr.findIndex(p => p.product_id === row.product_id);
+          if (idx >= 0) {
+            arr[idx] = { ...arr[idx], ...normalized };
+            updated++;
+          } else {
+            arr.unshift(normalized);
+            added++;
+          }
+          await dbService.upsertProduct({
+            ...normalized,
+            custom_specs: typeof normalized.custom_specs === 'string' ? normalized.custom_specs : JSON.stringify(normalized.custom_specs || []),
+            specs_json: '{}'
+          }).catch(() => {});
+        }
+        result[cat] = { added, updated };
+      }
+
+      // ---------- OVERWRITE MODE: ลบแถวที่ไม่มีในไฟล์ออกจาก PostgreSQL ----------
+      if (mode === 'overwrite') {
+        const filePageIds = new Set((data.pages || []).map((p: any) => p.page_id).filter(Boolean));
+        for (const p of db.pages) {
+          if (!filePageIds.has(p.page_id)) await dbService.deletePage(p.page_id).catch(() => {});
+        }
+      }
+
+      persistData();
+      const summary = Object.entries(result).map(([k, v]) => `${k} +${v.added}/~${v.updated}`).join(', ');
+      addLog('INFO', 'DATABASE', 'SYSTEM', `IMPORT นำเข้าฐานข้อมูล (${mode === 'overwrite' ? 'เขียนทับ' : 'รวมแบบกันซ้ำ'}) : ${summary}`, 'SUCCESS');
+
+      res.json({
+        success: true,
+        mode,
+        result,
+        applied: {
+          pages: db.pages,
+          customers: db.customers,
+          orders: db.orders,
+          amulet: db.amulet,
+          china: db.china,
+          otop: db.otop,
+          agriculture: db.agriculture
+        },
+        message: mode === 'overwrite'
+          ? 'นำเข้าแบบเขียนทับสำเร็จ'
+          : 'นำเข้าสำเร็จ (มีอยู่แล้ว = อัปเดตทับ ไม่ซ้ำแน่นอน)'
+      });
+    } catch (err: any) {
+      console.error('Backup import error:', err);
+      res.status(500).json({ success: false, message: `นำเข้าไม่สำเร็จ: ${err.message}` });
+    }
+  });
+
   app.get('/api/backup/export', (req: Request, res: Response) => {
     const backupData = {
       version: '2.0.0',

@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
+  Upload,
   Database,
   Plus,
   Search,
@@ -76,31 +77,65 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
   const [editingProduct, setEditingProduct] = useState<any | null>(null);
   const [viewingSpecsProduct, setViewingSpecsProduct] = useState<{ item: any; category: ProductCategory } | null>(null);
 
-  // Vercel / Cloud DB Custom Config State
+  // PostgreSQL Cloud DB — สถานะอัตโนมัติ (อ่านจากเซิร์ฟเวอร์ ไม่ต้องตั้งค่าเอง)
   const [isCloudConfigModalOpen, setIsCloudConfigModalOpen] = useState(false);
-  const [vercelKvRestApiUrl, setVercelKvRestApiUrl] = useState(() => {
-    return typeof window !== 'undefined' ? localStorage.getItem('fb_chatbot_kv_url') || '' : '';
-  });
-  const [vercelKvRestApiToken, setVercelKvRestApiToken] = useState(() => {
-    return typeof window !== 'undefined' ? localStorage.getItem('fb_chatbot_kv_token') || '' : '';
-  });
-  const [customApiUrl, setCustomApiUrl] = useState(() => {
-    return typeof window !== 'undefined' ? localStorage.getItem('fb_chatbot_custom_api_url') || '' : '';
-  });
-  const [cloudSaveNotice, setCloudSaveNotice] = useState<string | null>(null);
+  const [dbStatus, setDbStatus] = useState<any>(null);
+  const [dbStatusLoading, setDbStatusLoading] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
 
-  const handleSaveCloudSettings = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('fb_chatbot_kv_url', vercelKvRestApiUrl.trim());
-      localStorage.setItem('fb_chatbot_kv_token', vercelKvRestApiToken.trim());
-      localStorage.setItem('fb_chatbot_custom_api_url', customApiUrl.trim());
-    }
-    setCloudSaveNotice('✅ บันทึกการตั้งค่า Vercel Database / KV สำเร็จเรียบร้อยแล้ว!');
-    setTimeout(() => {
-      setCloudSaveNotice(null);
-      setIsCloudConfigModalOpen(false);
-    }, 1500);
+  const openDbStatus = () => {
+    setIsCloudConfigModalOpen(true);
+    setDbStatusLoading(true);
+    fetch('/api/database/status')
+      .then(r => r.json())
+      .then(d => setDbStatus(d.success ? d : null))
+      .catch(() => setDbStatus(null))
+      .finally(() => setDbStatusLoading(false));
+  };
+
+  const handleImportBackup = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const parsed = JSON.parse(String(reader.result));
+        const data = parsed.data || parsed;
+        const summary = [
+          data.pages?.length ? `เพจ ${data.pages.length}` : '',
+          data.customers?.length ? `ลูกค้า ${data.customers.length}` : '',
+          data.orders?.length ? `ออเดอร์ ${data.orders.length}` : '',
+          data.amulet?.length ? `พระ ${data.amulet.length}` : '',
+          data.china?.length ? `สินค้าจีน ${data.china.length}` : '',
+          data.otop?.length ? `OTOP ${data.otop.length}` : '',
+          data.agriculture?.length ? `เกษตร ${data.agriculture.length}` : ''
+        ].filter(Boolean).join(', ');
+        if (!summary) { alert('ไฟล์นี้ไม่มีข้อมูลที่ระบบรู้จัก'); return; }
+        if (!window.confirm('นำเข้าข้อมูล: ' + summary + '\n\nระบบจะรวมแบบกันซ้ำ (มีอยู่แล้ว = อัปเดตทับ ไม่สร้างซ้ำ)\nยืนยันนำเข้า?')) return;
+        setImporting(true);
+        const res = await fetch('/api/backup/import', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data, mode: 'merge' })
+        });
+        const r = await res.json();
+        if (r.success) {
+          if (r.applied.pages) setPages(r.applied.pages);
+          if (r.applied.customers) setCustomers(r.applied.customers);
+          if (r.applied.orders) setOrders(r.applied.orders);
+          if (r.applied.amulet) setAmulet(r.applied.amulet);
+          if (r.applied.china) setChina(r.applied.china);
+          if (r.applied.otop) setOtop(r.applied.otop);
+          if (r.applied.agriculture) setAgriculture(r.applied.agriculture);
+          const parts = Object.entries(r.result || {}).map(([k, v]: any) => k + ': เพิ่มใหม่ ' + v.added + ' / อัปเดต ' + v.updated);
+          setSyncStatus('✅ นำเข้าสำเร็จ (กันซ้ำแล้ว) — ' + parts.join(' | '));
+          setTimeout(() => setSyncStatus(null), 8000);
+        } else {
+          alert('นำเข้าไม่สำเร็จ: ' + (r.message || 'ไม่ทราบสาเหตุ'));
+        }
+      } catch (err: any) {
+        alert('ไฟล์ไม่ใช่ JSON ที่ถูกต้อง: ' + err.message);
+      } finally { setImporting(false); }
+    };
+    reader.readAsText(file);
   };
 
   const sheetsMeta = [
@@ -254,10 +289,19 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
     
     syncDatabaseWithPages();
     
-    setTimeout(() => {
-      setSyncStatus('✅ ซิงค์ข้อมูลกับ Database สำเร็จ! ข้อมูลสินค้าเชื่อมโยงกับเพจที่ตั้งค่าแล้ว');
-      setTimeout(() => setSyncStatus(null), 4000);
-    }, 900);
+    // เขียนข้อมูลทั้งหมดลง PostgreSQL จริง (ไม่ใช่แค่หน้าจอ)
+    fetch('/api/database/sync', { method: 'POST' })
+      .then(r => r.json())
+      .then(r => {
+        setSyncStatus(r.success
+          ? `✅ ซิงค์ลง PostgreSQL สำเร็จ (${r.durationMs}ms) — เพจ ${r.counts.pages} / ลูกค้า ${r.counts.customers} / ออเดอร์ ${r.counts.orders} / สินค้า ${r.counts.products}`
+          : '❌ ' + (r.message || 'ซิงค์ไม่สำเร็จ'));
+        setTimeout(() => setSyncStatus(null), 5000);
+      })
+      .catch(() => {
+        setSyncStatus('❌ เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ');
+        setTimeout(() => setSyncStatus(null), 5000);
+      });
   };
 
   const handleExportCSV = () => {
@@ -291,7 +335,7 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
   const handleExportBackupJSON = () => {
     const fullBackup = {
       exported_at: new Date().toISOString(),
-      provider: 'Vercel Serverless Database',
+      provider: 'PostgreSQL Cloud Database',
       data: {
         china,
         amulet,
@@ -305,7 +349,7 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
     const jsonStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(fullBackup, null, 2));
     const link = document.createElement('a');
     link.setAttribute('href', jsonStr);
-    link.setAttribute('download', `vercel_database_backup_${Date.now()}.json`);
+    link.setAttribute('download', `superai_postgres_backup_${Date.now()}.json`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -461,7 +505,7 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
   };
 
   const handleDeleteItem = (index: number) => {
-    if (!confirm('คุณแน่ใจหรือไม่ว่าต้องการลบรายการนี้ออกจาก Vercel Database?')) return;
+    if (!confirm('คุณแน่ใจหรือไม่ว่าต้องการลบรายการนี้ออกจากฐานข้อมูล?')) return;
     if (activeSheet === 'amulet') {
       const updated = amulet.filter((_, i) => i !== index);
       setAmulet(updated);
@@ -507,13 +551,13 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
               </span>
               <div>
                 <h3 className="font-bold text-slate-900 dark:text-zinc-100 text-lg flex items-center gap-2">
-                  ระบบฐานข้อมูลคลาวด์ Vercel (Vercel Database / KV & Serverless)
+                  ระบบฐานข้อมูลคลาวด์ PostgreSQL (ซิงค์อัตโนมัติ)
                   <span className="text-[10px] font-mono bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 font-bold px-2.5 py-0.5 rounded-full border border-emerald-200 dark:border-emerald-500/20">
-                    VERCEL EDGE ACTIVE
+                    POSTGRES ACTIVE
                   </span>
                 </h3>
                 <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
-                  จัดการสินค้าด้วยเทมเพลตภาษาไทยละเอียดตามหมวดหมู่ เลือกผูกกับเพจ Facebook ได้อิสระ พร้อมระบบซิงค์ 2 ทาง (Bi-Directional) กับศูนย์จัดการเพจ
+                  จัดการสินค้าด้วยเทมเพลตภาษาไทยละเอียดตามหมวดหมู่ เชื่อมต่อ PostgreSQL อัตโนมัติ (ตั้ง DATABASE_URL บนคลาวด์ หรือรัน local แบบ embedded) พร้อมสำรอง/นำเข้า JSON แบบกันข้อมูลซ้ำ
                 </p>
               </div>
             </div>
@@ -521,17 +565,17 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
 
           <div className="flex flex-wrap items-center gap-2.5">
             <button
-              onClick={() => setIsCloudConfigModalOpen(true)}
+              onClick={openDbStatus}
               className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition-all flex items-center gap-2 shadow-xs cursor-pointer"
             >
-              <span>⚙️ ตั้งค่าเชื่อมต่อ Vercel / Cloud DB</span>
+              <span>⚙️ สถานะฐานข้อมูล (อัตโนมัติ)</span>
             </button>
             <button
               onClick={handleSyncVercelDB}
               className="px-4 py-2 bg-slate-50 hover:bg-slate-100 dark:bg-[#141418] dark:hover:bg-[#181820] text-slate-700 dark:text-zinc-200 text-xs font-bold rounded-xl border border-slate-200 dark:border-zinc-700/80 transition-all flex items-center gap-2 shadow-xs"
             >
-              <RefreshCw className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
-              <span>ซิงค์ Vercel Database</span>
+              <RefreshCw className={`w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400 ${syncStatus ? 'animate-spin' : ''}`} />
+              <span>ซิงค์ข้อมูล → PostgreSQL</span>
             </button>
             <button
               onClick={handleExportBackupJSON}
@@ -539,6 +583,16 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
             >
               <Download className="w-3.5 h-3.5 text-indigo-500" />
               <span>สำรองฐานข้อมูล (JSON)</span>
+            </button>
+            <input ref={importInputRef} type="file" accept=".json,application/json" className="hidden"
+              onChange={e => { const f = e.target.files?.[0]; if (f) handleImportBackup(f); e.target.value = ''; }} />
+            <button
+              onClick={() => importInputRef.current?.click()}
+              disabled={importing}
+              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition-all flex items-center gap-2 shadow-xs disabled:opacity-50"
+            >
+              <Upload className={`w-3.5 h-3.5 ${importing ? 'animate-pulse' : ''}`} />
+              <span>{importing ? 'กำลังนำเข้า...' : 'นำเข้าฐานข้อมูล (JSON)'}</span>
             </button>
           </div>
         </div>
@@ -1518,10 +1572,10 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                 </div>
                 <div>
                   <h3 className="font-bold text-slate-900 dark:text-zinc-100 text-base">
-                    ตั้งค่าการเชื่อมต่อ Vercel / Cloud DB
+                    สถานะฐานข้อมูล PostgreSQL
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-zinc-400">
-                    ระบุ Environment Variables หรือ URL สำหรับเชื่อมต่อฐานข้อมูลคลาวด์ของคุณเอง
+                    เชื่อมต่ออัตโนมัติ — ไม่ต้องตั้งค่าอะไรเอง (ระบบอ่านจาก DATABASE_URL บนเซิร์ฟเวอร์)
                   </p>
                 </div>
               </div>
@@ -1533,70 +1587,46 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
               </button>
             </div>
 
-            {cloudSaveNotice && (
-              <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-emerald-600 dark:text-emerald-400 text-xs flex items-center gap-2">
-                <CheckCircle2 className="w-4 h-4 shrink-0" />
-                <span>{cloudSaveNotice}</span>
+            {dbStatusLoading ? (
+              <p className="text-xs text-slate-500 dark:text-zinc-400 text-center py-6">กำลังตรวจสอบสถานะ...</p>
+            ) : dbStatus ? (
+              <div className="space-y-3 text-xs">
+                <div className="flex items-center gap-2 p-3 rounded-xl bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-200 dark:border-emerald-500/30 text-emerald-700 dark:text-emerald-300 font-bold">
+                  <CheckCircle2 className="w-4 h-4" />
+                  เชื่อมต่อสำเร็จ: {dbStatus.engine} ({dbStatus.mode})
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#181920] border border-slate-200 dark:border-zinc-800">
+                    <div className="text-slate-500 dark:text-zinc-400 text-[10px]">เซิร์ฟเวอร์</div>
+                    <div className="font-mono font-bold text-slate-800 dark:text-zinc-100 break-all">{dbStatus.host}</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#181920] border border-slate-200 dark:border-zinc-800">
+                    <div className="text-slate-500 dark:text-zinc-400 text-[10px]">ชื่อฐานข้อมูล</div>
+                    <div className="font-mono font-bold text-slate-800 dark:text-zinc-100">{dbStatus.database}</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#181920] border border-slate-200 dark:border-zinc-800">
+                    <div className="text-slate-500 dark:text-zinc-400 text-[10px]">เพจ / ลูกค้า / ออเดอร์</div>
+                    <div className="font-mono font-bold text-slate-800 dark:text-zinc-100">{dbStatus.counts.pages} / {dbStatus.counts.customers} / {dbStatus.counts.orders}</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#181920] border border-slate-200 dark:border-zinc-800">
+                    <div className="text-slate-500 dark:text-zinc-400 text-[10px]">สินค้า / เซิร์ฟเวอร์รันมาแล้ว</div>
+                    <div className="font-mono font-bold text-slate-800 dark:text-zinc-100">{dbStatus.counts.products} ชิ้น / {Math.floor(dbStatus.uptimeSec / 60)} นาที</div>
+                  </div>
+                </div>
               </div>
+            ) : (
+              <p className="text-xs text-rose-500 text-center py-6">ตรวจสอบสถานะไม่สำเร็จ — ลองเปิดใหม่อีกครั้ง</p>
             )}
 
-            <form onSubmit={handleSaveCloudSettings} className="space-y-4 text-xs">
-              <div>
-                <label className="font-bold text-slate-700 dark:text-zinc-300 block mb-1">
-                  1. Vercel KV REST API URL (KV_REST_API_URL):
-                </label>
-                <input
-                  type="text"
-                  placeholder="https://...kv.vercel-storage.com"
-                  value={vercelKvRestApiUrl}
-                  onChange={e => setVercelKvRestApiUrl(e.target.value)}
-                  className="w-full bg-slate-50 dark:bg-[#181920] border border-slate-300 dark:border-zinc-700 rounded-xl px-3.5 py-2.5 font-mono text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
-                />
-              </div>
-
-              <div>
-                <label className="font-bold text-slate-700 dark:text-zinc-300 block mb-1">
-                  2. Vercel KV REST API Token (KV_REST_API_TOKEN):
-                </label>
-                <input
-                  type="password"
-                  placeholder="AXXX..."
-                  value={vercelKvRestApiToken}
-                  onChange={e => setVercelKvRestApiToken(e.target.value)}
-                  className="w-full bg-slate-50 dark:bg-[#181920] border border-slate-300 dark:border-zinc-700 rounded-xl px-3.5 py-2.5 font-mono text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
-                />
-              </div>
-
-              <div>
-                <label className="font-bold text-slate-700 dark:text-zinc-300 block mb-1">
-                  3. Custom Serverless API Endpoint (ถ้ามี):
-                </label>
-                <input
-                  type="text"
-                  placeholder="https://your-api.vercel.app/api/data"
-                  value={customApiUrl}
-                  onChange={e => setCustomApiUrl(e.target.value)}
-                  className="w-full bg-slate-50 dark:bg-[#181920] border border-slate-300 dark:border-zinc-700 rounded-xl px-3.5 py-2.5 font-mono text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
-                />
-              </div>
-
-              <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-slate-200 dark:border-zinc-800/80">
-                <button
-                  type="button"
-                  onClick={() => setIsCloudConfigModalOpen(false)}
-                  className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-slate-700 dark:text-zinc-300 font-bold rounded-xl cursor-pointer"
-                >
-                  ปิด
-                </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl shadow-md cursor-pointer flex items-center gap-1.5"
-                >
-                  <Check className="w-4 h-4" />
-                  <span>บันทึกการตั้งค่า</span>
-                </button>
-              </div>
-            </form>
+            <div className="flex justify-end pt-2">
+              <button
+                type="button"
+                onClick={() => setIsCloudConfigModalOpen(false)}
+                className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl shadow-md cursor-pointer"
+              >
+                ปิด
+              </button>
+            </div>
           </div>
         </div>
       )}

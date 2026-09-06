@@ -203,7 +203,7 @@ export async function migrateFromJsonIfEmpty(jsonData: any): Promise<void> {
   }
 }
 
-function flattenPage(page: PageConfig): Record<string, any> {
+export function flattenPage(page: PageConfig): Record<string, any> {
   return {
     page_id: page.page_id,
     page_name: page.page_name,

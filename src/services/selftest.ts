@@ -610,6 +610,42 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     }
   });
 
+  await run('database-status-sync', 'Database', 'สถานะ DB อัตโนมัติ + ซิงค์ลง PostgreSQL', async () => {
+    const st = await fetchJson(baseUrl, '/api/database/status');
+    if (st.status !== 200 || !st.data?.success) throw new Error(`status HTTP ${st.status}`);
+    if (st.data.engine !== 'PostgreSQL') throw new Error(`engine=${st.data.engine}`);
+    const sync = await fetchJson(baseUrl, '/api/database/sync', { method: 'POST' }, 30000);
+    if (sync.status !== 200 || !sync.data?.success) throw new Error(`sync HTTP ${sync.status}`);
+    return { detail: `${st.data.engine} (${st.data.mode}) ซิงค์สำเร็จ ${sync.data.durationMs}ms — เพจ ${sync.data.counts.pages} ลูกค้า ${sync.data.counts.customers} ออเดอร์ ${sync.data.counts.orders}` };
+  });
+
+  await run('backup-import-dedupe', 'Database', 'นำเข้า JSON กันข้อมูลซ้ำ (นำเข้าซ้ำ 2 รอบไม่เพิ่ม)', async () => {
+    const stamp = Date.now();
+    const testCustomers = [
+      { psid: PREFIX + 'imp_a', customer_name: 'ลูกค้านำเข้า A', phone_number: '0900000001' },
+      { psid: PREFIX + 'imp_b', customer_name: 'ลูกค้านำเข้า B', phone_number: '0900000002' }
+    ];
+    const payload = { data: { customers: testCustomers }, mode: 'merge' };
+    try {
+      // รอบที่ 1: นำเข้าใหม่
+      const r1 = await fetchJson(baseUrl, '/api/backup/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      if (r1.status !== 200 || !r1.data?.success) throw new Error(`import#1 HTTP ${r1.status}`);
+      const added1 = r1.data.result.customers?.added ?? -1;
+      if (added1 !== 2) throw new Error(`รอบ 1 ควรเพิ่ม 2 ได้ ${added1}`);
+      // รอบที่ 2: นำเข้าซ้ำเป๊ะ — ต้องเป็น update ทั้งหมด ไม่เพิ่ม
+      const r2 = await fetchJson(baseUrl, '/api/backup/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const added2 = r2.data.result.customers?.added ?? -1;
+      const updated2 = r2.data.result.customers?.updated ?? -1;
+      if (added2 !== 0 || updated2 !== 2) throw new Error(`รอบ 2 ควร 0 เพิ่ม/2 อัปเดต ได้ ${added2}/${updated2}`);
+      // DB ต้องมีแค่ 2 แถวพอดี (ไม่ซ้ำมั่ว)
+      const inDb = await dbService.executeRaw("SELECT COUNT(*) AS cnt FROM customers WHERE psid LIKE 'selftest_imp_%'");
+      if (Number(inDb[0]?.cnt) !== 2) throw new Error(`ใน DB มี ${inDb[0]?.cnt} แถว (ควร 2)`);
+      return { detail: 'นำเข้า 2 คน → นำเข้าซ้ำ = อัปเดตทับ (0 เพิ่ม) — ข้อมูลใน DB ไม่ซ้ำ' };
+    } finally {
+      await dbService.executeRaw("DELETE FROM customers WHERE psid LIKE 'selftest_imp_%'").catch(() => {});
+    }
+  });
+
   // ===================== F. BACKUP =====================
   await run('backup-create-list', 'สำรองข้อมูล', 'Backup: สร้าง/ดูรายการ', async () => {
     const create = await fetchJson(baseUrl, '/api/backup/create', { method: 'POST' }, 30000);
