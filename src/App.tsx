@@ -11,6 +11,7 @@ import { FollowUpEngineTab } from './components/FollowUpEngineTab';
 import { OrdersAndLineTab } from './components/OrdersAndLineTab';
 import { SystemDocsTab } from './components/SystemDocsTab';
 import { ChatInboxTab } from './components/ChatInboxTab';
+import { BroadcastTab } from './components/BroadcastTab';
 import { FacebookConnectModal } from './components/FacebookConnectModal';
 import { PageSettingsModal } from './components/PageSettingsModal';
 import { AiApiSettingsModal } from './components/AiApiSettingsModal';
@@ -752,6 +753,15 @@ export default function App() {
 
         {activeTab === 'chat_inbox' && (
           <ChatInboxTab
+            pages={pages}
+            selectedPageId={selectedPageId}
+            setSelectedPageId={setSelectedPageId}
+            theme={theme}
+          />
+        )}
+
+        {activeTab === 'broadcast' && (
+          <BroadcastTab
             pages={pages}
             selectedPageId={selectedPageId}
             setSelectedPageId={setSelectedPageId}

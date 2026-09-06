@@ -32,6 +32,8 @@ interface ConversationSummary {
   unread_count: number;
   starred: boolean;
   blocked: boolean;
+  bot_paused: boolean;
+  participant_pic?: string;
   source: string;
 }
 
@@ -157,7 +159,7 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
     }
   };
 
-  const updateConvoState = async (patch: { is_starred?: boolean; is_blocked?: boolean; mark_read?: boolean; mark_unread?: boolean }) => {
+  const updateConvoState = async (patch: { is_starred?: boolean; is_blocked?: boolean; bot_paused?: boolean; mark_read?: boolean; mark_unread?: boolean }) => {
     if (!selectedConvo) return;
     try {
       const res = await fetch('/api/inbox/state', {
@@ -171,13 +173,15 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
           ...c,
           starred: patch.is_starred !== undefined ? patch.is_starred : c.starred,
           blocked: patch.is_blocked !== undefined ? patch.is_blocked : c.blocked,
+          bot_paused: patch.bot_paused !== undefined ? patch.bot_paused : c.bot_paused,
           unread: patch.mark_unread ? true : (patch.mark_read ? false : c.unread),
           unread_count: patch.mark_read ? 0 : (patch.mark_unread ? Math.max(1, c.unread_count) : c.unread_count)
         } : c));
         setSelectedConvo(prev => prev ? {
           ...prev,
           starred: patch.is_starred !== undefined ? patch.is_starred : prev.starred,
-          blocked: patch.is_blocked !== undefined ? patch.is_blocked : prev.blocked
+          blocked: patch.is_blocked !== undefined ? patch.is_blocked : prev.blocked,
+          bot_paused: patch.bot_paused !== undefined ? patch.bot_paused : prev.bot_paused
         } : prev);
         if (patch.is_blocked) setFilter('ALL');
       }
@@ -421,8 +425,19 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
                   }`}
                 >
                   <div className="flex items-start gap-3">
-                    <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 relative ${dark ? 'bg-zinc-800 text-zinc-400' : 'bg-slate-200 text-slate-500'}`}>
+                    <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 relative overflow-hidden ${dark ? 'bg-zinc-800 text-zinc-400' : 'bg-slate-200 text-slate-500'}`}>
                       <User className="w-4 h-4" />
+                      <img
+                        src={`/api/inbox/avatar?page_id=${encodeURIComponent(selectedPageId)}&sender_id=${encodeURIComponent(convo.thread_id)}`}
+                        onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                        className="absolute inset-0 w-full h-full object-cover"
+                        alt=""
+                      />
+                      {convo.bot_paused && (
+                        <span className="absolute -bottom-0.5 -left-0.5 w-3.5 h-3.5 rounded-full bg-amber-500 border border-white dark:border-zinc-900 flex items-center justify-center" title="บอทหยุดไว้ — แอดมินตอบเอง">
+                          <Bot className="w-2 h-2 text-white" />
+                        </span>
+                      )}
                       {convo.unread && convo.unread_count > 0 && (
                         <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-indigo-600 text-white text-[9px] font-bold flex items-center justify-center">
                           {convo.unread_count > 99 ? '99+' : convo.unread_count}
@@ -460,8 +475,14 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
               <div className={`px-4 py-3 border-b ${dark ? 'border-zinc-800 bg-[#121216]' : 'border-slate-200 bg-slate-50'}`}>
                 <div className="flex items-center justify-between gap-3 flex-wrap">
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className={`w-9 h-9 rounded-full flex items-center justify-center ${dark ? 'bg-zinc-800 text-zinc-400' : 'bg-slate-200 text-slate-500'}`}>
+                    <div className={`w-9 h-9 rounded-full flex items-center justify-center relative overflow-hidden ${dark ? 'bg-zinc-800 text-zinc-400' : 'bg-slate-200 text-slate-500'}`}>
                       <User className="w-4 h-4" />
+                      <img
+                        src={`/api/inbox/avatar?page_id=${encodeURIComponent(selectedPageId)}&sender_id=${encodeURIComponent(selectedConvo.thread_id)}`}
+                        onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                        className="absolute inset-0 w-full h-full object-cover"
+                        alt=""
+                      />
                     </div>
                     <div className="min-w-0">
                       <h3 className="text-sm font-bold truncate flex items-center gap-1.5">
@@ -491,6 +512,13 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
                       <MailOpen className="w-4 h-4" />
                     </button>
                     <button
+                      onClick={() => updateConvoState({ bot_paused: !selectedConvo.bot_paused })}
+                      title={selectedConvo.bot_paused ? 'เปิดบอทกลับมาตอบอัตโนมัติ' : 'หยุดบอท — แอดมินจะตอบเอง (บอทไม่ตอบลูกค้าคนนี้)'}
+                      className={`p-2 rounded-lg transition-colors ${selectedConvo.bot_paused ? 'text-amber-400 bg-amber-500/10' : dark ? 'text-zinc-400 hover:bg-zinc-800' : 'text-slate-500 hover:bg-slate-100'}`}
+                    >
+                      <Bot className="w-4 h-4" />
+                    </button>
+                    <button
                       onClick={() => updateConvoState({ is_blocked: !selectedConvo.blocked })}
                       title={selectedConvo.blocked ? 'ปลดบล็อก — ให้ AI ตอบแชทได้' : 'บล็อก — AI จะไม่ตอบลูกค้าคนนี้'}
                       className={`p-2 rounded-lg transition-colors ${selectedConvo.blocked ? 'text-rose-400 bg-rose-500/10' : dark ? 'text-zinc-400 hover:bg-zinc-800' : 'text-slate-500 hover:bg-slate-100'}`}
@@ -502,6 +530,11 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
                 {selectedConvo.blocked && (
                   <p className={`text-[10px] mt-2 px-2 py-1.5 rounded-lg bg-rose-500/10 text-rose-500`}>
                     ลูกค้ารายนี้ถูกบล็อก — ระบบจะไม่ตอบแชทอัตโนมัติให้ (แอดมินยังส่งข้อความได้)
+                  </p>
+                )}
+                {selectedConvo.bot_paused && (
+                  <p className={`text-[10px] mt-2 px-2 py-1.5 rounded-lg bg-amber-500/10 text-amber-500`}>
+                    🤖⏸️ บอทหยุดตอบลูกค้ารายนี้ไว้ — เหมาะกับตอนที่แอดมินตัวจริงจะตอบเอง (กดปุ่มบอทด้านบนเพื่อเปิดกลับ)
                   </p>
                 )}
               </div>

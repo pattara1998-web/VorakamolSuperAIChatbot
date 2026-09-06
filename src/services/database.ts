@@ -303,9 +303,15 @@ async function initTables() {
       last_message_at TEXT DEFAULT '',
       last_message_text TEXT DEFAULT '',
       participant_name TEXT DEFAULT '',
+      participant_pic TEXT DEFAULT '',
+      bot_paused INTEGER DEFAULT 0,
       updated_at TEXT DEFAULT ${PG_NOW_DEFAULT},
       PRIMARY KEY (page_id, sender_id)
     );
+
+    -- Migrations for databases created before these fields existed
+    ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS participant_pic TEXT DEFAULT '';
+    ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS bot_paused INTEGER DEFAULT 0;
 
     CREATE INDEX IF NOT EXISTS idx_products_page ON products(page_id);
     CREATE INDEX IF NOT EXISTS idx_customers_page ON customers(page_id);
@@ -763,7 +769,59 @@ export interface ConversationStateRow {
   last_message_at: string;
   last_message_text: string;
   participant_name: string;
+  participant_pic: string;
+  bot_paused: number;
   updated_at: string;
+}
+
+export interface BroadcastTarget {
+  sender_id: string;
+  participant_name: string;
+  participant_pic: string;
+  is_starred: boolean;
+  last_message_at: string;
+  message_count: number;
+}
+
+/**
+ * Broadcast audience: every customer who ever messaged the page, excluding
+ * blocked conversations, with optional date-range and starred filters.
+ */
+export async function getBroadcastTargets(pageId: string, opts: { since?: string; until?: string; starred?: 'any' | 'only' | 'none' } = {}): Promise<BroadcastTarget[]> {
+  const rows = await q(
+    `SELECT ch.sender_id,
+            MAX(ch.created_at) AS last_message_at,
+            COUNT(*) AS message_count
+     FROM chat_history ch
+     WHERE ch.page_id = ?
+     GROUP BY ch.sender_id`,
+    [pageId]
+  );
+  const targetRows = rows.rows || [];
+  const states = await listConversationStates(pageId);
+  const stateMap = new Map(states.map(s => [s.sender_id, s]));
+
+  const targets: BroadcastTarget[] = [];
+  for (const row of targetRows) {
+    const st: any = stateMap.get(row.sender_id) || {};
+    if (Number(st.is_blocked) === 1) continue; // never broadcast to blocked
+    const starred = Number(st.is_starred) === 1;
+    if (opts.starred === 'only' && !starred) continue;
+    if (opts.starred === 'none' && starred) continue;
+    const lastAt = String(row.last_message_at || '');
+    if (opts.since && lastAt && lastAt < opts.since) continue;
+    if (opts.until && lastAt && lastAt > opts.until) continue;
+    targets.push({
+      sender_id: row.sender_id,
+      participant_name: st.participant_name || ('ลูกค้า ' + String(row.sender_id).slice(-4)),
+      participant_pic: st.participant_pic || '',
+      is_starred: starred,
+      last_message_at: lastAt,
+      message_count: Number(row.message_count) || 0
+    });
+  }
+  targets.sort((a, b) => (b.last_message_at || '').localeCompare(a.last_message_at || ''));
+  return targets;
 }
 
 export async function getConversationState(pageId: string, senderId: string): Promise<ConversationStateRow | undefined> {

@@ -1544,20 +1544,20 @@ async function startServer() {
     const page = db.pages.find(p => p.page_id === page_id);
     if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
 
-    // Local: aggregate chat_history per sender
+    // Local: aggregate EVERY customer via SQL GROUP BY (ไม่ตัดจำนวน — ครบทุกคน)
     const msgs = await dbService.executeRaw(
-      'SELECT sender_id, text, role, created_at FROM chat_history WHERE page_id = ? ORDER BY created_at DESC LIMIT 500',
+      `SELECT ch.sender_id,
+              (array_agg(ch.text ORDER BY ch.created_at DESC))[1] AS last_text,
+              (array_agg(ch.role ORDER BY ch.created_at DESC))[1] AS last_role,
+              MAX(ch.created_at) AS last_at
+       FROM chat_history ch
+       WHERE ch.page_id = ?
+       GROUP BY ch.sender_id`,
       [page_id]
     );
     const states = await dbService.listConversationStates(page_id);
     const stateMap = new Map(states.map((s: any) => [s.sender_id, s]));
-    const bySender = new Map<string, any>();
-    for (const m of msgs) {
-      if (!bySender.has(m.sender_id)) {
-        bySender.set(m.sender_id, { sender_id: m.sender_id, last_text: m.text, last_at: m.created_at, last_role: m.role });
-      }
-    }
-    const conversations: any[] = [...bySender.values()].map(c => {
+    const conversations: any[] = (msgs as any[]).map(c => {
       const st: any = stateMap.get(c.sender_id) || {};
       return {
         thread_id: c.sender_id,
@@ -1569,6 +1569,8 @@ async function startServer() {
         unread_count: Number(st.unread_count) || (st.is_unread ? 1 : 0),
         starred: Boolean(st.is_starred),
         blocked: Boolean(st.is_blocked),
+        bot_paused: Boolean(st.bot_paused),
+        participant_pic: st.participant_pic || '',
         source: 'local'
       };
     });
@@ -1584,7 +1586,24 @@ async function startServer() {
         clearTimeout(timer);
         const gd: any = await g.json();
         if (!gd.error) {
-          for (const convo of (gd.data || [])) {
+          // Follow pagination (up to 5 pages x 100 threads = 500 conversations)
+          let graphThreads: any[] = [...(gd.data || [])];
+          let nextUrl: string | null = gd.paging?.next || null;
+          let pagesFollowed = 0;
+          while (nextUrl && pagesFollowed < 4) {
+            try {
+              const nextController = new AbortController();
+              const nextTimer = setTimeout(() => nextController.abort(), 8000);
+              const nr: any = await fetch(nextUrl, { signal: nextController.signal });
+              clearTimeout(nextTimer);
+              const nd: any = await nr.json();
+              if (nd.error || !nd.data?.length) break;
+              graphThreads = graphThreads.concat(nd.data);
+              nextUrl = nd.paging?.next || null;
+              pagesFollowed++;
+            } catch { break; }
+          }
+          for (const convo of graphThreads) {
             const other = convo.participants?.data?.find((p: any) => p.id !== page_id);
             if (!other) continue;
             const graphPreview = convo.snippet || convo.messages?.data?.[0]?.message || '';
@@ -1608,6 +1627,8 @@ async function startServer() {
                 unread_count: Number(st.unread_count) || 0,
                 starred: Boolean(st.is_starred),
                 blocked: Boolean(st.is_blocked),
+                bot_paused: Boolean(st.bot_paused),
+                participant_pic: st.participant_pic || '',
                 source: 'graph'
               });
             }
@@ -1691,16 +1712,215 @@ async function startServer() {
 
   // Star / block / unread flags for one conversation
   app.post('/api/inbox/state', async (req: Request, res: Response) => {
-    const { page_id, sender_id, is_starred, is_blocked, mark_read, mark_unread } = req.body || {};
+    const { page_id, sender_id, is_starred, is_blocked, bot_paused, mark_read, mark_unread } = req.body || {};
     if (!page_id || !sender_id) return res.status(400).json({ success: false, message: 'ต้องระบุ page_id และ sender_id' });
     const patch: Record<string, any> = {};
     if (is_starred !== undefined) patch.is_starred = is_starred ? 1 : 0;
     if (is_blocked !== undefined) patch.is_blocked = is_blocked ? 1 : 0;
+    if (bot_paused !== undefined) patch.bot_paused = bot_paused ? 1 : 0;
     if (mark_read) { patch.is_unread = 0; patch.unread_count = 0; }
     if (mark_unread) patch.is_unread = 1;
     await dbService.updateConversationState(page_id, sender_id, patch);
     dbBridge.broadcastSSE('inbox_state_changed', { page_id, sender_id }, page_id);
     res.json({ success: true, page_id, sender_id, ...patch });
+  });
+
+  // Customer profile picture proxy: Facebook PSIDs have no public avatar URL,
+  // but the Graph API returns profile_pic for a page-scoped user. Results are
+  // cached in conversation_state so a page with 100+ chats does not hammer
+  // the Graph API on every inbox render.
+  app.get('/api/inbox/avatar', async (req: Request, res: Response) => {
+    const page_id = req.query.page_id as string;
+    const sender_id = req.query.sender_id as string;
+    if (!page_id || !sender_id) return res.status(400).json({ error: 'page_id and sender_id required' });
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ error: 'PAGE_NOT_FOUND' });
+
+    try {
+      const st = await dbService.getConversationState(page_id, sender_id);
+      if (st?.participant_pic) return res.redirect(302, st.participant_pic);
+
+      const rawToken = decryptToken(page.page_access_token || '');
+      if (!rawToken?.startsWith('EAA')) return res.status(404).json({ error: 'NO_PAGE_TOKEN' });
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 6000);
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(sender_id)}?fields=first_name,last_name,profile_pic&access_token=${encodeURIComponent(rawToken)}`;
+      const g: any = await fetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+      const gd: any = await g.json();
+      if (gd.error || !gd.profile_pic) return res.status(404).json({ error: 'NO_PROFILE' });
+
+      const name = [gd.first_name, gd.last_name].filter(Boolean).join(' ').trim();
+      await dbService.updateConversationState(page_id, sender_id, {
+        participant_pic: gd.profile_pic,
+        ...(name ? { participant_name: name } : {})
+      }).catch(() => {});
+      return res.redirect(302, gd.profile_pic);
+    } catch {
+      return res.status(404).json({ error: 'LOOKUP_FAILED' });
+    }
+  });
+
+  // ================================================================
+  // BROADCAST (ส่งข้อความหาลูกค้าเก่าแบบหมู่ พร้อม anti-ban pacing)
+  // ================================================================
+  interface BroadcastJob {
+    id: string;
+    page_id: string;
+    total: number;
+    sent: number;
+    failed: number;
+    skipped: number;
+    running: boolean;
+    stopped: boolean;
+    finished: boolean;
+    current?: string;
+    startedAt: string;
+    errors: Array<{ sender_id: string; error: string }>;
+  }
+  const broadcastJobs = new Map<string, BroadcastJob>();
+
+  // สแกนกลุ่มเป้าหมายก่อนส่งจริง: ลูกค้าที่เคยทัก + ตัวกรองวันที่/ติดดาว
+  app.post('/api/broadcast/scan', async (req: Request, res: Response) => {
+    const { page_id, since, until, starred } = req.body || {};
+    if (!page_id) return res.status(400).json({ success: false, message: 'ต้องระบุ page_id' });
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    const targets = await dbService.getBroadcastTargets(page_id, {
+      since: typeof since === 'string' && since ? since : undefined,
+      until: typeof until === 'string' && until ? until : undefined,
+      starred: starred === 'only' || starred === 'none' ? starred : 'any'
+    });
+    res.json({
+      success: true,
+      total: targets.length,
+      targets: targets.slice(0, 50).map(t => ({ sender_id: t.sender_id, name: t.participant_name, last_message_at: t.last_message_at, starred: t.is_starred })),
+      sample_names: targets.slice(0, 5).map(t => t.participant_name)
+    });
+  });
+
+  // อัปโหลดไฟล์แนบ (รูป/วิดีโอ/ไฟล์ทั่วไป) เข้า Facebook Attachment API ครั้งเดียว
+  // แล้วใช้ attachment_id ส่งซ้ำได้ทุกเป้าหมายโดยไม่ต้องอัปโหลดซ้ำ (คุณภาพเดิม)
+  app.post('/api/broadcast/upload', express.raw({ type: '*/*', limit: '550mb' }), async (req: Request, res: Response) => {
+    const page_id = req.query.page_id as string;
+    const filename = (req.query.filename as string) || 'attachment.bin';
+    const mime = (req.query.mime as string) || 'application/octet-stream';
+    if (!page_id) return res.status(400).json({ success: false, message: 'ต้องระบุ page_id' });
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    const rawToken = decryptToken(page.page_access_token || '');
+    if (!rawToken?.startsWith('EAA')) return res.status(400).json({ success: false, message: 'เพจนี้ยังไม่มี Page Access Token จริง' });
+    const buf = Buffer.from(req.body || []);
+    if (!buf.length) return res.status(400).json({ success: false, message: 'ไม่พบไฟล์ที่อัปโหลด' });
+
+    const lower = filename.toLowerCase();
+    const attachType = /\.(png|jpe?g|gif|webp)$/.test(lower) ? 'IMAGE' : /\.(mp4|mov|avi|mkv|webm)$/.test(lower) ? 'VIDEO' : /\.(mp3|wav|ogg|m4a|aac)$/.test(lower) ? 'AUDIO' : 'FILE';
+    try {
+      const form = new FormData();
+      form.append('message', JSON.stringify({ attachment: { type: attachType, payload: { is_reusable: true } } }));
+      form.append('filedata', new Blob([new Uint8Array(buf)], { type: mime }), filename);
+      const upRes: any = await fetch(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/message_attachments?access_token=${encodeURIComponent(rawToken)}`, {
+        method: 'POST',
+        body: form as any
+      });
+      const upData: any = await upRes.json();
+      if (upData.error) {
+        return res.status(502).json({ success: false, message: `อัปโหลดเข้า Facebook ไม่สำเร็จ: ${upData.error.message} (Facebook จำกัดไฟล์วิดีโอไม่เกิน 25MB — ไฟล์ใหญ่กว่านี้ต้องย่อก่อน)` });
+      }
+      res.json({ success: true, attachment_id: upData.attachment_id, attachment_type: attachType, size: buf.length });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: `อัปโหลดไม่สำเร็จ: ${err.message}` });
+    }
+  });
+
+  // เริ่ม broadcast: ส่งเรียงลำดับ มี delay + jitter + พักเป็นชุด (anti-ban)
+  app.post('/api/broadcast/start', async (req: Request, res: Response) => {
+    const { page_id, targets, text, attachment_id, attachment_type, tag, delay_ms, batch_size, batch_pause_ms } = req.body || {};
+    if (!page_id || !Array.isArray(targets) || targets.length === 0) {
+      return res.status(400).json({ success: false, message: 'ต้องระบุ page_id และ targets' });
+    }
+    if (!text && !attachment_id) {
+      return res.status(400).json({ success: false, message: 'ต้องมีข้อความหรือไฟล์แนบอย่างน้อย 1 อย่าง' });
+    }
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    const rawToken = decryptToken(page.page_access_token || '');
+    if (!rawToken?.startsWith('EAA')) return res.status(400).json({ success: false, message: 'เพจนี้ยังไม่มี Page Access Token จริง' });
+
+    const jobId = 'bc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    const job: BroadcastJob = {
+      id: jobId, page_id, total: targets.length, sent: 0, failed: 0, skipped: 0,
+      running: true, stopped: false, finished: false, startedAt: new Date().toISOString(), errors: []
+    };
+    broadcastJobs.set(jobId, job);
+    const baseDelay = Math.max(1500, Number(delay_ms) || 4000);
+    const batchSize = Math.max(1, Number(batch_size) || 50);
+    const batchPause = Math.max(5000, Number(batch_pause_ms) || 60000);
+    const payloadBase: Record<string, any> = text ? { text } : {};
+    const attachmentPayload = attachment_id ? { type: attachment_type || 'FILE', payload: { attachment_id } } : null;
+
+    addLog('INFO', 'BROADCAST', page_id, `📣 เริ่ม Broadcast ไป ${targets.length} ลูกค้า (delay ${baseDelay}ms)`, 'SUCCESS');
+    res.json({ success: true, job_id: jobId, total: targets.length });
+
+    // Run asynchronously — the client polls /api/broadcast/status
+    (async () => {
+      for (let i = 0; i < targets.length; i++) {
+        if (job.stopped) break;
+        const target = targets[i];
+        job.current = target.sender_id;
+        try {
+          const messagePayload: Record<string, any> = attachmentPayload
+            ? { attachment: attachmentPayload }
+            : { text: payloadBase.text };
+          if (tag) messagePayload.tag = tag;
+          const sendRes: any = await fetch(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ recipient: { id: target.sender_id }, message: messagePayload })
+          });
+          const sendData: any = await sendRes.json();
+          if (sendData.error) {
+            job.failed++;
+            job.errors.push({ sender_id: target.sender_id, error: String(sendData.error.message || '').slice(0, 160) });
+          } else {
+            job.sent++;
+            // บันทึกลงประวัติ + preview ใน Inbox
+            try {
+              const preview = text ? String(text).slice(0, 200) : `[${attachmentPayload?.type || 'FILE'}]`;
+              await dbService.addChatMessage(page_id, target.sender_id, 'admin', text || `[${attachmentPayload?.type || 'FILE'}]`);
+              await dbService.recordOutgoingMessage(page_id, target.sender_id, preview);
+            } catch { /* non-critical */ }
+          }
+        } catch (err: any) {
+          job.failed++;
+          job.errors.push({ sender_id: target.sender_id, error: String(err?.message || err).slice(0, 160) });
+        }
+        // Anti-ban pacing: jitter + พักยาวทุกชุด
+        if (i < targets.length - 1) {
+          const jitter = baseDelay * (0.75 + Math.random() * 0.5);
+          const isBatchEnd = (i + 1) % batchSize === 0;
+          const wait = isBatchEnd ? jitter + batchPause : jitter;
+          await new Promise(r => setTimeout(r, wait));
+        }
+      }
+      job.running = false;
+      job.finished = true;
+      addLog('INFO', 'BROADCAST', page_id, `📣 Broadcast เสร็จ: ส่งสำเร็จ ${job.sent} / พลาด ${job.failed}${job.stopped ? ' (หยุดก่อนเวลา)' : ''}`, job.failed > 0 ? 'WARNING' : 'SUCCESS');
+    })();
+  });
+
+  app.get('/api/broadcast/status', (req: Request, res: Response) => {
+    const job = broadcastJobs.get(req.query.job_id as string);
+    if (!job) return res.status(404).json({ success: false, message: 'ไม่พบ job' });
+    res.json({ success: true, job: { ...job, errors: job.errors.slice(-20) } });
+  });
+
+  app.post('/api/broadcast/stop', (req: Request, res: Response) => {
+    const job = broadcastJobs.get((req.body || {}).job_id);
+    if (!job) return res.status(404).json({ success: false, message: 'ไม่พบ job' });
+    job.stopped = true;
+    res.json({ success: true, message: 'สั่งหยุดแล้ว — จะหยุดหลังข้อความปัจจุบันเสร็จ' });
   });
 
   // ================================================================
@@ -2940,9 +3160,14 @@ async function startServer() {
       }
 
       // Blocked customer: never auto-reply (admin blocked them in the Inbox)
+      // Bot-paused conversation: admin is handling this customer personally
       const blockedState = await dbService.getConversationState(pageId, senderId).catch(() => null);
       if (blockedState?.is_blocked) {
         addLog('INFO', senderId, pageId, `🚫 ข้ามข้อความจาก ${senderId} (ลูกค้าถูกบล็อกไว้ใน Inbox)`, 'INFO');
+        return;
+      }
+      if (Number(blockedState?.bot_paused) === 1) {
+        addLog('INFO', senderId, pageId, `🤖⏸️ ข้ามข้อความจาก ${senderId} (แอดมินหยุดบอทไว้ — จะตอบเอง)`, 'INFO');
         return;
       }
 

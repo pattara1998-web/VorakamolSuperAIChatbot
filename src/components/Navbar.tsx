@@ -3,6 +3,7 @@ import { useState, useRef, useEffect } from 'react';
 import { AlertCircle } from 'lucide-react';
 import {
   FlaskConical,
+  Megaphone,
   Bot,
   Facebook,
   CheckCircle2,
@@ -103,6 +104,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   const navItems: Array<{id: string, label: string, icon: any, badge?: string, count?: number, iconColor?: string}> = [
     { id: 'pages_hub', label: 'ศูนย์รวมเพจ (Pages Hub)', icon: Layers, iconColor: 'text-blue-500' },
     { id: 'chat_inbox', label: 'แชท Inbox 💬', icon: Inbox, iconColor: 'text-cyan-500' },
+    { id: 'broadcast', label: 'Broadcast ลูกค้า 📣', icon: Megaphone, iconColor: 'text-orange-500' },
     { id: 'dashboard', label: 'แดชบอร์ด & ยอดขาย', icon: LayoutDashboard, badge: 'PRO', iconColor: 'text-indigo-500' },
     ...(isFacebookConnected ? [] : [{ id: 'simulator', label: 'จำลองแชท AI ปิดการขาย', icon: MessageSquare, badge: 'TEST', iconColor: 'text-emerald-500' } as any]),
     { id: 'orders', label: 'ออเดอร์ & ขนส่ง (COD)', icon: ShoppingBag, count: totalOrders, iconColor: 'text-amber-500' },
@@ -112,6 +114,32 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'database', label: 'แก้ไขฐานข้อมูล (Database)', icon: Database, iconColor: 'text-teal-500' },
     { id: 'system_docs', label: 'คู่มือระบบเชิงลึก & แก้ไข AI', icon: BookOpen, badge: 'DEV', iconColor: 'text-violet-500' }
   ];
+
+  // ── จัดเรียงเมนูเองได้: ลำดับถูกเก็บใน localStorage ──
+  const MENU_ORDER_KEY = 'superai_menu_order';
+  const [menuOrder, setMenuOrder] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem(MENU_ORDER_KEY) || '[]'); } catch { return []; }
+  });
+  const [isMenuManagerOpen, setIsMenuManagerOpen] = useState(false);
+  const applyMenuOrder = (ids: string[]) => {
+    setMenuOrder(ids);
+    try { localStorage.setItem(MENU_ORDER_KEY, JSON.stringify(ids)); } catch { /* private mode */ }
+  };
+  const orderedNavItems = React.useMemo(() => {
+    const rank = (id: string) => {
+      const i = menuOrder.indexOf(id);
+      return i === -1 ? menuOrder.length + navItems.findIndex(t => t.id === id) : i;
+    };
+    return [...navItems].sort((a, b) => rank(a.id) - rank(b.id));
+  }, [navItems, menuOrder]);
+  const moveMenuItem = (id: string, dir: -1 | 1) => {
+    const ids = orderedNavItems.map(t => t.id);
+    const i = ids.indexOf(id);
+    const j = i + dir;
+    if (j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    applyMenuOrder(ids);
+  };
 
   const tabsContainerRef = useRef<HTMLDivElement>(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
@@ -171,6 +199,14 @@ export const Navbar: React.FC<NavbarProps> = ({
           </span>
         </div>
         <div className="flex items-center gap-2 md:gap-4 shrink-0">
+          <button
+            onClick={() => setIsMenuManagerOpen(true)}
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md font-semibold transition-colors cursor-pointer text-xs whitespace-nowrap bg-slate-500/10 hover:bg-slate-500/20 text-slate-600 dark:text-zinc-300 border border-slate-500/20"
+            title="จัดเรียงเมนู — เลื่อนเมนูไหนขึ้นก่อน/ลงหลังได้"
+          >
+            <SlidersHorizontal className="w-3 h-3 shrink-0" />
+            <span className="hidden xl:inline">เมนู</span>
+          </button>
           <button
             onClick={onOpenSelfTest}
             className="flex items-center gap-1.5 px-2 py-0.5 rounded-md font-semibold transition-colors cursor-pointer text-xs whitespace-nowrap bg-violet-500/10 hover:bg-violet-500/20 text-violet-600 dark:text-violet-400 border border-violet-500/20"
@@ -324,7 +360,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             onWheel={handleTabsWheel}
             className="flex space-x-1.5 overflow-x-auto pb-1.5 pt-0.5 horizontal-tabs-scrollbar scroll-smooth w-full px-1"
           >
-            {navItems.map(item => {
+            {orderedNavItems.map(item => {
               const Icon = item.icon;
               const isActive = activeTab === item.id;
               return (
@@ -381,6 +417,62 @@ export const Navbar: React.FC<NavbarProps> = ({
           )}
         </div>
       </div>
-    </header>
+    
+      {/* ── Menu Manager Modal (จัดเรียงเมนู) ── */}
+      {isMenuManagerOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4" onClick={() => setIsMenuManagerOpen(false)}>
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+          <div
+            onClick={e => e.stopPropagation()}
+            className={`relative rounded-2xl border w-full max-w-md shadow-2xl overflow-hidden ${theme === 'dark' ? 'bg-[#121216] border-zinc-800 text-zinc-100' : 'bg-white border-slate-200 text-slate-900'}`}
+          >
+            <div className={`px-4 py-3 border-b flex items-center justify-between ${theme === 'dark' ? 'border-zinc-800' : 'border-slate-200'}`}>
+              <div>
+                <h3 className="text-sm font-bold flex items-center gap-2"><SlidersHorizontal className="w-4 h-4 text-indigo-400" /> จัดเรียงเมนู</h3>
+                <p className="text-[10px] text-slate-500 dark:text-zinc-400">เลื่อนเมนูขึ้น-ลงได้ตามใจ ตั้งค่าอัตโนมัติทันที</p>
+              </div>
+              <button onClick={() => setIsMenuManagerOpen(false)} className="text-xs text-slate-400 hover:text-slate-600">✕</button>
+            </div>
+            <div className="p-3 space-y-1.5 max-h-[60vh] overflow-y-auto">
+              {orderedNavItems.map((item, idx) => {
+                const Icon = item.icon;
+                return (
+                  <div key={item.id} className={`flex items-center gap-2 px-3 py-2 rounded-lg border ${theme === 'dark' ? 'bg-[#16161C] border-zinc-800' : 'bg-slate-50 border-slate-200'}`}>
+                    <Icon className={`w-4 h-4 shrink-0 ${item.iconColor || 'text-slate-400'}`} />
+                    <span className="flex-1 text-xs font-medium truncate">{item.label}</span>
+                    <button
+                      onClick={() => moveMenuItem(item.id, -1)}
+                      disabled={idx === 0}
+                      className={`px-2 py-1 rounded text-[11px] font-bold disabled:opacity-30 ${theme === 'dark' ? 'bg-zinc-800 hover:bg-zinc-700' : 'bg-white border border-slate-200 hover:bg-slate-100'}`}
+                      title="เลื่อนขึ้น"
+                    >▲</button>
+                    <button
+                      onClick={() => moveMenuItem(item.id, 1)}
+                      disabled={idx === orderedNavItems.length - 1}
+                      className={`px-2 py-1 rounded text-[11px] font-bold disabled:opacity-30 ${theme === 'dark' ? 'bg-zinc-800 hover:bg-zinc-700' : 'bg-white border border-slate-200 hover:bg-slate-100'}`}
+                      title="เลื่อนลง"
+                    >▼</button>
+                  </div>
+                );
+              })}
+            </div>
+            <div className={`px-4 py-3 border-t flex items-center justify-between ${theme === 'dark' ? 'border-zinc-800' : 'border-slate-200'}`}>
+              <button
+                onClick={() => applyMenuOrder([])}
+                className="text-[11px] font-bold text-slate-500 hover:text-slate-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+              >
+                รีเซ็ตเรียงใหม่ตามค่าเริ่มต้น
+              </button>
+              <button
+                onClick={() => setIsMenuManagerOpen(false)}
+                className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold"
+              >
+                เสร็จแล้ว
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+</header>
   );
 };

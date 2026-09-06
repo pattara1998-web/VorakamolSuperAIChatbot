@@ -546,6 +546,70 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     }
   });
 
+  // ===================== E3. BOT PAUSE & BROADCAST =====================
+  await run('bot-pause-per-customer', 'Meta Inbox', 'หยุดบอทต่อลูกค้า — webhook ไม่ตอบ', async () => {
+    const pageId = addTestPage();
+    const sender = PREFIX + 'paused_' + Date.now();
+    try {
+      // หยุดบอทลูกค้ารายนี้
+      const st = await fetchJson(baseUrl, '/api/inbox/state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, sender_id: sender, bot_paused: true }) });
+      if (st.status !== 200 || !st.data?.success) throw new Error(`state HTTP ${st.status}`);
+      // ลูกค้าทักเข้ามา — บอทต้องไม่ตอบ (มี log ข้าม ไม่มี AI_REPLY)
+      const hook = webhookRequest({ id: pageId, messaging: [{ sender: { id: sender }, message: { mid: PREFIX + 'pz_' + Date.now(), text: 'สนใจค่ะ' } }] });
+      const r = await fetchJson(baseUrl, '/api/webhook/facebook', hook);
+      if (r.status !== 200) throw new Error(`webhook HTTP ${r.status}`);
+      await new Promise(rr => setTimeout(rr, 3000));
+      const logs = (await fetchJson(baseUrl, '/api/data')).data.logs;
+      const aiLog = logs.find((l: any) => l.sender_id === sender && l.type === 'AI_REPLY');
+      if (aiLog) throw new Error('บอทยังตอบลูกค้าที่หยุดบอทไว้!');
+      const skipLog = logs.find((l: any) => l.sender_id === sender && String(l.content).includes('หยุดบอท'));
+      if (!skipLog) throw new Error('ไม่พบ log การข้ามข้อความ');
+      return { detail: 'หยุดบอท → ลูกค้าทัก → ระบบข้าม (ไม่ตอบอัตโนมัติ) สำเร็จ' };
+    } finally {
+      removeTestPage(pageId);
+      await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [sender]).catch(() => {});
+    }
+  });
+
+  await run('broadcast-scan', 'Broadcast', 'สแกนกลุ่มเป้าหมาย + กรองติดดาว/วันที่', async () => {
+    const pageId = addTestPage();
+    const starSender = PREFIX + 'bc_star';
+    const normalSender = PREFIX + 'bc_norm';
+    try {
+      // สร้าง 2 ลูกค้า: คนหนึ่งติดดาว
+      await dbService.addChatMessage(pageId, starSender, 'customer', 'สวัสดีค่ะ');
+      await dbService.updateConversationState(pageId, starSender, { is_starred: 1 });
+      await dbService.addChatMessage(pageId, normalSender, 'customer', 'สอบถามค่ะ');
+      const scanAll = await fetchJson(baseUrl, '/api/broadcast/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId }) });
+      if (scanAll.status !== 200 || !scanAll.data?.success) throw new Error(`scan HTTP ${scanAll.status}`);
+      if (scanAll.data.total < 2) throw new Error(`เจอแค่ ${scanAll.data.total} คน (ควร >= 2)`);
+      const scanStar = await fetchJson(baseUrl, '/api/broadcast/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId, starred: 'only' }) });
+      const ids = (scanStar.data.targets || []).map((t: any) => t.sender_id);
+      if (scanStar.data.total !== 1 || !ids.includes(starSender)) throw new Error(`กรองติดดาวไม่แม่น: ${scanStar.data.total}`);
+      return { detail: `สแกนได้ ${scanAll.data.total} คน → กรองติดดาวเหลือ ${scanStar.data.total} คน ถูกต้อง` };
+    } finally {
+      removeTestPage(pageId);
+      for (const s of [starSender, normalSender]) {
+        await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [s]).catch(() => {});
+        await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [s]).catch(() => {});
+      }
+    }
+  });
+
+  await run('inbox-avatar-endpoint', 'Meta Inbox', 'รูปโปรไฟล์ลูกค้า (proxy ไม่พังแม้ไม่มีรูป)', async () => {
+    const pageId = addTestPage();
+    try {
+      // เพจทดสอบไม่มี token จริง → endpoint ต้องตอบ 404 อย่างสุภาพ (ไม่ crash)
+      const r = await fetchJson(baseUrl, `/api/inbox/avatar?page_id=${pageId}&sender_id=${PREFIX}av`);
+      if (r.status !== 404) throw new Error(`คาด 404 ได้ ${r.status}`);
+      return { detail: 'endpoint ตอบ 404 เมื่อไม่มีรูป — หน้าเว็บ fallback เป็นไอคอน' };
+    } finally {
+      removeTestPage(pageId);
+    }
+  });
+
   // ===================== F. BACKUP =====================
   await run('backup-create-list', 'สำรองข้อมูล', 'Backup: สร้าง/ดูรายการ', async () => {
     const create = await fetchJson(baseUrl, '/api/backup/create', { method: 'POST' }, 30000);
