@@ -90,6 +90,26 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     }
   };
 
+  // ---------- purge: ล้างเศษการทดสอบทุกตาราง ทั้ง memory และ PostgreSQL ----------
+  // ทำงานตอนเริ่มและจบชุดทดสอบ — กันเศษจากรอบก่อนที่ assertion พังก่อน cleanup
+  // (เช่น selftest_mem_order ที่เคยค้างใน production) รอดไปโผล่ในหน้าจริง
+  const purgeTestLeftovers = async () => {
+    db.orders = db.orders.filter(o => !String(o.order_id || '').startsWith(PREFIX));
+    db.customers = db.customers.filter(c => !String(c.psid || '').startsWith(PREFIX));
+    db.pages = db.pages.filter(p => !p.page_id.startsWith(PREFIX));
+    await dbService.executeRaw("DELETE FROM orders WHERE order_id LIKE 'selftest_%'").catch(() => {});
+    await dbService.executeRaw("DELETE FROM customers WHERE psid LIKE 'selftest_%'").catch(() => {});
+    await dbService.executeRaw("DELETE FROM pages WHERE page_id LIKE 'selftest_%'").catch(() => {});
+    await dbService.executeRaw("DELETE FROM chat_history WHERE sender_id LIKE 'selftest_%' OR page_id LIKE 'selftest_%'").catch(() => {});
+    await dbService.executeRaw("DELETE FROM conversation_state WHERE sender_id LIKE 'selftest_%' OR page_id LIKE 'selftest_%'").catch(() => {});
+    await dbService.executeRaw("DELETE FROM activity_logs WHERE sender_id LIKE 'selftest_%' OR page_id LIKE 'selftest_%'").catch(() => {});
+    await dbService.executeRaw("DELETE FROM custom_buttons WHERE page_id LIKE 'selftest_%'").catch(() => {});
+    await dbService.executeRaw("DELETE FROM order_dispatch_counter WHERE page_id LIKE 'selftest_%'").catch(() => {});
+    await dbService.executeRaw("DELETE FROM dispatched_messages WHERE page_id LIKE 'selftest_%'").catch(() => {});
+    persistData(); // เขียน memory ที่สะอาดแล้วทับ — กัน persistData รอบหลังฟื้นเศษกลับมา
+  };
+  await purgeTestLeftovers();
+
   // ---------- helper: temporary selftest page in memory + DB ----------
   const addTestPage = () => {
     const pageId = `${PREFIX}page`;
@@ -249,29 +269,35 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
   await run('db-customer-crud', 'ฐานข้อมูล', 'Customers: สร้าง/อ่าน/ยอดซื้อรวม/ลบ', async () => {
     const psid = `${PREFIX}cus`;
     const orderId = `${PREFIX}cus_order`;
-    await dbService.upsertCustomer({ psid, customer_name: 'ลูกค้าทดสอบ' });
-    const row = await dbService.getCustomer(psid);
-    if (!row) throw new Error('สร้างแล้วอ่านไม่เจอ');
-    // ยอดซื้อรวมนับจากออเดอร์ที่ยังไม่ยกเลิก (ไม่ใช่คอลัมน์ customers.total_spent)
-    await dbService.upsertOrder({ order_id: orderId, psid, total_amount: 500, quantity: 1, payment_status: 'PENDING' });
-    const spent = await dbService.getCustomerTotalSpent(psid);
-    if (Number(spent) !== 500) throw new Error(`ยอดรวมไม่ตรง: ${spent}`);
-    await dbService.executeRaw('DELETE FROM orders WHERE order_id = ?', [orderId]);
-    await dbService.executeRaw('DELETE FROM customers WHERE psid = ?', [psid]);
-    return { detail: 'upsert → read → ยอดซื้อจากออเดอร์ → cleanup สำเร็จ' };
+    try {
+      await dbService.upsertCustomer({ psid, customer_name: 'ลูกค้าทดสอบ' });
+      const row = await dbService.getCustomer(psid);
+      if (!row) throw new Error('สร้างแล้วอ่านไม่เจอ');
+      // ยอดซื้อรวมนับจากออเดอร์ที่ยังไม่ยกเลิก (ไม่ใช่คอลัมน์ customers.total_spent)
+      await dbService.upsertOrder({ order_id: orderId, psid, total_amount: 500, quantity: 1, payment_status: 'PENDING' });
+      const spent = await dbService.getCustomerTotalSpent(psid);
+      if (Number(spent) !== 500) throw new Error(`ยอดรวมไม่ตรง: ${spent}`);
+      return { detail: 'upsert → read → ยอดซื้อจากออเดอร์ → cleanup สำเร็จ' };
+    } finally {
+      await dbService.executeRaw('DELETE FROM orders WHERE order_id = ?', [orderId]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM customers WHERE psid = ?', [psid]).catch(() => {});
+    }
   });
 
   await run('db-order-crud', 'ฐานข้อมูล', 'Orders: สร้าง/ยกเลิก/นับ', async () => {
     const orderId = `${PREFIX}order`;
-    await dbService.upsertOrder({ order_id: orderId, psid: `${PREFIX}cus2`, total_amount: 990, quantity: 1, payment_status: 'PENDING' });
-    let count = await dbService.getCustomerOrderCount(`${PREFIX}cus2`);
-    if (count !== 1) throw new Error(`นับออเดอร์ได้ ${count}`);
-    await dbService.cancelOrder(orderId);
-    count = await dbService.getCustomerOrderCount(`${PREFIX}cus2`);
-    if (count !== 0) throw new Error(`หลังยกเลิกนับได้ ${count}`);
-    await dbService.executeRaw('DELETE FROM orders WHERE order_id = ?', [orderId]);
-    await dbService.executeRaw('DELETE FROM customers WHERE psid = ?', [`${PREFIX}cus2`]);
-    return { detail: 'upsert → count → cancel → count สำเร็จ' };
+    try {
+      await dbService.upsertOrder({ order_id: orderId, psid: `${PREFIX}cus2`, total_amount: 990, quantity: 1, payment_status: 'PENDING' });
+      let count = await dbService.getCustomerOrderCount(`${PREFIX}cus2`);
+      if (count !== 1) throw new Error(`นับออเดอร์ได้ ${count}`);
+      await dbService.cancelOrder(orderId);
+      count = await dbService.getCustomerOrderCount(`${PREFIX}cus2`);
+      if (count !== 0) throw new Error(`หลังยกเลิกนับได้ ${count}`);
+      return { detail: 'upsert → count → cancel → count สำเร็จ' };
+    } finally {
+      await dbService.executeRaw('DELETE FROM orders WHERE order_id = ?', [orderId]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM customers WHERE psid = ?', [`${PREFIX}cus2`]).catch(() => {});
+    }
   });
 
   await run('db-chat-history', 'ฐานข้อมูล', 'Chat history: บันทึก/อ่านย้อนหลัง', async () => {
@@ -357,15 +383,18 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
   await run('api-customer-memory', 'API Endpoints', 'GET /api/customer/memory', async () => {
     const psid = `${PREFIX}mem`;
     const orderId = `${PREFIX}mem_order`;
-    await dbService.upsertCustomer({ psid, customer_name: 'คนจำ' });
-    await dbService.upsertOrder({ order_id: orderId, psid, total_amount: 300, quantity: 1, payment_status: 'PENDING' });
-    const { status, data } = await fetchJson(baseUrl, `/api/customer/memory?psid=${psid}`);
-    if (status !== 200 || !data?.success) throw new Error(`HTTP ${status}`);
-    if (data.order_count !== 1) throw new Error(`order_count=${data.order_count}`);
-    if (data.star_rating !== 2) throw new Error(`star_rating=${data.star_rating}`);
-    await dbService.executeRaw('DELETE FROM orders WHERE order_id = ?', [orderId]);
-    await dbService.executeRaw('DELETE FROM customers WHERE psid = ?', [psid]);
-    return { detail: 'ดึงความจำลูกค้า + order_count + star rating สำเร็จ' };
+    try {
+      await dbService.upsertCustomer({ psid, customer_name: 'คนจำ' });
+      await dbService.upsertOrder({ order_id: orderId, psid, total_amount: 300, quantity: 1, payment_status: 'PENDING' });
+      const { status, data } = await fetchJson(baseUrl, `/api/customer/memory?psid=${psid}`);
+      if (status !== 200 || !data?.success) throw new Error(`HTTP ${status}`);
+      if (data.order_count !== 1) throw new Error(`order_count=${data.order_count}`);
+      if (data.star_rating !== 2) throw new Error(`star_rating=${data.star_rating}`);
+      return { detail: 'ดึงความจำลูกค้า + order_count + star rating สำเร็จ' };
+    } finally {
+      await dbService.executeRaw('DELETE FROM orders WHERE order_id = ?', [orderId]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM customers WHERE psid = ?', [psid]).catch(() => {});
+    }
   });
 
   await run('api-dispatch-status', 'API Endpoints', 'GET /api/orders/dispatch-status', async () => {
@@ -687,11 +716,7 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
 
   // ---------- cleanup any leftovers, then build the report ----------
   try {
-    await dbService.deletePage(`${PREFIX}page`);
-    await dbService.executeRaw("DELETE FROM custom_buttons WHERE page_id LIKE 'selftest_%'");
-    await dbService.executeRaw("DELETE FROM order_dispatch_counter WHERE page_id LIKE 'selftest_%'");
-    db.pages = db.pages.filter(p => !p.page_id.startsWith(PREFIX));
-    persistData();
+    await purgeTestLeftovers(); // ล้างซ้ำรอบสุดท้าย — รับประกันข้อมูลจริงไม่มีเศษทดสอบ
   } catch { /* best effort */ }
 
   const finishedAt = new Date();
