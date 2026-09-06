@@ -47,6 +47,7 @@ interface LiveSimulatorTabProps {
     amulet: AnyProduct[];
     china: AnyProduct[];
     otop: AnyProduct[];
+    agriculture?: AnyProduct[];
   };
   onOrderCreated: (order: any) => void;
   theme?: 'dark' | 'light';
@@ -125,10 +126,10 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
   // When page changes, reset initial message with that page's opening
   useEffect(() => {
     if (selectedPage) {
-      const initialMessages = [
+      const initialMessages: MessageItem[] = [
         {
           id: `msg-init-${Date.now()}`,
-          sender: 'bot',
+          sender: 'bot' as const,
           text: selectedPage.sequence?.step1_opening_text || `${selectedPage.admin_name || 'น้ำหวาน'}: สวัสดีค่ะ ยินดีต้อนรับ สนใจสินค้าตัวไหนสอบถามได้เลยนะคะ 🙏`,
           timestamp: new Date().toLocaleTimeString('th-TH')
         }
@@ -138,7 +139,7 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
       if (!isApiConfigured) {
         initialMessages.push({
           id: `msg-api-warning-${Date.now()}`,
-          sender: 'bot',
+          sender: 'bot' as const,
           text: '⚠️ ระบบยังไม่ได้ตั้งค่า AI API กรุณาไปที่ "ตั้งค่า AI API" ในเมนูด้านบนเพื่อใส่ API Key ก่อนนะคะ',
           timestamp: new Date().toLocaleTimeString('th-TH')
         });

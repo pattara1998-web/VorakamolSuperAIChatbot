@@ -8,3 +8,4 @@ coverage/
 !.env.example
 # Runtime data snapshot (created by server.ts persistence layer)
 data/
+.qwen/

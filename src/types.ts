@@ -532,16 +532,20 @@ export interface Order {
   items: string; // product_id or description
   quantity?: number;
   total_amount: number;
-  payment_status: 'PENDING' | 'PAID' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED';
+  payment_status: 'PENDING' | 'PAID' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED' | 'COD';
   created_at: string;
   tracking_number: string;
   page_id?: string;
   category?: ProductCategory | string;
   notes?: string;
+  dispatch_number?: number; // ลำดับที่ตอนส่งไป LINE/Telegram
+  is_cancelled?: boolean;
+  cancelled_at?: string;
 }
 
 export interface Customer {
   psid: string;
+  customer_id?: string; // alias ของ psid (ใช้ในตัวจัดการฐานข้อมูล)
   customer_name: string;
   phone_number: string;
   address: string;
@@ -568,7 +572,7 @@ export interface Customer {
 export interface ActivityLog {
   id: string;
   timestamp: string;
-  type: 'MESSAGE' | 'COMMENT' | 'ORDER' | 'LINE_ALERT' | 'FOLLOW_UP' | 'AI_REPLY' | 'COMMENT_HIDDEN' | 'INFO' | 'SYSTEM';
+  type: 'MESSAGE' | 'COMMENT' | 'ORDER' | 'LINE_ALERT' | 'FOLLOW_UP' | 'AI_REPLY' | 'COMMENT_HIDDEN' | 'INFO' | 'SYSTEM' | 'ERROR';
   sender_id: string;
   page_id: string;
   content: string;

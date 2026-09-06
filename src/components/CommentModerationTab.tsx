@@ -45,7 +45,7 @@ export const CommentModerationTab: React.FC<CommentModerationTabProps> = ({
   pages,
   selectedPageId
 }) => {
-  const selectedPage = pages.find(p => p.page_id === selectedPageId) || pages[0] || {
+  const selectedPage: PageConfig = pages.find(p => p.page_id === selectedPageId) || pages[0] || ({
     page_id: '',
     page_name: 'ยังไม่ได้เลือกเพจ',
     category: 'CHINA',
@@ -53,7 +53,7 @@ export const CommentModerationTab: React.FC<CommentModerationTabProps> = ({
     auto_reply: true,
     auto_close_ai: true,
     notification_channel: 'BOTH'
-  };
+  } as PageConfig);
 
   const defaultReplyImages = selectedPage.comment_reply_images?.length
     ? selectedPage.comment_reply_images

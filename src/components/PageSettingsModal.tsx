@@ -38,6 +38,7 @@ import { PageConfig, PromotionTier, ProductCategory, ProductDetailedSpecs, Custo
 import { parseTextToSpecs } from '../utils/aiSpecParser';
 import { chatWithLocalAi, isLocalAiModel } from '../utils/localAi';
 import { getStoredLocalAiModel } from './AiApiSettingsModal';
+import { CustomButtonsManager } from './CustomButtonsManager';
 
 interface PageSettingsModalProps {
   isOpen: boolean;
@@ -55,8 +56,12 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
   const originalPageIdRef = React.useRef(page?.page_id);
 
   const [activeSubTab, setActiveSubTab] = useState<
-    'ai_persona' | 'sales_sequence' | 'comments' | 'followup' | 'detailed_specs' | 'product_promos' | 'cod_summary' | 'notifications' | 'facebook' | 'bot_settings'
+    'ai_persona' | 'sales_sequence' | 'comments' | 'followup' | 'detailed_specs' | 'product_promos' | 'cod_summary' | 'notifications' | 'facebook' | 'bot_settings' | 'chat_buttons'
   >('ai_persona');
+
+  // Detect current theme from <html> class (App.tsx syncs it with the theme state)
+  const currentTheme: 'dark' | 'light' =
+    typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? 'dark' : 'light';
 
   // AI Auto-Key State
   const [aiAutoText, setAiAutoText] = useState('');
@@ -362,7 +367,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
   };
 
   // Image Upload helper
-  const handleImageFileUpload = (e: React.ChangeEvent<HTMLInputElement>, onComplete: (dataUrl: string) => void) => {
+  const handleImageFileUpload = (e: React.ChangeEvent<any>, onComplete: (dataUrl: string) => void) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -765,7 +770,8 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
             { id: 'cod_summary', label: '7. ระบบสรุปยอดลูกค้า (COD)', icon: Copy },
             { id: 'notifications', label: '8. ส่งสรุปไป Telegram / LINE', icon: Bell },
             { id: 'facebook', label: '9. เชื่อมต่อ Facebook API 🔌', icon: Facebook },
-            { id: 'bot_settings', label: '10. ตั้งค่าบอท ⚙️', icon: Settings }
+            { id: 'bot_settings', label: '10. ตั้งค่าบอท ⚙️', icon: Settings },
+            { id: 'chat_buttons', label: '11. ปุ่มแชทลูกค้า 💬', icon: MessageSquare }
           ].map(tab => {
             const Icon = tab.icon;
             const isActive = activeSubTab === tab.id;
@@ -2164,7 +2170,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                             cod_summary_fields: {
                               ...prev.cod_summary_fields,
                               [f.key]: e.target.checked
-                            }
+                            } as PageConfig['cod_summary_fields']
                           }))
                         }
                         className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
@@ -2673,6 +2679,23 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                     ⚠️ คำเตือน: การเปิดใช้งานนี้จะส่งข้อความ Sales Sequence ทั้งหมด (6 ขั้นตอน) ติดต่อกัน อาจทำให้ลูกค้ารู้สึกว่ารบกวน
                   </span>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 11: CUSTOM CHAT BUTTONS (persisted in DB via /api/buttons) */}
+          {activeSubTab === 'chat_buttons' && (
+            <div className="space-y-6">
+              <div className="bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-xl p-5 space-y-4 shadow-xs">
+                <h4 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 flex items-center gap-2">
+                  <MessageSquare className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                  จัดการปุ่มแชทของเพจนี้ (บันทึกถาวรในฐานข้อมูล)
+                </h4>
+                <p className="text-xs text-slate-500 dark:text-zinc-400">
+                  ปุ่มเหล่านี้ถูกเก็บแยกตามเพจในตาราง custom_buttons และอัปเดตเรียลไทม์ผ่าน SSE —
+                  ต่างจาก "ปุ่มลัด Messenger" ในแท็บ 10 ที่เก็บรวมในการตั้งค่าเพจ
+                </p>
+                <CustomButtonsManager pageId={formData.page_id} theme={currentTheme} />
               </div>
             </div>
           )}

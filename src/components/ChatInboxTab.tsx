@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MessageSquare, Send, RefreshCw, User, Bot, Clock, AlertCircle, CheckCircle2, Inbox } from 'lucide-react';
 import type { PageConfig } from '../types';
+import { useSSE } from '../utils/useSSE';
 
 interface ChatInboxTabProps {
   pages: PageConfig[];
   selectedPageId: string;
+  setSelectedPageId?: (id: string) => void;
   theme: 'dark' | 'light';
 }
 
@@ -24,7 +26,7 @@ interface Conversation {
   messages: ChatMessage[];
 }
 
-export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageId, theme }) => {
+export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageId, setSelectedPageId, theme }) => {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedConvo, setSelectedConvo] = useState<Conversation | null>(null);
   const [replyText, setReplyText] = useState('');
@@ -34,6 +36,16 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<{ connected: boolean; count: number; pages: any[] } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Admin quick-reply shortcuts: one tap inserts the text into the input box
+  const ADMIN_QUICK_REPLIES = [
+    'สวัสดีค่ะ ยินดีให้ข้อมูลนะคะ 🙏',
+    'ราคาและโปรโมชั่นสรุปให้ในแชทเลยนะคะ สนใจกี่ชิ้นคะ 😊',
+    'รบกวนแจ้ง ชื่อ-ที่อยู่-เบอร์โทร เพื่อจัดส่งได้เลยค่ะ 📦',
+    'สินค้าส่ง 1-2 วันทำการ มีเก็บเงินปลายทางค่ะ',
+    'ขอบคุณที่รับชมนะคะ 🙏',
+    'แอดมินจะรีบตอบกลับให้เร็วที่สุดค่ะ'
+  ];
 
   const currentPage = pages.find(p => p.page_id === selectedPageId);
 
@@ -55,9 +67,9 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
     return () => clearInterval(interval);
   }, []);
 
-  const fetchInbox = async () => {
+  const fetchInbox = async (silent = false) => {
     if (!selectedPageId) return;
-    setIsLoading(true);
+    if (!silent) setIsLoading(true);
     setError(null);
     try {
       const res = await fetch(`/api/facebook/inbox?page_id=${encodeURIComponent(selectedPageId)}`);
@@ -65,24 +77,49 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
       if (data.success) {
         setConversations(data.conversations || []);
         setLastRefresh(new Date());
-        // Auto-select first conversation if none selected
-        if (!selectedConvo && data.conversations?.length > 0) {
-          setSelectedConvo(data.conversations[0]);
-        }
+        // Merge refresh: keep the currently-open conversation selected and
+        // update its messages in place so polling never resets the view.
+        setSelectedConvo(prev => {
+          if (!prev) return data.conversations?.[0] || null;
+          const updated = (data.conversations || []).find((c: Conversation) => c.thread_id === prev.thread_id);
+          return updated || prev;
+        });
       } else {
-        setError(data.message || data.error?.message || 'ไม่สามารถดึงข้อมูลแชทได้');
+        if (!silent) setError(data.message || data.error?.message || 'ไม่สามารถดึงข้อมูลแชทได้');
       }
     } catch (err: any) {
-      setError(`เกิดข้อผิดพลาด: ${err.message}`);
+      if (!silent) setError(`เกิดข้อผิดพลาด: ${err.message}`);
     } finally {
-      setIsLoading(false);
+      if (!silent) setIsLoading(false);
     }
   };
 
+  // ── Real-time upgrade (SSE) ─────────────────────────────────────────────
+  // New customer messages now arrive instantly via Server-Sent Events.
+  // Fallback polling runs every 30s (was 5s) to save free-host requests.
+  const { connected: sseConnected } = useSSE({
+    pageId: selectedPageId,
+    enabled: !!selectedPageId,
+    onNewMessage: (data) => {
+      if (!selectedPageId || data.page_id !== selectedPageId) return;
+      fetchInbox(true);
+    },
+    onConnectionChanged: (data) => {
+      if (!selectedPageId || data.page_id !== selectedPageId) return;
+      fetchInbox(true);
+    },
+    onDataUpdated: (data) => {
+      if (data.collection === 'chat_history' || data.collection === 'pages') {
+        fetchInbox(true);
+      }
+    }
+  });
+
   useEffect(() => {
+    setSelectedConvo(null);
     fetchInbox();
-    // Auto-refresh every 30 seconds
-    const interval = setInterval(fetchInbox, 30000);
+    // Fallback polling: safety net in case SSE drops
+    const interval = setInterval(() => fetchInbox(true), 30000);
     return () => clearInterval(interval);
   }, [selectedPageId]);
 
@@ -182,14 +219,38 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Page switcher: change page without leaving the chat screen */}
+          <select
+            value={selectedPageId}
+            onChange={e => setSelectedPageId?.(e.target.value)}
+            className={`text-xs font-medium rounded-lg px-2.5 py-2 border outline-none cursor-pointer max-w-[180px] sm:max-w-[260px] truncate ${
+              theme === 'dark'
+                ? 'bg-[#141418] text-zinc-200 border-zinc-800 focus:border-indigo-500'
+                : 'bg-white text-zinc-800 border-slate-200 focus:border-indigo-500'
+            }`}
+            title="เลือกเพจเพื่อดูแชทของเพจนั้น"
+          >
+            {pages.map(p => (
+              <option key={p.page_id} value={p.page_id}>{p.page_name}</option>
+            ))}
+          </select>
+          {/* SSE real-time status indicator */}
+          <span className={`flex items-center gap-1.5 text-[10px] font-medium ${
+            sseConnected
+              ? theme === 'dark' ? 'text-emerald-400' : 'text-emerald-600'
+              : theme === 'dark' ? 'text-amber-400' : 'text-amber-600'
+          }`} title={sseConnected ? 'เชื่อมต่อเรียลไทม์ (SSE) — ข้อความใหม่ปรากฏทันที' : 'โหมดสำรอง — ตรวจสอบทุก 30 วินาที'}>
+            <span className={`w-1.5 h-1.5 rounded-full ${sseConnected ? 'bg-emerald-500' : 'bg-amber-500'}`} />
+            {sseConnected ? 'เรียลไทม์' : 'โหมดสำรอง'}
+          </span>
           {lastRefresh && (
             <span className={`text-[10px] ${theme === 'dark' ? 'text-zinc-500' : 'text-slate-400'}`}>
-              อัปเดตล่าสุด: {lastRefresh.toLocaleTimeString('th-TH')}
+              อัปเดต: {lastRefresh.toLocaleTimeString('th-TH')}
             </span>
           )}
           <button
-            onClick={fetchInbox}
+            onClick={() => fetchInbox()}
             disabled={isLoading}
             className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
               isLoading

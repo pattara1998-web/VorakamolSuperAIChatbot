@@ -25,6 +25,9 @@ import {
   ActivityLog,
   EmergencyAlert
 } from './src/types.ts';
+import * as dbBridge from './src/services/dbBridge.ts';
+import * as dbService from './src/services/database.ts';
+import * as auth from './src/services/auth.ts';
 
 dotenv.config();
 
@@ -180,10 +183,59 @@ const META_GRAPH_API_VERSION = process.env.META_GRAPH_API_VERSION || 'v24.0';
 // instant-fire like a bot (Meta anti-spam / BAN prevention). Configurable.
 const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 1500);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// Hard cap on any single AI call so a hung Gemini request can never leave a
+// customer waiting for minutes — we race the call against a timer and fall
+// back to a short template reply instead.
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 25000);
+function withTimeout<T>(promise: Promise<T>, ms: number, label = 'AI'): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label}_TIMEOUT`)), ms))
+  ]);
+}
 // Dedupe stores: webhook pushes + Graph API polling may deliver the same
 // message/comment twice — never process (or reply to) an event twice.
 const processedMessageIds = new Set<string>();
 const processedCommentIds = new Set<string>();
+
+// ---------------------------------------------------------------------------
+// Per-conversation chat memory. Without it the AI only ever sees ONE message,
+// which is the root cause of off-topic answers and repeated identical replies:
+// it literally cannot know what was already said. The last few exchanges are
+// injected into every prompt so answers continue the conversation naturally.
+// ---------------------------------------------------------------------------
+interface HistoryEntry {
+  role: 'customer' | 'admin';
+  text: string;
+  timestamp: number;
+}
+const conversationHistory = new Map<string, HistoryEntry[]>();
+const HISTORY_MAX_PER_SENDER = 300;
+function pushHistory(pageId: string, senderId: string, role: 'customer' | 'admin', text: string) {
+  const key = `${pageId}:${senderId}`;
+  const list = conversationHistory.get(key) || [];
+  list.push({ role, text: String(text || '').slice(0, 600), timestamp: Date.now() });
+  if (list.length > HISTORY_MAX_PER_SENDER) list.splice(0, list.length - HISTORY_MAX_PER_SENDER);
+  conversationHistory.set(key, list);
+  // Also persist to SQLite ChatHistory table
+  try {
+    dbService.addChatMessage(pageId, senderId, role, text);
+  } catch { /* non-critical */ }
+  // Broadcast real-time update via SSE
+  try {
+    dbBridge.broadcastSSE('new_message', { page_id: pageId, sender_id: senderId, role, text: text.slice(0, 200), timestamp: new Date().toISOString() }, pageId);
+  } catch { /* non-critical */ }
+}
+function getRecentHistory(pageId: string, senderId: string, limit = 8): HistoryEntry[] {
+  const list = conversationHistory.get(`${pageId}:${senderId}`) || [];
+  return list.slice(-limit);
+}
+function getRecentAdminReplies(pageId: string, senderId: string, limit = 4): string[] {
+  return getRecentHistory(pageId, senderId, 20)
+    .filter(h => h.role === 'admin')
+    .slice(-limit)
+    .map(h => h.text);
+}
 
 // Track recent AI replies per sender to prevent repetition
 interface RecentReply {
@@ -316,23 +368,58 @@ function decryptStoredSecret(value: string) {
 }
 function loadPersistedData() {
   try {
+    // 1. Try loading from SQLite first (primary database)
+    const sqliteLoaded = dbBridge.loadFromDatabase(db);
+    if (sqliteLoaded) {
+      console.log('[Store] Loaded data from SQLite database');
+      // Still check JSON for migration if SQLite was empty
+      if (fs.existsSync(DATA_FILE)) {
+        try {
+          const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) as Partial<DatabaseStore>;
+          dbBridge.migrateFromJsonIfEmpty(saved);
+        } catch { /* JSON migration is best-effort */ }
+      }
+      // Apply env var fallback for Gemini key
+      if (!db.settings.geminiApiKey && process.env.GEMINI_API_KEY) {
+        db.settings.geminiApiKey = process.env.GEMINI_API_KEY;
+      }
+      return;
+    }
+
+    // 2. Fallback: load from JSON file if SQLite fails
     if (!fs.existsSync(DATA_FILE)) return;
     const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) as Partial<DatabaseStore>;
     for (const key of ['pages', 'amulet', 'china', 'otop', 'agriculture', 'customers', 'orders', 'logs', 'emergencyAlerts'] as const) {
       if (Array.isArray(saved[key])) (db as any)[key] = saved[key];
     }
-    if (saved.settings) db.settings = { ...db.settings, ...saved.settings, geminiApiKey: decryptStoredSecret(saved.settings.geminiApiKey || '') };
+    if (saved.settings) {
+      const savedKey = decryptStoredSecret(saved.settings.geminiApiKey || '');
+      db.settings = {
+        ...db.settings,
+        ...saved.settings,
+        geminiApiKey: savedKey || process.env.GEMINI_API_KEY || db.settings.geminiApiKey || ''
+      };
+    }
+    // Migrate JSON data into SQLite for future loads
+    dbBridge.migrateFromJsonIfEmpty(saved);
   } catch (error) {
     console.error('[Store] Could not load persisted data:', error);
   }
 }
 function persistData() {
   try {
+    // Save to JSON file (backward compatibility)
     fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
     const persistable = { ...db, settings: { ...db.settings, geminiApiKey: encryptStoredSecret(db.settings.geminiApiKey) } };
     fs.writeFileSync(DATA_FILE, JSON.stringify(persistable), 'utf8');
   } catch (error) {
-    console.error('[Store] Could not persist data. Configure a writable DATA_FILE for production:', error);
+    console.error('[Store] Could not persist data to JSON. Configure a writable DATA_FILE for production:', error);
+  }
+  try {
+    // Save to SQLite (primary database)
+    dbBridge.saveToDatabase(db);
+  } catch (error) {
+    console.error('[Store] Could not persist data to SQLite:', error);
   }
 }
 loadPersistedData();
@@ -622,6 +709,287 @@ async function startServer() {
     next();
   });
 
+  // ================================================================
+  // AUTHENTICATION & SECURITY ENDPOINTS
+  // ================================================================
+
+  // Login endpoint
+  app.post('/api/auth/login', (req: Request, res: Response) => {
+    const { username, password, security_code } = req.body;
+    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || req.socket.remoteAddress || 'unknown';
+    const userAgent = req.headers['user-agent'] || '';
+
+    if (!username || !password || !security_code) {
+      return res.status(400).json({ success: false, error: 'กรุณากรอกข้อมูลให้ครบทุกช่อง' });
+    }
+
+    const result = auth.authenticateUser(username, password, security_code, ip, userAgent);
+
+    if (result.success) {
+      addLog('INFO', 'AUTH', 'SYSTEM', `🔐 เข้าสู่ระบบสำเร็จ: ${username} จาก IP ${ip} (${result.session?.device_info})`, 'SUCCESS');
+      res.json({
+        success: true,
+        token: result.token,
+        session_id: result.session?.session_id,
+        user: {
+          id: result.session?.user_id,
+          username: result.session?.username,
+          role: result.session?.role
+        },
+        message: 'เข้าสู่ระบบสำเร็จ'
+      });
+    } else {
+      addLog('INFO', 'AUTH', 'SYSTEM', `❌ เข้าสู่ระบบล้มเหลวจาก IP ${ip}: ${result.error}`, 'WARNING');
+      res.status(401).json({ success: false, error: result.error });
+    }
+  });
+
+  // Logout endpoint
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    const sessionId = req.headers['x-session-id'] as string;
+    if (sessionId) {
+      auth.endSession(sessionId);
+      addLog('INFO', 'AUTH', 'SYSTEM', `🚪 ออกจากระบบ: session ${sessionId.slice(0, 8)}...`, 'INFO');
+    }
+    res.json({ success: true, message: 'ออกจากระบบเรียบร้อย' });
+  });
+
+  // Validate session
+  app.get('/api/auth/validate', (req: Request, res: Response) => {
+    const sessionId = req.headers['x-session-id'] as string;
+    if (!sessionId) return res.status(401).json({ valid: false, error: 'No session' });
+
+    const session = auth.validateSession(sessionId);
+    if (!session) return res.status(401).json({ valid: false, error: 'Session expired' });
+
+    res.json({
+      valid: true,
+      session: {
+        session_id: session.session_id,
+        user_id: session.user_id,
+        username: session.username,
+        role: session.role,
+        login_at: session.login_at,
+        last_activity: session.last_activity
+      }
+    });
+  });
+
+  // ================================================================
+  // ADMIN PANEL - Session Management & User Control
+  // ================================================================
+
+  // Get all active sessions
+  app.get('/api/admin/sessions', (req: Request, res: Response) => {
+    const sessionId = req.headers['x-session-id'] as string;
+    const session = auth.validateSession(sessionId);
+    if (!session || session.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const sessions = auth.getAllSessions();
+    res.json({
+      success: true,
+      sessions: sessions.map(s => ({
+        session_id: s.session_id,
+        username: s.username,
+        role: s.role,
+        ip_address: s.ip_address,
+        device_info: s.device_info,
+        location: s.location,
+        login_at: s.login_at,
+        last_activity: s.last_activity,
+        is_active: s.is_active
+      })),
+      total_active: sessions.length
+    });
+  });
+
+  // Kick a session
+  app.post('/api/admin/kick-session', (req: Request, res: Response) => {
+    const sessionId = req.headers['x-session-id'] as string;
+    const session = auth.validateSession(sessionId);
+    if (!session || session.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const { target_session_id } = req.body;
+    if (!target_session_id) return res.status(400).json({ error: 'target_session_id required' });
+
+    const kicked = auth.kickSession(target_session_id);
+    if (kicked) {
+      addLog('INFO', 'ADMIN', 'SYSTEM', `🦵 Kick session ${target_session_id.slice(0, 8)}... โดย ${session.username}`, 'WARNING');
+    }
+    res.json({ success: kicked, message: kicked ? 'เตะผู้ใช้ ออกจากระบบแล้ว' : 'ไม่พบ session' });
+  });
+
+  // Block an IP
+  app.post('/api/admin/block-ip', (req: Request, res: Response) => {
+    const sessionId = req.headers['x-session-id'] as string;
+    const session = auth.validateSession(sessionId);
+    if (!session || session.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const { ip, reason, duration_hours } = req.body;
+    if (!ip) return res.status(400).json({ error: 'ip required' });
+
+    auth.blockIP(ip, reason || 'Blocked by admin', duration_hours);
+    addLog('INFO', 'ADMIN', 'SYSTEM', `🚫 Block IP ${ip}: ${reason || 'No reason'} โดย ${session.username}`, 'WARNING');
+    res.json({ success: true, message: `บล็อก IP ${ip} แล้ว` });
+  });
+
+  // Unblock an IP
+  app.post('/api/admin/unblock-ip', (req: Request, res: Response) => {
+    const sessionId = req.headers['x-session-id'] as string;
+    const session = auth.validateSession(sessionId);
+    if (!session || session.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const { ip } = req.body;
+    auth.unblockIP(ip);
+    addLog('INFO', 'ADMIN', 'SYSTEM', `✅ Unblock IP ${ip} โดย ${session.username}`, 'SUCCESS');
+    res.json({ success: true, message: `ปลดบล็อก IP ${ip} แล้ว` });
+  });
+
+  // Get blocked IPs
+  app.get('/api/admin/blocked-ips', (req: Request, res: Response) => {
+    const sessionId = req.headers['x-session-id'] as string;
+    const session = auth.validateSession(sessionId);
+    if (!session || session.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    res.json({ success: true, blocked_ips: auth.getBlockedIPs() });
+  });
+
+  // Admin: View all user data (pages, customers, messages)
+  app.get('/api/admin/user-data/:userId', (req: Request, res: Response) => {
+    const sessionId = req.headers['x-session-id'] as string;
+    const session = auth.validateSession(sessionId);
+    if (!session || session.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const { userId } = req.params;
+    // Get all data related to this user
+    const userPages = db.pages.filter(p => (p as any).owner_id === userId || p.page_id === userId);
+    const userCustomers = db.customers.filter(c => (c as any).owner_id === userId);
+    const userOrders = db.orders.filter(o => (o as any).owner_id === userId || userPages.some(p => p.page_id === o.page_id));
+    const userLogs = db.logs.filter(l => l.sender_id === userId || l.page_id === userId);
+
+    res.json({
+      success: true,
+      user_id: userId,
+      pages: userPages.length,
+      customers: userCustomers.length,
+      orders: userOrders.length,
+      logs: userLogs.length,
+      data: {
+        pages: userPages.map(p => ({ page_id: p.page_id, page_name: p.page_name, is_active: p.is_active })),
+        recent_orders: userOrders.slice(0, 20),
+        recent_customers: userCustomers.slice(0, 20)
+      }
+    });
+  });
+
+  // Session count for UI
+  app.get('/api/auth/session-count', (req: Request, res: Response) => {
+    res.json({ count: auth.getSessionCount() });
+  });
+
+  // ================================================================
+  // AUTOMATIC BACKUP SYSTEM
+  // ================================================================
+  const BACKUP_INTERVAL_MS = 6 * 60 * 60 * 1000; // Every 6 hours
+  const BACKUP_DIR = path.join(process.cwd(), 'data', 'backups');
+
+  function createBackup(): string | null {
+    try {
+      fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const backupFile = path.join(BACKUP_DIR, `backup_${timestamp}.json`);
+
+      const backupData = {
+        version: '3.0.0',
+        created_at: new Date().toISOString(),
+        counts: {
+          pages: db.pages.length,
+          customers: db.customers.length,
+          orders: db.orders.length,
+          amulet: db.amulet.length,
+          china: db.china.length,
+          otop: db.otop.length,
+          agriculture: db.agriculture.length
+        },
+        data: {
+          pages: db.pages.map(p => ({ ...p, page_access_token: maskToken(p.page_access_token) })),
+          customers: db.customers,
+          orders: db.orders,
+          amulet: db.amulet,
+          china: db.china,
+          otop: db.otop,
+          agriculture: db.agriculture,
+          settings: { ...db.settings, geminiApiKey: encryptStoredSecret(db.settings.geminiApiKey) }
+        }
+      };
+
+      fs.writeFileSync(backupFile, JSON.stringify(backupData, null, 2), 'utf8');
+
+      // Keep only last 20 backups
+      const backups = fs.readdirSync(BACKUP_DIR).filter(f => f.startsWith('backup_')).sort().reverse();
+      for (const old of backups.slice(20)) {
+        fs.unlinkSync(path.join(BACKUP_DIR, old));
+      }
+
+      addLog('INFO', 'BACKUP', 'SYSTEM', `💾 สร้าง Backup สำเร็จ: ${backupFile}`, 'SUCCESS');
+      return backupFile;
+    } catch (err) {
+      console.error('[Backup] Failed:', err);
+      return null;
+    }
+  }
+
+  // Auto backup every 6 hours
+  if (process.env.VERCEL !== '1') {
+    setInterval(() => {
+      createBackup();
+    }, BACKUP_INTERVAL_MS);
+
+    // Initial backup on startup (after 30 seconds)
+    setTimeout(() => createBackup(), 30000);
+  }
+
+  // Manual backup endpoint
+  app.post('/api/backup/create', (req: Request, res: Response) => {
+    const file = createBackup();
+    if (file) {
+      res.json({ success: true, file, message: 'สร้าง Backup สำเร็จ' });
+    } else {
+      res.status(500).json({ success: false, error: 'สร้าง Backup ไม่สำเร็จ' });
+    }
+  });
+
+  // List backups
+  app.get('/api/backup/list', (req: Request, res: Response) => {
+    try {
+      fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      const backups = fs.readdirSync(BACKUP_DIR)
+        .filter(f => f.startsWith('backup_') && f.endsWith('.json'))
+        .sort()
+        .reverse()
+        .map(f => ({
+          filename: f,
+          size: fs.statSync(path.join(BACKUP_DIR, f)).size,
+          created_at: fs.statSync(path.join(BACKUP_DIR, f)).mtime.toISOString()
+        }));
+      res.json({ success: true, backups });
+    } catch {
+      res.json({ success: true, backups: [] });
+    }
+  });
+
   // Health check endpoint
   app.get('/api/health', (req: Request, res: Response) => {
     res.json({
@@ -787,7 +1155,8 @@ async function startServer() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           recipient: { id: recipientId },
-          message: { text }
+          // Messenger text limit is 2000 characters — truncate anything longer.
+          message: { text: String(text || '').slice(0, 2000) }
         })
       });
       const data = await res.json();
@@ -822,11 +1191,25 @@ async function startServer() {
     }
   }
 
-  // Send Facebook Messenger message with Quick Reply buttons (3-4 buttons)
+  // Send Facebook Messenger message with Quick Reply buttons.
+  // Limits enforced by the Send API: max 13 buttons per message, 20-char
+  // titles, 1000-char payloads. Empty/broken entries are filtered out so a
+  // single bad button can never fail the whole message.
   async function sendFacebookQuickReplies(accessToken: string, recipientId: string, text: string, quickReplies: { title: string; payload: string }[]) {
     const rawToken = decryptToken(accessToken);
     if (!rawToken || !rawToken.startsWith('EAA')) {
       return { success: false, simulated: true, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
+    }
+    const validReplies = (quickReplies || [])
+      .filter(qr => qr && typeof qr.title === 'string' && qr.title.trim())
+      .map(qr => ({
+        content_type: 'text',
+        title: qr.title.trim().slice(0, 20),
+        payload: String(qr.payload || qr.title).slice(0, 1000)
+      }))
+      .slice(0, 13);
+    if (validReplies.length === 0) {
+      return sendFacebookMessage(accessToken, recipientId, text);
     }
     try {
       const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`;
@@ -836,12 +1219,8 @@ async function startServer() {
         body: JSON.stringify({
           recipient: { id: recipientId },
           message: {
-            text,
-            quick_replies: quickReplies.slice(0, 13).map(qr => ({
-              content_type: 'text',
-              title: qr.title.substring(0, 20),
-              payload: qr.payload || qr.title
-            }))
+            text: String(text || '').slice(0, 2000),
+            quick_replies: validReplies
           }
         })
       });
@@ -1728,6 +2107,7 @@ async function startServer() {
       let senderId = '';
       let pageId = '';
       let messageText = '';
+      let isQuickReplyTap = false;
       let commentId: string | null = null;
       let postId: string | null = null;
 
@@ -1743,16 +2123,26 @@ async function startServer() {
             return;
           }
 
+          // Echo guard: every message the PAGE sends (bot replies + admin
+          // inbox replies) comes back to the webhook with is_echo=true.
+          // Without this filter the bot would answer its own messages.
+          if (messagingEvent.message?.is_echo) {
+            return;
+          }
+
           // Dedupe: the same message can arrive via webhook AND inbox polling.
           const incomingMid = messagingEvent.message?.mid;
           if (incomingMid && !rememberId(processedMessageIds, incomingMid)) {
             return;
           }
 
-          if (messagingEvent.message?.text) {
+          if (messagingEvent.message?.text || messagingEvent.message?.quick_reply?.payload) {
             eventType = 'MESSAGE';
             senderId = messagingEvent.sender?.id || 'UNKNOWN_SENDER';
-            messageText = messagingEvent.message.text;
+            isQuickReplyTap = Boolean(messagingEvent.message.quick_reply?.payload);
+            // Quick Reply taps deliver the button payload — prefer it over the
+            // 20-char title so the full configured text reaches the AI.
+            messageText = messagingEvent.message.quick_reply?.payload || messagingEvent.message.text;
           } else if (messagingEvent.message?.attachments?.length) {
             // Customer sent an image/sticker/file — acknowledge instead of staying silent.
             eventType = 'MESSAGE';
@@ -1816,6 +2206,27 @@ async function startServer() {
         addLog('INFO', 'BOT_CONTROL', pageId, `▶️ บอทถูกเปิดใช้งานอีกครั้งโดย ${senderId}`, 'SUCCESS');
         await sendFacebookMessage(page.page_access_token || '', senderId, '▶️ บอทถูกเปิดใช้งานแล้ว ระบบจะตอบข้อความอัตโนมัติอีกครั้ง');
         return;
+      }
+
+      // ตัดรอบ command: Admin resets order counter
+      if (messageText.trim() === 'ตัดรอบ' || messageText.trim().toLowerCase() === '/cutround') {
+        const prevCounter = dbService.getDispatchCounter(pageId);
+        dbService.resetDispatchCounter(pageId);
+        addLog('INFO', 'ADMIN', pageId, `🔔 ตัดรอบออเดอร์! รีเซ็ตตัวนับจาก ${prevCounter} → 1`, 'SUCCESS');
+        dbBridge.broadcastSSE('round_cut', { page_id: pageId, previous_counter: prevCounter });
+        await sendFacebookMessage(page.page_access_token || '', senderId, `🔔 ตัดรอบเรียบร้อยค่ะ! ตัวนับออเดอร์รีเซ็ตเป็น 1 (รอบก่อนหน้าถึง ${prevCounter - 1})`);
+        return;
+      }
+
+      // ยกเลิกออเดอร์ command: Customer cancels their order
+      if (messageText.trim().toLowerCase().includes('ยกเลิก') || messageText.trim().toLowerCase().includes('cancel')) {
+        const customerOrders = db.orders.filter(o => o.psid === senderId && o.payment_status !== 'CANCELLED' && o.page_id === pageId);
+        if (customerOrders.length > 0) {
+          const latestOrder = customerOrders[0];
+          await cancelOrderAndNotify(latestOrder.order_id, page, 'ลูกค้าขอยกเลิก');
+          await sendFacebookMessage(page.page_access_token || '', senderId, `✅ ยกเลิกออเดอร์ ${latestOrder.order_id} เรียบร้อยแล้วค่ะ\nหากต้องการสั่งซื้อใหม่ ทักมาได้เลยนะคะ 🙏`);
+          return;
+        }
       }
 
       // Check if bot is stopped for this page
@@ -1918,6 +2329,20 @@ async function startServer() {
 
       // Handle MESSENGER MESSAGE Event
       addLog('MESSAGE', senderId, pageId, `📩 ลูกค้าทักแชท: "${messageText}"`, 'INFO', { senderId, pageId });
+      // Remember the customer's message in conversation memory BEFORE any
+      // mutation so first-message detection below stays truthful.
+      const isNewCustomer = !db.customers.some(c => c.psid === senderId);
+      pushHistory(pageId, senderId, 'customer', messageText);
+
+      // Customer Memory: Check if returning customer with order history
+      const customerOrderCount = dbService.getCustomerOrderCount(senderId);
+      const customerTotalSpent = dbService.getCustomerTotalSpent(senderId);
+      const isReturningCustomer = customerOrderCount > 0;
+      let customerStarRating = 0;
+      if (customerOrderCount >= 10) customerStarRating = 5;
+      else if (customerOrderCount >= 5) customerStarRating = 4;
+      else if (customerOrderCount >= 3) customerStarRating = 3;
+      else if (customerOrderCount >= 1) customerStarRating = 2;
 
       // Customer Search & Create/Update (Steps 3-6 in n8n)
       let customer = db.customers.find(c => c.psid === senderId);
@@ -1929,17 +2354,42 @@ async function startServer() {
           address: '',
           first_interaction: new Date().toISOString(),
           last_interaction: new Date().toISOString(),
-          status: 'NEW_CUSTOMER',
-          notes: 'ทักมาจากข้อความเพจ',
-          order_count: 0
+          status: isReturningCustomer ? 'ORDER_COMPLETED' : 'NEW_CUSTOMER',
+          notes: isReturningCustomer ? `ลูกค้าเก่า เคยสั่งซื้อ ${customerOrderCount} ครั้ง ยอดรวม ฿${customerTotalSpent.toLocaleString()}` : 'ทักมาจากข้อความเพจ',
+          order_count: customerOrderCount
         };
         db.customers.unshift(customer);
-        addLog('INFO', senderId, pageId, `👤 สร้างประวัติลูกค้าใหม่ (PSID: ${senderId})`, 'SUCCESS');
+        addLog('INFO', senderId, pageId, `👤 สร้างประวัติลูกค้าใหม่${isReturningCustomer ? ' (ลูกค้าเก่ากลับมา!)' : ''} (PSID: ${senderId})`, 'SUCCESS');
       } else {
         customer.last_interaction = new Date().toISOString();
-        if (customer.status !== 'ORDER_COMPLETED') {
+        if (isReturningCustomer && customer.status !== 'ORDER_COMPLETED') {
+          customer.status = 'ORDER_COMPLETED';
+        } else if (customer.status !== 'ORDER_COMPLETED') {
           customer.status = 'OLD_CUSTOMER';
         }
+        customer.order_count = customerOrderCount;
+      }
+
+      // Product Knowledge Check: ถ้าเพจไม่มีข้อมูลสินค้าเลย ให้ถามแอดมินก่อน
+      const hasProductData = Boolean(page.product?.product_name && (page.product?.display_price > 0 || page.product?.description));
+      if (!hasProductData && !isReturningCustomer) {
+        // Page has no product data - ask admin for info instead of answering blindly
+        const knowledgePrompt = `📝 สวัสดีค่ะแอดมิน! เพจ "${page.page_name}" ยังไม่มีข้อมูลสินค้าในระบบค่ะ
+
+เพื่อให้ AI ตอบลูกค้าได้อย่างถูกต้อง รบกวนแอดมินกรอกข้อมูลดังนี้ค่ะ:
+1️⃣ ชื่อสินค้าคืออะไรค่ะ?
+2️⃣ ราคาเท่าไรค่ะ?
+3️⃣ มีรายละเอียด/คุณสมบัติอะไรที่ลูกค้าชอบถามบ้างค่ะ?
+4️⃣ มีโปรโมชั่นอะไรบ้างค่ะ?
+
+แอดมินสามารถพิมพ์ตอบกลับมาได้เลย หรือตั้งค่าในหน้า "แก้ไขฐานข้อมูล" ค่ะ 🙏
+
+(ลูกค้า "${customer?.customer_name || 'ไม่ทราบชื่อ'}" ทักเข้ามาถาม: "${messageText.slice(0, 100)}")`;
+
+        await sendFacebookMessage(page.page_access_token || '', senderId, '🙏 ขออภัยค่ะ แอดมินกำลังอัปเดตข้อมูลสินค้า กรุณารอสักครู่ แอดมินจะรีบมาตอบให้เร็วที่สุดค่ะ');
+        addLog('INFO', 'KNOWLEDGE', pageId, `📝 เพจไม่มีข้อมูลสินค้า - แจ้งแอดมินให้กรอกข้อมูล (ลูกค้า: ${senderId})`, 'WARNING');
+        dbBridge.broadcastSSE('knowledge_needed', { page_id: pageId, customer_message: messageText, sender_id: senderId });
+        return;
       }
 
       // Product and Detailed Specs selection
@@ -2059,36 +2509,60 @@ async function startServer() {
 
       const ai = getGemini();
 
+      // Conversation memory: the last few exchanges so the answer continues
+      // the chat instead of ignoring what was already said.
+      const historyEntries = getRecentHistory(pageId, senderId, 8);
+      const historyText = historyEntries.length
+        ? historyEntries.map(h => `${h.role === 'customer' ? 'ลูกค้า' : adminName}: ${h.text}`).join('\n')
+        : '(ยังไม่มีประวัติบทสนทนา — นี่คือข้อความแรก)';
+      // Replies already used in this conversation — the AI must not repeat them.
+      const usedReplies = getRecentAdminReplies(pageId, senderId, 4);
+      const usedRepliesText = usedReplies.length
+        ? usedReplies.map(r => `- "${r}"`).join('\n')
+        : '(ยังไม่มีคำตอบก่อนหน้า)';
+
       const promptContext = `
 คุณคือ "${adminName}" ซึ่งเป็นแอดมินร้านค้าเพจ Facebook: "${page.page_name}"
 ลักษณะการตอบและบุคลิก:
 - ชื่อแอดมิน: ${adminName}
 - โทนเสียง: ${aiTone}
-- ความยาวคำตอบ: ${brevityMode ? 'ตอบสั้น กระชับ ตรงประเด็น ไม่เยิ่นเย้อ เหมือนคนพิมพ์แชทมือถือจริง (สูงสุด 2-3 ประโยค)' : 'ให้ข้อมูลครบถ้วน ชัดเจน แต่ไม่ต้องยาวเกิน 5 ประโยค'}
+- ความยาวคำตอบ: ${brevityMode ? 'ตอบสั้น กระชับ ตรงประเด็น 1-3 ประโยค เหมือนคนพิมพ์แชทมือถือจริง' : 'ให้ข้อมูลครบถ้วน ชัดเจน แต่ไม่เกิน 5 ประโยค'}
 - คำสั่งเฉพาะของเพจนี้: ${customInstructions}
 
-⚠️ กฎสำคัญที่สุด - ต้องทำตามนี้ทุกข้อ:
-1. ตอบให้ตรงคำถามของลูกค้าโดยเฉพาะ อย่าตอบวกไปวนมา
-2. ห้ามตอบข้อความเดิมซ้ำถ้าลูกค้าถามคำถามเดิม ให้ปรับวิธีตอบเสมอ
-3. ถ้าลูกค้าถามเรื่องเดิม ให้ตอบเพิ่มเติมจากที่เคยตอบ ไม่ใช่ตอบซ้ำประโยคเดิม
-4. ตอบเหมือนมนุษย์คุยจริง สั้น กระชับ เป็นธรรมชาติ
-5. ห้ามตอบยาวเป็นเรียงความเด็ดขาด
+👤 ข้อมูลลูกค้าคนนี้:
+- สถานะ: ${isReturningCustomer ? `⭐ ลูกค้าเก่า (เคยสั่งซื้อ ${customerOrderCount} ครั้ง ยอดรวม ฿${customerTotalSpent.toLocaleString()} ดาว ${customerStarRating}/5)` : '🆕 ลูกค้าใหม่ (ยังไม่เคยสั่งซื้อ)'}
+- ชื่อ: ${customer?.customer_name || 'ไม่ทราบ'}
+- สถานะลูกค้า: ${customer?.status || 'NEW_CUSTOMER'}
+${isReturningCustomer ? '- ⚡ ลูกค้าเคยสั่งซื้อแล้ว ให้ต้อนรับเป็นพิเศษ เช่น "ยินดีกลับมาอีกครั้งค่ะ!" และอาจเสนอโปรโมชั่นพิเศษสำหรับลูกค้าเก่า' : ''}
+
+📜 ประวัติบทสนทนาล่าสุดกับลูกค้าคนนี้ (ข้อความล่าสุดอยู่ท้ายสุด ให้ตอบต่อเนื่องจากนี้):
+${historyText}
+
+🚫 คำตอบที่คุณเคยตอบไปแล้วกับลูกค้าคนนี้ (ห้ามใช้ประโยคหรือโครงสร้างเดิมซ้ำ ต้องตอบใหม่ทุกครั้ง):
+${usedRepliesText}
+
+⚠️ กฎสำคัญที่สุด - ทำตามทุกข้อ:
+1. อ่าน "ข้อความล่าสุดของลูกค้า" แล้วตอบสิ่งที่ลูกค้าถามโดยเฉพาะ ห้ามเลี่ยงคำถาม ห้ามตอบวนเรื่องเดิม
+2. ถ้าลูกค้าถามต่อเนื่อง ให้ต่อยอดจากที่เคยตอบ (เช่น บอกรายละเอียดเพิ่ม หรือถามปิดการขาย) ไม่ใช่เริ่มใหม่
+3. ตอบเหมือนมนุษย์แอดมินคุยจริง พิมพ์สั้น เป็นธรรมชาติ ใช้คำอุดมคติของแอดมินไทย
+4. ตัวเลขราคา/โปรโมชั่น ใช้จากข้อมูลสินค้าด้านล่างเท่านั้น ห้ามเดา ห้ามมั่ว
+5. ห้ามอ้างว่าเป็น AI ห้ามแนะนำตัวซ้ำทุกข้อความ ห้ามทักทายใหม่ทุกครั้งเมื่อกำลังคุยอยู่
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
 - ชื่อสินค้า: ${page.product?.product_name || matchedProduct.product_name}
-- ราคาปกติ: ฿${(page.product?.base_price || matchedProduct.price_1 || 990).toLocaleString()}
-- ราคาโปรโมชั่นขาย: ฿${(page.product?.display_price || matchedProduct.display_price || 990).toLocaleString()}
+- ราคาปกติ: ฿${(page.product?.base_price || matchedProduct.price_1 || 0).toLocaleString()}
+- ราคาโปรโมชั่นขาย: ฿${(page.product?.display_price || matchedProduct.display_price || 0).toLocaleString()}
 - รายละเอียด: ${page.product?.description || matchedProduct.detail_text || ''}
-- รายการของแถม: ${combinedSpecs.box_contents || 'ของแถมพิเศษ'}
+- รายการของแถมในกล่อง: ${combinedSpecs.box_contents || 'ของแถมพิเศษ'}
 
 📋 ข้อมูลสเปกสินค้าแบบละเอียด (Detailed Product Specifications):
 ${specsText}
 - โปรโมชั่นทั้งหมดที่มี (ชื่อแพ็กเกจคือชื่อที่ร้านกำหนดเอง ให้ใช้ชื่อนี้ตามนั้น):
 ${JSON.stringify((page.product?.promotions || [
-  { name: 'โปรโมชั่น 1 ชิ้น', price: matchedProduct.price_1 || 990 },
-  { name: 'โปรโมชั่น 2 ชิ้น', price: matchedProduct.price_2 || 1800 },
-  { name: 'โปรโมชั่น 3 ชิ้น', price: matchedProduct.price_3 || 2500 }
+  { name: 'โปรโมชั่น 1 ชิ้น', price: matchedProduct.price_1 || 0 },
+  { name: 'โปรโมชั่น 2 ชิ้น', price: matchedProduct.price_2 || 0 },
+  { name: 'โปรโมชั่น 3 ชิ้น', price: matchedProduct.price_3 || 0 }
 ]).map((p: any) => ({
   name: p.name,
   quantity: p.quantity,
@@ -2098,38 +2572,39 @@ ${JSON.stringify((page.product?.promotions || [
   free_gifts: p.free_gifts || ''
 })), null, 2)}
 
-แพตเทิร์นการขาย 6 สเต็ปของเพจนี้:
+แพตเทิร์นการขาย 6 สเต็ปของเพจนี้ (ใช้เป็นแนวทาง ไม่ต้องเรียงทุกข้อความ):
 - สเต็ป 1 (ข้อความเปิด): ${page.sequence?.step1_opening_text || matchedProduct.opening_text}
 - สเต็ป 3 (รายละเอียดโปรโมชั่น): ${page.sequence?.step3_promotion_detail || matchedProduct.promotion_text}
 - สเต็ป 6 (ข้อความปิดการขาย): ${page.sequence?.step6_closing_text || matchedProduct.closing_text}
 
 ข้อมูลลูกค้าปัจจุบัน:
-${JSON.stringify(customer, null, 2)}
+${JSON.stringify({ name: customer.customer_name, status: customer.status, order_count: customer.order_count, notes: customer.notes }, null, 2)}
 
 กฎเหล็กเพิ่มเติม:
-1. ตอบแบบมนุษย์ที่เป็นแอดมินจริงๆ เท่านั้น ห้ามตอบยาวเป็นเรียงความ และห้ามอ้างอิงว่าเป็น AI
-2. ให้ข้อมูลเฉพาะโปรโมชั่นและสินค้าของเพจนี้ ห้ามแต่งข้อมูล ห้ามเดา
-3. หากเป็นพระเครื่อง: ห้ามสร้างพุทธคุณเอง ให้ใช้ข้อมูลแท้เท่านั้น
-4. หากลูกค้าถามทั่วไป/ราคา ให้ตอบสุภาพ แนะนำโปรโมชั่น และปิดการขายอย่างกระชับ
-5. หากลูกค้าส่งข้อมูลสั่งซื้อหรือส่งชื่อ/ที่อยู่/เบอร์โทร หรือจำนวน: ให้ตรวจจับเป็น ORDER และดึงข้อมูลลูกค้าออกมาให้ครบถ้วน
-6. เรื่องการจัดส่ง: บอกว่า "ส่งฟรี" ได้เฉพาะแพ็กเกจที่ free_shipping = true เท่านั้น แพ็กเกจที่ free_shipping = false ห้ามบอกส่งฟรีเด็ดขาด ให้บอกว่ามีค่าจัดส่งตามจริง
-7. เรื่องของแถม: บอกของแถมเฉพาะแพ็กเกจที่ gift_quantity > 0 หรือมี free_gifts ระบุเท่านั้น แพ็กเกจที่ไม่มีของแถมห้ามบอกว่ามีของแถม
+1. ให้ข้อมูลเฉพาะสินค้าและโปรโมชั่นของเพจนี้ ห้ามแต่งข้อมูล ห้ามเดา
+2. หากเป็นพระเครื่อง: ห้ามสร้างพุทธคุณเอง ให้ใช้ข้อมูลแท้เท่านั้น
+3. ถ้าลูกค้ายังไม่ได้ถามเรื่องราคา/โปรโมชั่น อย่ายัดโปรทันที — ตอบคำถามก่อน แล้วค่อยมีจังหวะปิดการขายสั้นๆ ท้ายข้อความ
+4. หากลูกค้าส่งข้อมูลสั่งซื้อหรือส่งชื่อ/ที่อยู่/เบอร์โทร หรือจำนวน: ให้ตรวจจับเป็น ORDER และดึงข้อมูลลูกค้าออกมาให้ครบถ้วน
+5. เรื่องการจัดส่ง: บอกว่า "ส่งฟรี" ได้เฉพาะแพ็กเกจที่ free_shipping = true เท่านั้น แพ็กเกจที่ free_shipping = false ห้ามบอกส่งฟรีเด็ดขาด
+6. เรื่องของแถม: บอกของแถมเฉพาะแพ็กเกจที่ gift_quantity > 0 หรือมี free_gifts ระบุเท่านั้น
+7. ทุกคำตอบต้องต่างจากคำตอบก่อนหน้า (ดูรายการ 🚫 ด้านบน) — ปรับคำพูดใหม่เสมอ
 
-ตัวอย่างการตอบที่ดี (ต้องตอบแบบนี้ทุกครั้ง แต่ไม่ซ้ำรูปแบบ):
-- ถามราคา: "ราคาเริ่มต้น ฿990 ค่ะ มีโปรโมชั่น 2 ชิ้น ฿1,800 ประหยัดเลย 🎁 สนใจกี่ชิ้นคะ?"
-- ถามคุณภาพ: "สินค้ารับประกันคุณภาพค่ะ ส่งตรงจากแหล่งผลิต มีรีวิวเยอะเลยคะ ✨"
-- ปิดการขาย: "สนใจสั่งซื้อได้เลยค่ะ ส่งฟรีเก็บเงินปลายทางนะคะ 📦"
-
-ข้อความที่ลูกค้าส่งมา:
+ข้อความล่าสุดของลูกค้าที่ต้องตอบ:
 "${messageText}"
 `;
 
       try {
-        const response = await ai.models.generateContent({
+        // Timeout race: a hung Gemini call must never stall the customer for
+        // minutes — cap it and fall back to a short template reply.
+        const response = await withTimeout(ai.models.generateContent({
           model: selectedModel,
           contents: promptContext,
           config: {
             responseMimeType: 'application/json',
+            // Higher temperature => varied wording between replies (less
+            // repetition); capped output keeps generation fast and chat-sized.
+            temperature: 0.9,
+            maxOutputTokens: 600,
             responseSchema: {
               type: Type.OBJECT,
               properties: {
@@ -2165,15 +2640,16 @@ ${JSON.stringify(customer, null, 2)}
               required: ['intent', 'replyText', 'isOrderDetected']
             }
           }
-        });
+        }), AI_TIMEOUT_MS);
 
         const parsed: any = JSON.parse(response.text?.trim() || '{}');
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
         let replyText = parsed.replyText || page.sequence?.step1_opening_text || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นแจ้งได้เลยนะคะ 🙏';
 
-        // Check if AI generated a repeated reply - regenerate with different wording
+        // Check if AI generated a repeated reply - regenerate ONCE with
+        // different wording (more retries would double the reply latency).
         let regenerationCount = 0;
-        const maxRegenerations = 2;
+        const maxRegenerations = 1;
         while (isRepeatedReply(pageId, senderId, replyText) && regenerationCount < maxRegenerations) {
           addLog('INFO', senderId, pageId, `⚠️ ตรวจพบ AI ตอบข้อความซ้ำ กำลังสร้างคำตอบใหม่... (ครั้งที่ ${regenerationCount + 1})`, 'INFO');
           
@@ -2181,11 +2657,13 @@ ${JSON.stringify(customer, null, 2)}
           const freshPrompt = promptContext + `\n\n⚠️ สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม`;
           
           try {
-            const regenResponse = await ai.models.generateContent({
+            const regenResponse = await withTimeout(ai.models.generateContent({
               model: selectedModel,
               contents: freshPrompt,
               config: {
                 responseMimeType: 'application/json',
+                temperature: 1.0,
+                maxOutputTokens: 600,
                 responseSchema: {
                   type: Type.OBJECT,
                   properties: {
@@ -2209,7 +2687,7 @@ ${JSON.stringify(customer, null, 2)}
                   required: ['intent', 'replyText', 'isOrderDetected']
                 }
               }
-            });
+            }), AI_TIMEOUT_MS);
             const regenParsed: any = JSON.parse(regenResponse.text?.trim() || '{}');
             replyText = regenParsed.replyText || replyText;
             intent = regenParsed.intent === 'ORDER' || regenParsed.isOrderDetected ? 'ORDER' : intent;
@@ -2222,7 +2700,7 @@ ${JSON.stringify(customer, null, 2)}
 
         if (isRepeatedReply(pageId, senderId, replyText)) {
           addLog('AI_REPLY', senderId, pageId, `⚠️ ยังตรวจพบการตอบซ้ำหลังจากพยายาม ${regenerationCount} ครั้ง ใช้ fallback reply`, 'WARNING');
-          replyText = `ขอโทษนะคะที่คุณถามมาค่ะ 😊 สินค้าของเรามีคุณภาพดี ราคาเริ่มต้น ฿${(page.product?.display_price || matchedProduct.display_price || 990).toLocaleString()} เท่านั้นค่ะ มีโปรโมชั่นพิเศษ สนใจดูรายละเอียดเพิ่มเติมไหมคะ?`;
+          replyText = `รบกวนสอบถามเพิ่มเติมหน่อยนะคะ ${adminName} ยินดีช่วยเหลือเรื่อง ${page.product?.product_name || 'สินค้า'} เต็มที่ค่ะ พิมพ์สิ่งที่อยากทราบมาได้เลยค่า 🙏`;
         }
 
         // Track this reply to prevent future repetitions
@@ -2238,30 +2716,36 @@ ${JSON.stringify(customer, null, 2)}
           { fullReply: replyText, matchedProduct: page.product?.product_name || matchedProduct.product_name, model: selectedModel, regenerations: regenerationCount }
         );
 
-        // Per-page reply delay (configurable, default to global REPLY_DELAY_MS)
-        // Reduced from 1500ms to 800ms for faster response
-        const pageDelay = page.reply_delay_ms ?? Math.min(REPLY_DELAY_MS, 800);
+        // Per-page reply delay (configurable, default fast). Cap at 3000ms so
+        // a misconfigured huge delay can never leave customers hanging again.
+        const pageDelay = Math.min(Number(page.reply_delay_ms ?? 500), 3000);
 
-        // Check if this is first message from customer (for quick replies)
-        const isFirstMessage = customer.order_count === 0 && !customer.last_interaction;
+        // Purchase-intent keywords: when the customer shows buying interest the
+        // closing sales sequence fires immediately.
+        const purchaseIntentKeywords = ['สนใจ', 'อยากได้', 'อยากซื้อ', 'ต้องการ', 'ซื้อ', 'ราคา', 'เท่าไหร่', 'เท่าไร', 'สั่ง', 'จอง', 'เอา', 'โอน', 'cod'];
+        const hasPurchaseIntent = purchaseIntentKeywords.some(kw => messageText.toLowerCase().includes(kw));
 
-        // Check if customer said "สนใจ" or similar purchase intent keywords
-        const purchaseIntentKeywords = ['สนใจ', 'อยากได้', 'ต้องการ', 'ซื้อ', 'ราคา', 'เท่าไหร่'];
-        const hasPurchaseIntent = purchaseIntentKeywords.some(kw => messageText.includes(kw));
+        // Quick Reply buttons go to every NEW customer (first contact) and on
+        // any message when the customer hasn't tapped one yet — not only when
+        // order_count is 0 AND last_interaction is empty (that condition was
+        // always false here because last_interaction was just set above).
+        const shouldSendQuickReplies = page.quick_replies && page.quick_replies.length > 0;
 
-        // Sales Sequence Auto-Trigger: fire immediately on first message or "สนใจ"
-        const shouldTriggerSalesSequence = page.sales_sequence_auto_trigger && (isFirstMessage || hasPurchaseIntent);
+        // Purchase intent => fire the closing sales sequence immediately
+        // (customer said สนใจ/ราคา/สั่ง etc.) or on first contact.
+        const shouldTriggerSalesSequence = (page.sales_sequence_auto_trigger && (isNewCustomer || hasPurchaseIntent)) || false;
 
         // Send the AI answer with human-like pacing
         await sleep(pageDelay);
 
-        // If quick replies are configured and this is first message, send with buttons
-        if (isFirstMessage && page.quick_replies && page.quick_replies.length > 0) {
+        if (shouldSendQuickReplies) {
           await sendFacebookQuickReplies(page.page_access_token || '', senderId, replyText, page.quick_replies);
           addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${page.quick_replies.length} ปุ่ม พร้อมข้อความตอบกลับ`, 'SUCCESS');
         } else {
           await sendFacebookMessage(page.page_access_token || '', senderId, replyText);
         }
+        // Remember what we answered for the conversation memory + anti-repeat.
+        pushHistory(pageId, senderId, 'admin', replyText);
 
         // Send configured sales sequence step
         const sequenceStep = shouldTriggerSalesSequence ? 1 : Math.min(6, Math.max(1, Number(parsed.sequenceStep) || 1));
@@ -2323,16 +2807,33 @@ ${JSON.stringify(customer, null, 2)}
 
           addLog('ORDER', senderId, pageId, `🎉 บันทึกคำสั่งซื้อใหม่! รหัส ${newOrder.order_id} ยอดรวม ฿${totalAmount.toLocaleString()}`, 'SUCCESS', newOrder);
 
-          // Dispatch order summary to Telegram / LINE based on Page configuration
+          // Order Dispatch: รันเลขออเดอร์และส่งไป LINE/Telegram
+          const dispatchNumber = dbService.incrementDispatchCounter(pageId);
+          newOrder.dispatch_number = dispatchNumber;
+
+          // Dispatch formatted order message to configured channel
+          try {
+            const dispatchResult = await dispatchOrderToChannel(newOrder, page, dispatchNumber);
+            addLog('ORDER', senderId, pageId, `📤 ส่งออเดอร์ #${dispatchNumber} ไป ${page.notification_channel || 'BOTH'} สำเร็จ`, 'SUCCESS', { dispatch_number: dispatchNumber, message_id: dispatchResult.messageId });
+          } catch (dispatchErr: any) {
+            addLog('ORDER', senderId, pageId, `❌ ส่งออเดอร์ไป LINE/Telegram ไม่สำเร็จ: ${dispatchErr.message}`, 'ERROR');
+          }
+
+          // Also dispatch order summary (legacy)
           await dispatchOrderSummary(newOrder, page);
+
+          dbBridge.broadcastSSE('new_order', { order_id: newOrder.order_id, page_id: pageId, dispatch_number: dispatchNumber, customer_name: custName, total_amount: totalAmount });
         }
 
       } catch (aiErr: any) {
         console.error('Gemini AI execution error:', aiErr);
-        const fallbackReply = `${matchedProduct.opening_text}\n\n${matchedProduct.detail_text}\n\n${matchedProduct.promotion_text}\n\n${matchedProduct.closing_text}`;
-        addLog('AI_REPLY', senderId, pageId, `🤖 ตอบกลับตามชีท (Fallback): "${fallbackReply.substring(0, 80)}..."`, 'INFO');
-        await sleep(REPLY_DELAY_MS);
-        await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply.trim() || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าได้เลยนะคะ 🙏');
+        // Short, relevant fallback — never dump the whole product sheet, that
+        // is what made replies look like essays that ignore the question.
+        const price = (page.product?.display_price || matchedProduct.display_price || 0).toLocaleString();
+        const fallbackReply = `ขออภัยค่ะ ระบบขัดข้องชั่วครู่ 🙏 ${page.product?.product_name || 'สินค้าของเรา'} ราคา ฿${price} สอบถามเพิ่มเติมได้เลยนะคะ แอดมินจะรีบตอบให้เร็วที่สุดค่ะ`;
+        addLog('AI_REPLY', senderId, pageId, `🤖 ตอบกลับแบบสำรอง (AI Error: ${aiErr.message})`, 'INFO');
+        await sleep(Math.min(Number(page.reply_delay_ms ?? 500), 500));
+        await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply);
         await sendConfiguredSequenceStep(page, senderId, 1);
       }
 
@@ -2368,6 +2869,10 @@ ${JSON.stringify(customer, null, 2)}
 
   // Pull latest Messenger conversations for a page; every new customer
   // message is answered through the normal AI reply flow.
+  // Stale-message cutoff: messages older than this were probably already
+  // answered before a restart/reconnect — replying to them feels broken and
+  // wastes the reply window on old chats instead of fresh customer messages.
+  const POLL_MESSAGE_MAX_AGE_MS = 10 * 60 * 1000;
   async function pollPageInbox(page: PageConfig) {
     const rawToken = decryptToken(page.page_access_token || '');
     if (!rawToken?.startsWith('EAA')) return { success: false, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
@@ -2383,6 +2888,12 @@ ${JSON.stringify(customer, null, 2)}
         for (const msg of [...messages].reverse()) {
           if (!msg?.id || !msg.from || msg.from.id === page.page_id) continue; // skip page's own messages
           if (!msg.message || processedMessageIds.has(msg.id)) continue;
+          // Skip stale messages so the bot only ever answers fresh chats.
+          const msgTime = Date.parse(msg.created_time) || 0;
+          if (msgTime && Date.now() - msgTime > POLL_MESSAGE_MAX_AGE_MS) {
+            rememberId(processedMessageIds, msg.id); // mark seen, never answer
+            continue;
+          }
           dispatched++;
           await dispatchSyntheticEvent({
             object: 'page',
@@ -2424,6 +2935,13 @@ ${JSON.stringify(customer, null, 2)}
         for (const comment of (post.comments?.data || [])) {
           if (!comment?.id || comment.from?.id === page.page_id) continue; // skip page's own replies
           if (processedCommentIds.has(comment.id)) continue;
+          // Skip stale comments (older than 1 hour) — they were likely
+          // handled before; answering them now confuses customers.
+          const cmtTime = Date.parse(comment.created_time) || 0;
+          if (cmtTime && Date.now() - cmtTime > 60 * 60 * 1000) {
+            rememberId(processedCommentIds, comment.id);
+            continue;
+          }
           newComments++;
           await dispatchSyntheticEvent({
             object: 'page',
@@ -3129,6 +3647,572 @@ ${JSON.stringify(categorySummary, null, 2)}
     res.status(400).json({ error: 'Invalid collection or data' });
   });
 
+  // ================================================================
+  // SSE (Server-Sent Events) - Real-time Live Updates
+  // ================================================================
+  app.get('/api/events', (req: Request, res: Response) => {
+    const pageId = req.query.page_id as string | undefined;
+    const clientId = `sse_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    });
+    res.write(`event: connected\ndata: ${JSON.stringify({ clientId, timestamp: new Date().toISOString() })}\n\n`);
+
+    dbBridge.addSSEClient(clientId, res, pageId);
+    addLog('INFO', 'SSE', 'SYSTEM', `SSE client connected: ${clientId} (page: ${pageId || 'ALL'})`, 'INFO');
+  });
+
+  // ================================================================
+  // Custom Buttons CRUD API
+  // ================================================================
+  app.get('/api/buttons', (req: Request, res: Response) => {
+    const pageId = req.query.page_id as string;
+    if (!pageId) return res.status(400).json({ error: 'page_id required' });
+    const buttons = dbService.getCustomButtons(pageId);
+    res.json({ success: true, buttons });
+  });
+
+  app.post('/api/buttons', (req: Request, res: Response) => {
+    const { page_id, title, payload, button_type, sort_order } = req.body;
+    if (!page_id || !title) return res.status(400).json({ error: 'page_id and title required' });
+    if (title.length > 20) return res.status(400).json({ error: 'Quick Reply title must be 20 characters or less' });
+
+    // Verify the page exists before inserting (avoids FK constraint 500)
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(400).json({ error: 'Page not found. Please save the page first before adding buttons.' });
+
+    try {
+      const id = `btn_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      dbService.addCustomButton({ id, page_id, title, payload: payload || title, button_type: button_type || 'QUICK_REPLY', sort_order: sort_order || 0 });
+
+      // Also update in-memory page quick_replies
+      const allButtons = dbService.getCustomButtons(page_id);
+      page.quick_replies = allButtons.map(b => ({ title: b.title, payload: b.payload }));
+      persistData();
+      dbBridge.broadcastSSE('buttons_updated', { page_id, buttons: allButtons }, page_id);
+      res.json({ success: true, id });
+    } catch (err: any) {
+      addLog('ERROR', 'BUTTONS', 'SYSTEM', `Failed to add button: ${err?.message}`, 'ERROR');
+      res.status(400).json({ error: `Unable to add button: ${err?.message || 'unknown error'}` });
+    }
+  });
+
+  app.put('/api/buttons/:id', (req: Request, res: Response) => {
+    const { id } = req.params;
+    const updates = req.body;
+    if (updates.title && updates.title.length > 20) return res.status(400).json({ error: 'Quick Reply title must be 20 characters or less' });
+    try {
+      dbService.updateCustomButton(id, updates);
+
+      if (req.body.page_id) {
+        const page = db.pages.find(p => p.page_id === req.body.page_id);
+        if (page) {
+          const allButtons = dbService.getCustomButtons(req.body.page_id);
+          page.quick_replies = allButtons.map(b => ({ title: b.title, payload: b.payload }));
+          persistData();
+          dbBridge.broadcastSSE('buttons_updated', { page_id: req.body.page_id, buttons: allButtons }, req.body.page_id);
+        }
+      }
+      res.json({ success: true });
+    } catch (err: any) {
+      addLog('ERROR', 'BUTTONS', 'SYSTEM', `Failed to update button ${id}: ${err?.message}`, 'ERROR');
+      res.status(400).json({ error: `Unable to update button: ${err?.message || 'unknown error'}` });
+    }
+  });
+
+  app.delete('/api/buttons/:id', (req: Request, res: Response) => {
+    const { id } = req.params;
+    const pageId = req.query.page_id as string;
+    try {
+      dbService.deleteCustomButton(id);
+      if (pageId) {
+        const page = db.pages.find(p => p.page_id === pageId);
+        if (page) {
+          const allButtons = dbService.getCustomButtons(pageId);
+          page.quick_replies = allButtons.map(b => ({ title: b.title, payload: b.payload }));
+          persistData();
+          dbBridge.broadcastSSE('buttons_updated', { page_id: pageId, buttons: allButtons }, pageId);
+        }
+      }
+      res.json({ success: true });
+    } catch (err: any) {
+      addLog('ERROR', 'BUTTONS', 'SYSTEM', `Failed to delete button ${id}: ${err?.message}`, 'ERROR');
+      res.status(400).json({ error: `Unable to delete button: ${err?.message || 'unknown error'}` });
+    }
+  });
+
+  // ================================================================
+  // Page Sorting & Filtering API
+  // ================================================================
+  app.get('/api/pages/sorted', (req: Request, res: Response) => {
+    const sortBy = (req.query.sort_by as string) || 'name';
+    const sanitizedPages = db.pages.map(p => ({
+      ...p,
+      page_access_token: maskToken(p.page_access_token),
+      telegram_bot_token: maskToken(p.telegram_bot_token || ''),
+      line_notify_token: maskToken(p.line_notify_token || '')
+    }));
+
+    let sorted = [...sanitizedPages];
+    if (sortBy === 'name') {
+      sorted.sort((a, b) => (a.page_name || '').localeCompare(b.page_name || '', 'th'));
+    } else if (sortBy === 'recent') {
+      sorted.sort((a, b) => {
+        const aTime = (a as any).last_active_at || (a as any).connected_at || '';
+        const bTime = (b as any).last_active_at || (b as any).connected_at || '';
+        return bTime.localeCompare(aTime);
+      });
+    } else if (sortBy === 'active') {
+      sorted.sort((a, b) => (b.is_active ? 1 : 0) - (a.is_active ? 1 : 0));
+    }
+    res.json({ success: true, pages: sorted, sort_by: sortBy });
+  });
+
+  // ================================================================
+  // JSON/CSV File Import for Products
+  // ================================================================
+  app.post('/api/products/import', (req: Request, res: Response) => {
+    const { products, category, format } = req.body;
+    if (!Array.isArray(products) || products.length === 0) {
+      return res.status(400).json({ error: 'No products data provided' });
+    }
+
+    const targetCategory = category || 'CHINA';
+    const collectionKey = targetCategory.toLowerCase() as 'amulet' | 'china' | 'otop' | 'agriculture';
+    const existing = db[collectionKey] as any[];
+    let imported = 0;
+    let updated = 0;
+
+    for (const item of products) {
+      const productId = item.product_id || `PROD-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const idx = existing.findIndex(p => p.product_id === productId);
+      const productData = {
+        product_id: productId,
+        page_id: item.page_id || '',
+        product_name: item.product_name || item.name || '',
+        category: targetCategory,
+        display_price: Number(item.display_price || item.price || 0),
+        price_1: Number(item.price_1 || item.price || 0),
+        price_2: Number(item.price_2 || 0),
+        price_3: Number(item.price_3 || 0),
+        promotion_detail: item.promotion_detail || '',
+        shipping_duration: item.shipping_duration || '',
+        image_main: item.image_main || item.image || '',
+        image_detail: item.image_detail || '',
+        image_promotion: item.image_promotion || '',
+        image_review: item.image_review || '',
+        image_closing: item.image_closing || '',
+        opening_text: item.opening_text || '',
+        detail_text: item.detail_text || item.description || '',
+        promotion_text: item.promotion_text || '',
+        review_text: item.review_text || '',
+        closing_text: item.closing_text || '',
+        custom_specs: item.custom_specs || []
+      };
+
+      if (idx >= 0) {
+        existing[idx] = { ...existing[idx], ...productData };
+        updated++;
+      } else {
+        existing.unshift(productData as any);
+        imported++;
+      }
+    }
+
+    syncPagesFromCatalog(collectionKey);
+    persistData();
+    addLog('INFO', 'IMPORT', 'SYSTEM', `นำเข้าสินค้า ${targetCategory}: ${imported} ใหม่, ${updated} อัปเดต`, 'SUCCESS');
+    dbBridge.broadcastSSE('data_updated', { collection: collectionKey });
+
+    res.json({ success: true, imported, updated, total: products.length });
+  });
+
+  // CSV parser endpoint
+  app.post('/api/products/import-csv', (req: Request, res: Response) => {
+    const { csvText, category } = req.body;
+    if (!csvText || typeof csvText !== 'string') {
+      return res.status(400).json({ error: 'csvText is required' });
+    }
+    try {
+      const lines = csvText.trim().split('\n');
+      if (lines.length < 2) return res.status(400).json({ error: 'CSV must have header + data rows' });
+
+      const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      const products = [];
+      for (let i = 1; i < lines.length; i++) {
+        const values = lines[i].match(/("([^"]|"")*"|[^,]*)(,|$)/g);
+        if (!values) continue;
+        const cleanValues = values.map(v => v.replace(/,$/, '').replace(/^"|"$/g, '').replace(/""/g, '"').trim());
+        const obj: Record<string, string> = {};
+        headers.forEach((h, idx) => { obj[h] = cleanValues[idx] || ''; });
+        products.push(obj);
+      }
+
+      res.json({ success: true, products, count: products.length });
+    } catch (err: any) {
+      res.status(400).json({ error: `CSV parse error: ${err.message}` });
+    }
+  });
+
+  // ================================================================
+  // Chat History API (for admin review)
+  // ================================================================
+  app.get('/api/chat-history', (req: Request, res: Response) => {
+    const { page_id, sender_id, limit } = req.query;
+    if (!page_id || !sender_id) {
+      return res.status(400).json({ error: 'page_id and sender_id required' });
+    }
+    const history = dbService.getChatHistoryForInbox(page_id as string, sender_id as string, Number(limit) || 50);
+    res.json({ success: true, history });
+  });
+
+  // ================================================================
+  // Connection Status with isConnected flag
+  // ================================================================
+  app.post('/api/pages/set-connected', (req: Request, res: Response) => {
+    const { page_id, is_connected } = req.body;
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ error: 'Page not found' });
+    (page as any).is_connected = Boolean(is_connected);
+    (page as any).connected_at = is_connected ? new Date().toISOString() : null;
+    persistData();
+    dbBridge.broadcastSSE('connection_changed', { page_id, is_connected });
+    res.json({ success: true, is_connected: Boolean(is_connected) });
+  });
+
+  // ================================================================
+  // CUSTOMER MEMORY API - จำลูกค้าเก่า/ใหม่, ดาว, ประวัติสั่งซื้อ
+  // ================================================================
+  app.get('/api/customer/memory', (req: Request, res: Response) => {
+    const { psid, page_id } = req.query;
+    if (!psid) return res.status(400).json({ error: 'psid required' });
+
+    const orderCount = dbService.getCustomerOrderCount(psid as string);
+    const totalSpent = dbService.getCustomerTotalSpent(psid as string);
+    const isReturning = orderCount > 0;
+    const customer = db.customers.find(c => c.psid === psid);
+    const recentOrders = db.orders.filter(o => o.psid === psid && o.payment_status !== 'CANCELLED').slice(0, 5);
+
+    // Star rating based on order history
+    let starRating = 0;
+    if (orderCount >= 10) starRating = 5;
+    else if (orderCount >= 5) starRating = 4;
+    else if (orderCount >= 3) starRating = 3;
+    else if (orderCount >= 1) starRating = 2;
+    else starRating = 0;
+
+    res.json({
+      success: true,
+      psid,
+      is_returning: isReturning,
+      star_rating: starRating,
+      order_count: orderCount,
+      total_spent: totalSpent,
+      customer_name: customer?.customer_name || '',
+      phone_number: customer?.phone_number || '',
+      status: customer?.status || 'NEW_CUSTOMER',
+      recent_orders: recentOrders.map(o => ({
+        order_id: o.order_id,
+        items: o.items,
+        total_amount: o.total_amount,
+        payment_status: o.payment_status,
+        created_at: o.created_at
+      }))
+    });
+  });
+
+  // ================================================================
+  // ORDER DISPATCH COUNTER API - รันเลขออเดอร์, ตัดรอบ
+  // ================================================================
+  app.get('/api/orders/dispatch-counter', (req: Request, res: Response) => {
+    const pageId = req.query.page_id as string;
+    if (!pageId) return res.status(400).json({ error: 'page_id required' });
+    const counter = dbService.getDispatchCounter(pageId);
+    const activeOrders = dbService.getActiveOrdersByPage(pageId);
+    res.json({ success: true, page_id: pageId, current_number: counter, active_orders_count: activeOrders.length });
+  });
+
+  app.post('/api/orders/cut-round', (req: Request, res: Response) => {
+    const { page_id } = req.body;
+    if (!page_id) return res.status(400).json({ error: 'page_id required' });
+    const prevCounter = dbService.getDispatchCounter(page_id);
+    dbService.resetDispatchCounter(page_id);
+    addLog('INFO', 'ADMIN', page_id, `🔔 ตัดรอบออเดอร์! รีเซ็ตตัวนับจาก ${prevCounter} → 1`, 'SUCCESS');
+    dbBridge.broadcastSSE('round_cut', { page_id, previous_counter: prevCounter });
+    res.json({ success: true, message: `ตัดรอบเรียบร้อย! ตัวneyรีเซ็ตเป็น 1 (รอบก่อนหน้าถึง ${prevCounter - 1})` });
+  });
+
+  // ================================================================
+  // ORDER DISPATCH - ส่งออเดอร์ไป LINE/Telegram พร้อมรันเลข
+  // ================================================================
+  async function dispatchOrderToChannel(order: Order, page: PageConfig, dispatchNumber: number) {
+    const channel = page.notification_channel || 'BOTH';
+    const formattedMsg = `${dispatchNumber}. 📦 ออเดอร์ใหม่
+ชื่อ: ${order.customer_name}
+โทร: ${order.phone_number}
+ที่อยู่: ${order.shipping_address}
+สินค้า: ${order.items}
+จำนวน: ${order.quantity || 1} ชุด
+ยอดรวม: ฿${order.total_amount.toLocaleString()}
+รหัส: ${order.order_id}
+เวลา: ${new Date().toLocaleString('th-TH')}`;
+
+    let telegramMsgId = '';
+    let lineMsgId = '';
+
+    // Send to Telegram
+    if ((channel === 'TELEGRAM' || channel === 'BOTH') && deliverTelegram) {
+      const result = await deliverTelegram(page, formattedMsg);
+      if (result.success && (result as any).messageId) {
+        telegramMsgId = String((result as any).messageId);
+      }
+      // Also try sending to the configured chat
+      const rawTgToken = decryptToken(page.telegram_bot_token || '');
+      const chatId = page.telegram_chat_id || '';
+      if (rawTgToken && chatId) {
+        try {
+          const tgRes = await fetch(`https://api.telegram.org/bot${encodeURIComponent(rawTgToken)}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: formattedMsg })
+          });
+          const tgData: any = await tgRes.json();
+          if (tgData.ok && tgData.result?.message_id) {
+            telegramMsgId = String(tgData.result.message_id);
+          }
+        } catch (tgErr) {
+          console.warn('[Dispatch] Telegram send error:', tgErr);
+        }
+      }
+    }
+
+    // Send to LINE
+    if ((channel === 'LINE' || channel === 'BOTH') && deliverLine) {
+      const result = await deliverLine(page, formattedMsg);
+      if (result.success) {
+        lineMsgId = `line_${Date.now()}`;
+      }
+      // Also try LINE push to group
+      const rawLineToken = decryptToken(page.line_notify_token || '');
+      const lineGroupId = page.line_group_id || '';
+      if (rawLineToken && lineGroupId) {
+        try {
+          const lineRes = await fetch('https://api.line.me/v2/bot/message/push', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${rawLineToken}` },
+            body: JSON.stringify({ to: lineGroupId, messages: [{ type: 'text', text: formattedMsg }] })
+          });
+          if (lineRes.ok) {
+            lineMsgId = `line_${Date.now()}`;
+          }
+        } catch (lineErr) {
+          console.warn('[Dispatch] LINE send error:', lineErr);
+        }
+      }
+    }
+
+    // Save dispatched message record
+    const msgId = telegramMsgId || lineMsgId || `disp_${Date.now()}`;
+    dbService.saveDispatchedMessage({
+      message_id: msgId,
+      page_id: page.page_id,
+      channel: channel === 'BOTH' ? 'TELEGRAM' : channel,
+      chat_id: page.telegram_chat_id || page.line_group_id || '',
+      order_id: order.order_id,
+      dispatch_number: dispatchNumber,
+      message_text: formattedMsg
+    });
+
+    return { messageId: msgId, dispatchNumber, message: formattedMsg };
+  }
+
+  // Cancel order and notify
+  async function cancelOrderAndNotify(orderId: string, page: PageConfig, reason: string = 'ลูกค้า取消了การสั่งซื้อ') {
+    const order = db.orders.find(o => o.order_id === orderId);
+    if (!order) return { success: false, error: 'Order not found' };
+
+    // Mark order as cancelled in DB
+    dbService.cancelOrder(orderId);
+    order.payment_status = 'CANCELLED';
+
+    // Find the dispatched message for this order
+    const dispatchedMsg = dbService.getDispatchedMessageByOrderId(orderId);
+
+    // Try to delete the original message (Telegram supports this)
+    if (dispatchedMsg && dispatchedMsg.channel === 'TELEGRAM') {
+      const rawTgToken = decryptToken(page.telegram_bot_token || '');
+      const chatId = dispatchedMsg.chat_id;
+      if (rawTgToken && chatId && dispatchedMsg.message_id) {
+        try {
+          await fetch(`https://api.telegram.org/bot${encodeURIComponent(rawTgToken)}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, message_id: dispatchedMsg.message_id })
+          });
+        } catch {
+          // If can't delete, send cancellation notice instead
+          const cancelNotice = `${dispatchedMsg.dispatch_number}. ❌ ${order.customer_name} ได้ยกเลิกการสั่งซื้อ\n(${reason})`;
+          await deliverTelegram?.(page, cancelNotice);
+        }
+      }
+    }
+
+    // Mark dispatched message as cancelled
+    if (dispatchedMsg) {
+      dbService.markDispatchedMessageCancelled(dispatchedMsg.message_id);
+    }
+
+    // Send cancellation notice to chat
+    const channel = page.notification_channel || 'BOTH';
+    const cancelNotice = `${dispatchedMsg?.dispatch_number || '?'}. ❌ ${order.customer_name} ได้ยกเลิกการสั่งซื้อ\n(${reason})`;
+    if (channel === 'TELEGRAM' || channel === 'BOTH') {
+      await deliverTelegram?.(page, cancelNotice);
+    }
+    if (channel === 'LINE' || channel === 'BOTH') {
+      await deliverLine?.(page, cancelNotice);
+    }
+
+    addLog('ORDER', 'SYSTEM', page.page_id, `❌ ออเดอร์ ${orderId} ถูกยกเลิกโดย ${order.customer_name} - ${reason}`, 'WARNING');
+    dbBridge.broadcastSSE('order_cancelled', { order_id: orderId, page_id: page.page_id });
+    persistData();
+
+    return { success: true, order_id: orderId };
+  }
+
+  // API: Cancel order manually
+  app.post('/api/orders/cancel', async (req: Request, res: Response) => {
+    const { order_id, page_id, reason } = req.body;
+    if (!order_id) return res.status(400).json({ error: 'order_id required' });
+    const page = db.pages.find(p => p.page_id === (page_id || (db.orders.find(o => o.order_id === order_id)?.page_id)));
+    if (!page) return res.status(404).json({ error: 'Page not found' });
+    const result = await cancelOrderAndNotify(order_id, page, reason || 'แอดมินยกเลิก');
+    res.json(result);
+  });
+
+  // API: Get dispatch status for a page
+  app.get('/api/orders/dispatch-status', (req: Request, res: Response) => {
+    const pageId = req.query.page_id as string;
+    if (!pageId) return res.status(400).json({ error: 'page_id required' });
+    const counter = dbService.getDispatchCounter(pageId);
+    const activeOrders = dbService.getActiveOrdersByPage(pageId);
+    const dispatchedMsgs = dbService.getDispatchedMessages(pageId, true);
+    const totalRevenue = activeOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
+    res.json({
+      success: true,
+      page_id: pageId,
+      current_number: counter,
+      active_orders: activeOrders.length,
+      total_revenue: totalRevenue,
+      dispatched_messages: dispatchedMsgs.length
+    });
+  });
+
+  // ================================================================
+  // PRODUCT KNOWLEDGE PROMPT - ระบบถามข้อมูลสินค้าเมื่อไม่มีข้อมูล
+  // ================================================================
+  app.get('/api/products/knowledge-status', (req: Request, res: Response) => {
+    const pageId = req.query.page_id as string;
+    if (!pageId) return res.status(400).json({ error: 'page_id required' });
+    const page = db.pages.find(p => p.page_id === pageId);
+    if (!page) return res.status(404).json({ error: 'Page not found' });
+
+    const hasProductName = Boolean(page.product?.product_name);
+    const hasDescription = Boolean(page.product?.description);
+    const hasPrice = (page.product?.display_price || 0) > 0;
+    const hasPromotions = (page.product?.promotions?.length || 0) > 0;
+    const hasImages = Boolean(page.product?.images?.main);
+
+    const completeness = [hasProductName, hasDescription, hasPrice, hasPromotions, hasImages].filter(Boolean).length;
+    const percentage = Math.round((completeness / 5) * 100);
+
+    const missingFields: string[] = [];
+    if (!hasProductName) missingFields.push('ชื่อสินค้า');
+    if (!hasDescription) missingFields.push('รายละเอียดสินค้า');
+    if (!hasPrice) missingFields.push('ราคา');
+    if (!hasPromotions) missingFields.push('โปรโมชั่น');
+    if (!hasImages) missingFields.push('รูปภาพสินค้า');
+
+    res.json({
+      success: true,
+      page_id: pageId,
+      completeness_percentage: percentage,
+      is_ready_for_ai: percentage >= 60,
+      missing_fields: missingFields,
+      questions_for_admin: missingFields.length > 0 ? [
+        `สินค้าชื่ออะไรค่ะ?`,
+        `รายละเอียด/คุณสมบัติสินค้าเป็นยังไงบ้าง?`,
+        `ราคาเท่าไรค่ะ? มีโปรโมชั่นไหม?`,
+        `มีรูปภาพสินค้าไหมค่ะ?`,
+        `มีอะไรที่ลูกค้าชอบถามอีกไหมค่ะ?`
+      ].slice(0, missingFields.length) : []
+    });
+  });
+
+  // AI asks admin for product info (triggered when page has no data)
+  app.post('/api/products/knowledge-prompt', async (req: Request, res: Response) => {
+    const { page_id, answers } = req.body;
+    if (!page_id || !answers) return res.status(400).json({ error: 'page_id and answers required' });
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ error: 'Page not found' });
+
+    // Update page product with admin's answers
+    if (answers.product_name) page.product.product_name = answers.product_name;
+    if (answers.description) page.product.description = answers.description;
+    if (answers.price) page.product.display_price = Number(answers.price);
+    if (answers.promotions) {
+      page.product.promotions = [{ id: 'tier-1', name: 'โปรโมชั่น', quantity: 1, price: Number(answers.price || 0), description: answers.promotions }];
+    }
+    if (answers.images) page.product.images = { ...page.product.images, main: answers.images };
+    if (answers.additional_info) {
+      page.ai_custom_instructions = (page.ai_custom_instructions || '') + '\n' + answers.additional_info;
+    }
+
+    persistData();
+    addLog('INFO', 'KNOWLEDGE', page_id, `📝 อัปเดตข้อมูลสินค้าจากแอดมิน: ${Object.keys(answers).join(', ')}`, 'SUCCESS');
+    dbBridge.broadcastSSE('knowledge_updated', { page_id });
+
+    res.json({ success: true, message: 'บันทึกข้อมูลสินค้าเรียบร้อย! AI จะใช้ข้อมูลนี้ตอบลูกค้า' });
+  });
+
+  // ================================================================
+  // DASHBOARD API - รวมยอดขายไม่รวมออเดอร์ที่ถูกยกเลิก
+  // ================================================================
+  app.get('/api/dashboard/summary', (req: Request, res: Response) => {
+    const activeOrders = db.orders.filter(o => o.payment_status !== 'CANCELLED');
+    const cancelledOrders = db.orders.filter(o => o.payment_status === 'CANCELLED');
+    const totalRevenue = activeOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
+    const cancelledRevenue = cancelledOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
+
+    // Per-page breakdown
+    const pageBreakdown: Record<string, { revenue: number; orders: number; cancelled: number }> = {};
+    for (const order of db.orders) {
+      const pid = order.page_id || 'unknown';
+      if (!pageBreakdown[pid]) pageBreakdown[pid] = { revenue: 0, orders: 0, cancelled: 0 };
+      if (order.payment_status === 'CANCELLED') {
+        pageBreakdown[pid].cancelled++;
+      } else {
+        pageBreakdown[pid].revenue += order.total_amount || 0;
+        pageBreakdown[pid].orders++;
+      }
+    }
+
+    res.json({
+      success: true,
+      total_revenue: totalRevenue,
+      total_orders: activeOrders.length,
+      cancelled_orders: cancelledOrders.length,
+      cancelled_revenue: cancelledRevenue,
+      net_revenue: totalRevenue,
+      page_breakdown: pageBreakdown,
+      customers_total: db.customers.length,
+      returning_customers: db.customers.filter(c => db.orders.some(o => o.psid === c.psid && o.payment_status !== 'CANCELLED')).length
+    });
+  });
+
   // 4. Voice Audio Transcription API using Gemini (gemini-3.7-flash)
   app.post('/api/ai/transcribe', async (req: Request, res: Response) => {
     try {
@@ -3514,6 +4598,62 @@ ${String(rawText).slice(0, 12000)}
     app.get('*', (req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
+  }
+
+  // ================================================================
+  // Token Auto-Refresh Background Worker
+  // Extends Page Access Tokens before they expire (Facebook tokens
+  // last ~60 days). Runs every 12 hours to ensure continuity.
+  // ================================================================
+  async function refreshTokenForPage(page: PageConfig): Promise<boolean> {
+    const rawToken = decryptToken(page.page_access_token || '');
+    if (!rawToken || !rawToken.startsWith('EAA')) return false;
+    const appId = process.env.META_APP_ID || process.env.FACEBOOK_APP_ID || '';
+    const appSecret = process.env.META_APP_SECRET || process.env.FACEBOOK_APP_SECRET || '';
+    if (!appId || !appSecret) return false;
+
+    try {
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/oauth/access_token?grant_type=fb_exchange_token&client_id=${encodeURIComponent(appId)}&client_secret=${encodeURIComponent(appSecret)}&fb_exchange_token=${encodeURIComponent(rawToken)}`;
+      const res = await fetch(url);
+      const data: any = await res.json();
+      if (data.access_token && data.access_token !== rawToken) {
+        page.page_access_token = encryptToken(data.access_token);
+        addLog('INFO', 'TOKEN_REFRESH', page.page_id, `🔄 ต่ออายุ Page Access Token สำเร็จสำหรับเพจ ${page.page_name}`, 'SUCCESS');
+        persistData();
+        return true;
+      }
+      return false;
+    } catch (err: any) {
+      addLog('INFO', 'TOKEN_REFRESH', page.page_id, `❌ ต่ออายุ Token ไม่สำเร็จ: ${err.message}`, 'ERROR');
+      return false;
+    }
+  }
+
+  if (process.env.VERCEL !== '1') {
+    // Token refresh: every 12 hours
+    setInterval(async () => {
+      console.log('[Token Refresh] Starting auto-refresh cycle...');
+      let refreshed = 0;
+      for (const page of db.pages.filter(p => p.is_active)) {
+        const rawToken = decryptToken(page.page_access_token || '');
+        if (rawToken?.startsWith('EAA')) {
+          const success = await refreshTokenForPage(page);
+          if (success) refreshed++;
+        }
+      }
+      console.log(`[Token Refresh] Cycle complete: ${refreshed} tokens refreshed`);
+    }, 12 * 60 * 60 * 1000);
+
+    // Also run once 5 minutes after startup (give server time to stabilize)
+    setTimeout(async () => {
+      console.log('[Token Refresh] Initial auto-refresh cycle...');
+      for (const page of db.pages.filter(p => p.is_active)) {
+        const rawToken = decryptToken(page.page_access_token || '');
+        if (rawToken?.startsWith('EAA')) {
+          await refreshTokenForPage(page);
+        }
+      }
+    }, 5 * 60 * 1000);
   }
 
   // Background polling so every active page answers real messages/comments

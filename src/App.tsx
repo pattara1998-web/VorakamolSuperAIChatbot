@@ -16,6 +16,7 @@ import { PageSettingsModal } from './components/PageSettingsModal';
 import { AiApiSettingsModal } from './components/AiApiSettingsModal';
 import { AiAdminCopilot } from './components/AiAdminCopilot';
 import { SecurityLockScreen } from './components/SecurityLockScreen';
+import { LoginScreen } from './components/LoginScreen';
 import {
   ProductAmulet,
   ProductChina,
@@ -257,23 +258,49 @@ export default function App() {
       const res = await fetch('/api/data');
       if (res.ok) {
         const data = await res.json();
-        const serverPagesEmpty = !Array.isArray(data.pages) || data.pages.length === 0;
-        if (serverPagesEmpty && !hasRestoredFromLocal.current) {
-          const localPages = loadLocal<PageConfig[]>('pages', []);
-          if (localPages.length > 0) {
-            // Push locally-saved page settings back to the server (self-heal)
-            hasRestoredFromLocal.current = true;
-            try {
-              await fetch('/api/data/update', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ collection: 'pages', data: localPages })
-              });
-              console.info('🛡️ กู้คืนค่าที่ตั้งไว้ทั้งหมดจากเครื่องลูกค้ากลับสู่เซิร์ฟเวอร์แล้ว');
-            } catch {
-              // Server still offline — keep using local data
+        const serverCollectionsEmpty = ['pages', 'customers', 'orders', 'amulet', 'china', 'otop', 'agriculture'].filter(
+          key => !Array.isArray(data[key]) || data[key].length === 0
+        );
+        // Deploy resilience: after a redeploy the server's data file may be
+        // gone. ANY empty collection is restored from the browser's saved copy
+        // (self-heal), not just pages — so pages, page settings, products,
+        // customers and orders all survive a redeploy.
+        if (serverCollectionsEmpty.length > 0 && !hasRestoredFromLocal.current) {
+          hasRestoredFromLocal.current = true;
+          let restored = 0;
+          for (const key of serverCollectionsEmpty) {
+            const localData = loadLocal<any[]>(key, []);
+            if (localData.length > 0) {
+              restored += localData.length;
+              try {
+                await fetch('/api/data/update', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ collection: key, data: localData })
+                });
+              } catch {
+                // Server still offline — keep using local data
+              }
             }
-            setPages(localPages);
+          }
+          if (restored > 0) {
+            console.info(`🛡️ กู้คืนข้อมูลที่ตั้งไว้ทั้งหมด (${restored} รายการ) จากเครื่องนี้กลับสู่เซิร์ฟเวอร์แล้ว`);
+            // Pull the merged state back down (server may have re-encrypted tokens etc.)
+            try {
+              const reRes = await fetch('/api/data');
+              const reData = await reRes.json();
+              if (reData.pages) { setPages(reData.pages); saveLocal('pages', reData.pages); }
+              if (reData.amulet) { setAmulet(reData.amulet); saveLocal('amulet', reData.amulet); }
+              if (reData.china) { setChina(reData.china); saveLocal('china', reData.china); }
+              if (reData.otop) { setOtop(reData.otop); saveLocal('otop', reData.otop); }
+              if (reData.agriculture) { setAgriculture(reData.agriculture); saveLocal('agriculture', reData.agriculture); }
+              if (reData.customers) { setCustomers(reData.customers); saveLocal('customers', reData.customers); }
+              if (reData.orders) { setOrders(reData.orders); saveLocal('orders', reData.orders); }
+              if (reData.logs) setLogs(reData.logs);
+              if (reData.emergencyAlerts) setEmergencyAlerts(reData.emergencyAlerts);
+            } catch {
+              // ignore
+            }
             return;
           }
         }
@@ -590,13 +617,27 @@ export default function App() {
   };
 
   const handleOpenPageSettings = (pageId: string) => {
+    markPageUsage(pageId);
     setSettingsPageId(pageId);
     setIsPageSettingsOpen(true);
   };
 
   const handleSelectPageAndChat = (pageId: string) => {
+    markPageUsage(pageId);
     setSelectedPageId(pageId);
     setActiveTab('simulator');
+  };
+
+  // Record when a page was last used (for "เรียงตามใช้งานล่าสุด" sorting in Pages Hub)
+  const markPageUsage = (pageId: string) => {
+    if (typeof window === 'undefined') return;
+    try {
+      const usage = JSON.parse(localStorage.getItem('fb_chatbot_page_usage') || '{}');
+      usage[pageId] = Date.now();
+      localStorage.setItem('fb_chatbot_page_usage', JSON.stringify(usage));
+    } catch {
+      // ignore
+    }
   };
 
   const handleSimulateWebhook = async (type: string, message: string) => {
@@ -633,21 +674,22 @@ export default function App() {
     (lastModalPageRef.current?.page_id === settingsPageId ? lastModalPageRef.current : null) ||
     pages[0];
 
-  // If system is locked with PIN protection
+  // If system is locked - show login screen
   if (isLocked) {
     return (
-      <SecurityLockScreen
-        onUnlock={() => {
+      <LoginScreen
+        onLoginSuccess={(sessionData) => {
           setIsLocked(false);
           localStorage.setItem('fb_chatbot_unlocked', 'true');
         }}
+        theme={theme}
       />
     );
   }
 
   return (
     <div
-      className={`min-h-screen flex flex-col transition-colors duration-200 ${
+      className={`min-h-screen flex flex-col transition-colors duration-200 overflow-x-hidden max-w-full ${
         theme === 'dark'
           ? 'bg-[#09090B] bg-grid-pattern text-zinc-100 selection:bg-indigo-600 selection:text-white'
           : 'bg-slate-50 text-zinc-900 selection:bg-indigo-500 selection:text-white'
@@ -668,6 +710,11 @@ export default function App() {
         onToggleTheme={toggleTheme}
         onLockSystem={handleLockSystem}
         onResetDemoData={handleResetDemoData}
+        isFacebookConnected={isFacebookConnected}
+        connectedPageCount={pages.filter(p => {
+          const token = p.page_access_token || '';
+          return token.startsWith('EAA') || token.startsWith('enc:') || (token.length > 10 && !token.includes('••'));
+        }).length}
       />
 
       {/* Main Content Area */}
@@ -821,6 +868,7 @@ export default function App() {
               pages={pages}
               selectedPageId={selectedPageId}
               onImportPages={handleImportPages}
+              onGoToInbox={() => { setActiveTab('chat_inbox'); }}
             />
           </div>
         )}
@@ -833,6 +881,7 @@ export default function App() {
         pages={pages}
         selectedPageId={selectedPageId}
         onImportPages={handleImportPages}
+        onGoToInbox={() => { setIsConnectModalOpen(false); setActiveTab('chat_inbox'); }}
       />
 
       {/* Global AI API Settings Modal */}

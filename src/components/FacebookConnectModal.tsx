@@ -24,6 +24,7 @@ interface FacebookConnectModalProps {
   pages: PageConfig[];
   selectedPageId: string;
   onImportPages?: (newPages: PageConfig[]) => void;
+  onGoToInbox?: () => void;
 }
 
 export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
@@ -31,7 +32,8 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
   onClose,
   pages,
   selectedPageId,
-  onImportPages
+  onImportPages,
+  onGoToInbox
 }) => {
   const [activeTab, setActiveTab] = useState<'direct_page' | 'oneclick' | 'webhook'>('direct_page');
   const [copiedField, setCopiedField] = useState<string | null>(null);
@@ -609,7 +611,45 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
         {/* TAB 1: ONE-CLICK AUTO CONNECT (LIKE KAOJAO) */}
         {activeTab === 'direct_page' && (
           <div className="space-y-4 animate-in fade-in duration-150">
-            {/* Main Auto Connect Button */}
+            {/* ALREADY CONNECTED: green status panel instead of pushing reconnect */}
+            {connectionStatus?.connected && (
+              <div className="bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-300 dark:border-emerald-800/60 rounded-2xl p-6 space-y-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-emerald-500 flex items-center justify-center text-white shadow-lg shadow-emerald-500/30 shrink-0">
+                    <CheckCircle2 className="w-6 h-6" />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="font-black text-base text-emerald-900 dark:text-emerald-200">
+                      เชื่อมต่อเรียบร้อยแล้ว ({connectionStatus.count} เพจ)
+                    </h3>
+                    <p className="text-xs text-emerald-700 dark:text-emerald-300">
+                      บอทกำลังตอบแชทและปิดการขายให้อัตโนมัติ — ไม่ต้องเชื่อมต่อซ้ำ
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  {onGoToInbox && (
+                    <button
+                      onClick={onGoToInbox}
+                      className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black rounded-xl shadow-md flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer"
+                    >
+                      💬 ไปที่แชท Inbox
+                    </button>
+                  )}
+                  <button
+                    onClick={handleOneClickFacebookAuth}
+                    disabled={isConnectingFb}
+                    className="flex-1 py-3 bg-white dark:bg-[#141418] hover:bg-slate-50 dark:hover:bg-zinc-800 border border-slate-300 dark:border-zinc-700 text-slate-700 dark:text-zinc-200 text-xs font-bold rounded-xl flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer disabled:opacity-50"
+                  >
+                    {isConnectingFb ? <RefreshCw className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                    <span>เชื่อมต่อใหม่ / ซิงค์เพจเพิ่ม</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* NOT CONNECTED: main auto-connect block */}
+            {!connectionStatus?.connected && (
             <div className="bg-gradient-to-r from-[#1877F2]/10 to-indigo-500/10 dark:from-[#1877F2]/20 dark:to-indigo-500/20 border border-[#1877F2]/30 dark:border-[#1877F2]/40 rounded-2xl p-6 text-center space-y-4">
               <div className="flex items-center justify-center gap-3 mb-2">
                 <div className="w-16 h-16 rounded-2xl bg-[#1877F2] flex items-center justify-center text-white shadow-lg shadow-[#1877F2]/30">
@@ -643,6 +683,7 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
                 <span>ระบบจะดึงเพจทั้งหมด • เชื่อมต่อ Webhook • ตั้งค่า AI อัตโนมัติ</span>
               </div>
             </div>
+            )}
 
             {/* Manual Connection Option */}
             <div className="border-t border-slate-200 dark:border-zinc-800 pt-4">

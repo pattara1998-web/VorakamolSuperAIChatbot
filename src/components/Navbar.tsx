@@ -1,8 +1,10 @@
-import React, { useState, useRef, useEffect } from 'react';
+import * as React from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { AlertCircle } from 'lucide-react';
 import {
   Bot,
   Facebook,
+  CheckCircle2,
   Database,
   Radio,
   FileSpreadsheet,
@@ -30,6 +32,7 @@ import {
   Inbox
 } from 'lucide-react';
 import { PageConfig } from '../types';
+import { DynamicButton } from './DynamicButton';
 
 interface NavbarProps {
   activeTab: string;
@@ -45,6 +48,8 @@ interface NavbarProps {
   onToggleTheme: () => void;
   onLockSystem?: () => void;
   onResetDemoData?: () => void;
+  isFacebookConnected?: boolean;
+  connectedPageCount?: number;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -60,7 +65,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   theme,
   onToggleTheme,
   onLockSystem,
-  onResetDemoData
+  onResetDemoData,
+  isFacebookConnected = false,
+  connectedPageCount = 0
 }) => {
   const selectedPage = pages.find(p => p.page_id === selectedPageId) || pages[0];
   const [isApiConfigured, setIsApiConfigured] = useState<boolean | null>(null);
@@ -88,11 +95,13 @@ export const Navbar: React.FC<NavbarProps> = ({
   }, []);
   
   
+  // When Facebook is connected the chat simulator is pointless (the bot answers
+  // real customers) — hide it from the menu entirely, as requested.
   const navItems: Array<{id: string, label: string, icon: any, badge?: string, count?: number, iconColor?: string}> = [
     { id: 'pages_hub', label: 'ศูนย์รวมเพจ (Pages Hub)', icon: Layers, iconColor: 'text-blue-500' },
     { id: 'chat_inbox', label: 'แชท Inbox 💬', icon: Inbox, iconColor: 'text-cyan-500' },
     { id: 'dashboard', label: 'แดชบอร์ด & ยอดขาย', icon: LayoutDashboard, badge: 'PRO', iconColor: 'text-indigo-500' },
-    { id: 'simulator', label: 'จำลองแชท AI ปิดการขาย', icon: MessageSquare, badge: 'TEST', iconColor: 'text-emerald-500' },
+    ...(isFacebookConnected ? [] : [{ id: 'simulator', label: 'จำลองแชท AI ปิดการขาย', icon: MessageSquare, badge: 'TEST', iconColor: 'text-emerald-500' } as any]),
     { id: 'orders', label: 'ออเดอร์ & ขนส่ง (COD)', icon: ShoppingBag, count: totalOrders, iconColor: 'text-amber-500' },
     { id: 'crm', label: 'ฐานข้อมูลลูกค้า CRM', icon: Users, iconColor: 'text-purple-500' },
     { id: 'comments', label: 'จัดการคอมเมนต์ & โพสต์', icon: MessageCircle, iconColor: 'text-sky-500' },
@@ -183,28 +192,27 @@ export const Navbar: React.FC<NavbarProps> = ({
         </div>
       </div>
 
-      {/* Main Nav Header - Responsive layout */}
-      <div className="w-full max-w-[1700px] mx-auto px-3 sm:px-4 lg:px-6 shrink-0">
-        <div className="flex items-center justify-between h-14 gap-2">
-          {/* Logo & Brand */}
-          <div className="flex items-center gap-3 shrink-0">
-            <div className={`w-10 h-10 rounded-xl flex items-center justify-center border ${theme === 'dark' ? 'bg-[#141419] border-indigo-500/30 text-indigo-400 shadow-indigo-950' : 'bg-gradient-to-tr from-indigo-600 to-purple-600 border-indigo-500 text-white shadow-indigo-100'} shadow-md shrink-0`}>
-              <Bot className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="font-black text-base md:text-lg leading-tight tracking-tight flex items-center gap-1.5 text-slate-900 dark:text-zinc-100">
-                  Vorakamol SuperAI <span className="text-[10px] font-mono uppercase bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 px-2 py-0.5 rounded-full border border-indigo-500/20 font-bold">v2.8 PRO</span>
-                </h1>
+        {/* Main Nav Header - Responsive layout */}
+        <div className="w-full max-w-[1700px] mx-auto px-3 sm:px-4 lg:px-6 shrink-0">
+          <div className="flex items-center justify-between h-auto min-h-14 gap-2 flex-wrap">
+            {/* Logo & Brand */}
+            <div className="flex items-center gap-2 sm:gap-3 shrink-0 min-w-0">
+              <div className={`w-9 h-9 sm:w-10 sm:h-10 rounded-xl flex items-center justify-center border ${theme === 'dark' ? 'bg-[#141419] border-indigo-500/30 text-indigo-400 shadow-indigo-950' : 'bg-gradient-to-tr from-indigo-600 to-purple-600 border-indigo-500 text-white shadow-indigo-100'} shadow-md shrink-0`}>
+                <Bot className="w-4 h-4 sm:w-5 sm:h-5" />
               </div>
-              <p className="text-xs text-slate-500 dark:text-zinc-400">ระบบแชทบอท & ปิดการขายอัจฉริยะ ซิงค์ Vercel Database พระเครื่อง • จีน • OTOP • การเกษตร</p>
+              <div className="min-w-0">
+                <h1 className="font-black text-xs sm:text-sm md:text-lg leading-tight tracking-tight flex items-center gap-1.5 text-slate-900 dark:text-zinc-100 truncate">
+                  <span className="truncate">Vorakamol SuperAI</span>
+                  <span className="text-[10px] font-mono uppercase bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 px-2 py-0.5 rounded-full border border-indigo-500/20 font-bold shrink-0 hidden md:inline">v2.8 PRO</span>
+                </h1>
+                <p className="text-[10px] sm:text-xs text-slate-500 dark:text-zinc-400 hidden xl:block truncate max-w-[300px]">ระบบแชทบอท & ปิดการขายอัจฉริยะ</p>
+              </div>
             </div>
-          </div>
 
-          {/* Active Page Selector & Actions */}
-          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+            {/* Active Page Selector & Actions */}
+            <div className="flex items-center gap-1 sm:gap-1.5 lg:gap-2 min-w-0 flex-wrap justify-end">
             {/* Page Selector Dropdown */}
-            <div className={`hidden sm:flex items-center border rounded-xl p-1 ${theme === 'dark' ? 'bg-[#141418] border-zinc-800' : 'bg-slate-100 border-slate-200'}`}>
+            <div className={`hidden md:flex items-center border rounded-xl p-1 ${theme === 'dark' ? 'bg-[#141418] border-zinc-800' : 'bg-slate-100 border-slate-200'}`}>
               <span className="text-xs text-zinc-400 px-2 font-medium flex items-center gap-1.5 shrink-0">
                 <Facebook className="w-3.5 h-3.5 text-[#1877F2]" /> เพจ:
               </span>
@@ -212,7 +220,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 id="page-selector"
                 value={selectedPageId}
                 onChange={e => setSelectedPageId(e.target.value)}
-                className={`text-xs font-medium rounded-lg px-2 py-1 border outline-none cursor-pointer ${
+                className={`text-xs font-medium rounded-lg px-2 py-1 border outline-none cursor-pointer max-w-[150px] ${
                   theme === 'dark'
                     ? 'bg-[#0A0A0C] text-zinc-200 border-zinc-800/80 focus:border-indigo-500'
                     : 'bg-white text-zinc-800 border-slate-200 focus:border-indigo-500'
@@ -227,43 +235,27 @@ export const Navbar: React.FC<NavbarProps> = ({
               </select>
             </div>
 
-            {/* Page Settings Button ("ปุ่มตั้งค่าเพจ") */}
+            {/* Page Settings Button */}
             <button
               id="btn-page-settings"
               onClick={() => onOpenPageSettings(selectedPageId)}
-              className="px-3.5 py-2 bg-indigo-600/15 hover:bg-indigo-600/25 text-indigo-300 hover:text-white text-xs font-bold rounded-xl border border-indigo-500/40 flex items-center gap-1.5 transition-all shadow-sm cursor-pointer shrink-0"
+              className="px-2 sm:px-3.5 py-2 bg-indigo-600/15 hover:bg-indigo-600/25 text-indigo-300 hover:text-white text-xs font-bold rounded-xl border border-indigo-500/40 flex items-center gap-1.5 transition-all shadow-sm cursor-pointer shrink-0"
               title="ตั้งค่าสินค้า, โปรโมชั่น, AI บุคลิก, และ สเต็ปของเพจนี้"
             >
               <Settings className="w-3.5 h-3.5 text-indigo-400" />
-              <span className="hidden sm:inline">ตั้งค่าเพจนี้</span>
+              <span className="hidden lg:inline">ตั้งค่าเพจ</span>
             </button>
 
-            {/* Reset Demo Data Button */}
-            {onResetDemoData && (
-              <button
-                id="btn-reset-demo"
-                onClick={onResetDemoData}
-                className={`px-3 py-2 rounded-xl border text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 shrink-0 ${
-                  theme === 'dark'
-                    ? 'bg-zinc-900 border-zinc-800 text-zinc-300 hover:bg-zinc-800 hover:text-white'
-                    : 'bg-slate-100 border-slate-200 text-slate-700 hover:bg-slate-200'
-                }`}
-                title="ล้างข้อมูลออเดอร์และลูกค้าจำลอง ให้เริ่มต้นเป็น 0 เพื่อรอรับของจริง"
-              >
-                <span>🧹 ล้างข้อมูลจำลอง</span>
-              </button>
-            )}
-
-            {/* Security Lock Button */}
+            {/* Security Lock Button - hidden on small screens */}
             {onLockSystem && (
               <button
                 id="btn-lock-system"
                 onClick={onLockSystem}
-                className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700/80 text-xs font-bold rounded-xl flex items-center gap-1.5 transition-all shadow-xs cursor-pointer shrink-0"
-                title="ล็อคระบบความปลอดภัย (ต้องใส่ PIN เพื่อเข้าใช้งาน)"
+                className="hidden md:flex px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700/80 text-xs font-bold rounded-xl items-center gap-1.5 transition-all shadow-xs cursor-pointer shrink-0"
+                title="ล็อคระบบความปลอดภัย"
               >
                 <ShieldCheck className="w-3.5 h-3.5 text-blue-400" />
-                <span className="hidden md:inline">ล็อคระบบ</span>
+                <span className="hidden xl:inline">ล็อค</span>
               </button>
             )}
 
@@ -276,19 +268,24 @@ export const Navbar: React.FC<NavbarProps> = ({
                   ? 'bg-[#141418] border-zinc-800 text-amber-400 hover:bg-zinc-800'
                   : 'bg-slate-100 border-slate-200 text-zinc-700 hover:bg-slate-200'
               }`}
-              title={theme === 'dark' ? 'เปลี่ยนเป็นโหมดสว่าง (Light Mode)' : 'เปลี่ยนเป็นโหมดมืด (Dark Mode)'}
+              title={theme === 'dark' ? 'โหมดสว่าง' : 'โหมดมืด'}
             >
               {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>
 
-            {/* Facebook Connect Modal Button */}
+            {/* Facebook Connect Button — turns green when connected */}
             <button
               id="btn-quick-connect"
               onClick={onOpenConnectModal}
-              className="px-3.5 py-2 bg-[#1877F2] hover:bg-[#166fe5] text-white text-xs font-bold rounded-xl flex items-center gap-2 transition-all shadow-md shadow-[#1877F2]/25 cursor-pointer shrink-0"
+              className={`px-2.5 sm:px-3.5 py-2 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition-all shadow-md cursor-pointer shrink-0 ${
+                isFacebookConnected
+                  ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-600/25'
+                  : 'bg-[#1877F2] hover:bg-[#166fe5] shadow-[#1877F2]/25'
+              }`}
+              title={isFacebookConnected ? `เชื่อมต่อแล้ว ${connectedPageCount} เพจ` : 'เชื่อมต่อเพจ Facebook'}
             >
-              <Facebook className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">เชื่อมต่อ FB</span>
+              {isFacebookConnected ? <CheckCircle2 className="w-3.5 h-3.5" /> : <Facebook className="w-3.5 h-3.5" />}
+              <span className="hidden sm:inline">{isFacebookConnected ? `เชื่อมต่อแล้ว (${connectedPageCount})` : 'เชื่อมต่อ FB'}</span>
             </button>
           </div>
         </div>
