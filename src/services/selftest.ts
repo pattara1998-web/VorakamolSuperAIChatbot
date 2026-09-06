@@ -211,6 +211,17 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     return { detail: 'เข้าสู่ระบบด้วย env credentials สำเร็จ' };
   });
 
+  await run('auth-pin-gate', 'ความปลอดภัย', 'PIN Gate: ปฏิเสธเครื่องที่ไม่ได้ลงทะเบียน', async () => {
+    // ขาด field → 400
+    const missing = await fetchJson(baseUrl, '/api/auth/pin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+    if (missing.status !== 400) throw new Error(`ขาด field ควร 400 ได้ ${missing.status}`);
+    // device_token ปลอม → 401 DEVICE_NOT_TRUSTED (เครื่องแปลกต้องล็อกอินเต็มเสมอ)
+    const fake = await fetchJson(baseUrl, '/api/auth/pin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device_token: PREFIX + 'fake_token_' + Date.now(), pin: '170962' }) });
+    if (fake.status !== 401) throw new Error(`token ปลอม ควร 401 ได้ ${fake.status}`);
+    if (fake.data?.error !== 'DEVICE_NOT_TRUSTED') throw new Error(`error=${fake.data?.error}`);
+    return { detail: 'ปฏิเสธ field ไม่ครบ + ปฏิเสธเครื่องที่ไม่ได้ลงทะเบียน (DEVICE_NOT_TRUSTED)' };
+  });
+
   // ===================== C. DATABASE CRUD =====================
   await run('db-pages-crud', 'ฐานข้อมูล', 'Pages: สร้าง/อ่าน/แก้/ลบ', async () => {
     const id = `${PREFIX}crud_page`;

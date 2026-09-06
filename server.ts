@@ -1124,7 +1124,7 @@ async function startServer() {
   // ================================================================
 
   // Login endpoint
-  app.post('/api/auth/login', (req: Request, res: Response) => {
+  app.post('/api/auth/login', async (req: Request, res: Response) => {
     const { username, password, security_code } = req.body;
     const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || req.socket.remoteAddress || 'unknown';
     const userAgent = req.headers['user-agent'] || '';
@@ -1137,10 +1137,14 @@ async function startServer() {
 
     if (result.success) {
       addLog('INFO', 'AUTH', 'SYSTEM', `🔐 เข้าสู่ระบบสำเร็จ: ${username} จาก IP ${ip} (${result.session?.device_info})`, 'SUCCESS');
+      // ลงทะเบียนเครื่องนี้เป็น "เครื่องที่ไว้ใจ" — ครั้งถัดไปปลดล็อกด้วย PIN สั้นได้
+      const deviceToken = crypto.randomBytes(32).toString('hex');
+      await auth.saveTrustedDevice(deviceToken, { ip, device_info: result.session?.device_info || '' });
       res.json({
         success: true,
         token: result.token,
         session_id: result.session?.session_id,
+        device_token: deviceToken,
         user: {
           id: result.session?.user_id,
           username: result.session?.username,
@@ -1150,6 +1154,39 @@ async function startServer() {
       });
     } else {
       addLog('INFO', 'AUTH', 'SYSTEM', `❌ เข้าสู่ระบบล้มเหลวจาก IP ${ip}: ${result.error}`, 'WARNING');
+      res.status(401).json({ success: false, error: result.error });
+    }
+  });
+
+  // PIN Gate: ปลดล็อกด้วย PIN สั้นจาก "เครื่องที่ไว้ใจ" (เครื่องแปลกต้องล็อกอินเต็ม)
+  app.post('/api/auth/pin', async (req: Request, res: Response) => {
+    const { device_token, pin } = req.body || {};
+    if (!device_token || !pin) {
+      return res.status(400).json({ success: false, error: 'กรุณากรอก PIN ให้ครบถ้วน' });
+    }
+    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || req.socket.remoteAddress || 'unknown';
+    const userAgent = req.headers['user-agent'] || '';
+
+    const trusted = await auth.isTrustedDevice(device_token);
+    if (!trusted) {
+      return res.status(401).json({ success: false, error: 'DEVICE_NOT_TRUSTED' });
+    }
+    const result = await auth.loginWithDevicePin(device_token, pin, ip, userAgent);
+    if (result.success) {
+      addLog('INFO', 'AUTH', 'SYSTEM', `🔓 ปลดล็อกด้วย PIN สำเร็จ จาก IP ${ip} (${result.session?.device_info})`, 'SUCCESS');
+      res.json({
+        success: true,
+        token: result.token,
+        session_id: result.session?.session_id,
+        user: {
+          id: result.session?.user_id,
+          username: result.session?.username,
+          role: result.session?.role
+        },
+        message: 'ปลดล็อกด้วย PIN สำเร็จ'
+      });
+    } else {
+      addLog('INFO', 'AUTH', 'SYSTEM', `❌ PIN ไม่ถูกต้องจาก IP ${ip}`, 'WARNING');
       res.status(401).json({ success: false, error: result.error });
     }
   });

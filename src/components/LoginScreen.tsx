@@ -34,7 +34,9 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess, theme 
         localStorage.setItem('superai_session_id', data.session_id);
         localStorage.setItem('superai_token', data.token);
         localStorage.setItem('superai_user', JSON.stringify(data.user));
-        localStorage.setItem('fb_chatbot_unlocked', 'true');
+        if (data.device_token) {
+          localStorage.setItem('fb_chatbot_device_token', data.device_token);
+        }
         onLoginSuccess(data);
       } else {
         setError(data.error || 'เข้าสู่ระบบไม่สำเร็จ');

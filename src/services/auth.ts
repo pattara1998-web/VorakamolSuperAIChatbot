@@ -132,6 +132,11 @@ export function authenticateUser(username: string, password: string, securityCod
   }
 
   // Success - create session
+  const { session, token } = createSession(ip, userAgent);
+  return { success: true, session, token };
+}
+
+function createSession(ip: string, userAgent: string): { session: UserSession; token: string } {
   recordLoginAttempt(ip, true);
   const sessionId = generateSessionId();
   const token = generateToken();
@@ -153,8 +158,7 @@ export function authenticateUser(username: string, password: string, securityCod
   };
 
   activeSessions.set(sessionId, session);
-
-  return { success: true, session, token };
+  return { session, token };
 }
 
 export function validateSession(sessionId: string): UserSession | null {
@@ -240,3 +244,73 @@ setInterval(() => {
     }
   }
 }, 5 * 60 * 1000); // Every 5 minutes
+
+// ================================================================
+// TRUSTED DEVICE + PIN GATE
+// เครื่องที่เคยล็อกอินสำเร็จ = "เครื่องที่ไว้ใจ" — ครั้งถัดไปปลดล็อกด้วย PIN สั้น
+// เครื่องแปลก = ต้องล็อกอินเต็มรูปแบบเสมอ
+// รายการเครื่องที่ไว้ใจเก็บถาวรใน PostgreSQL (settings) — รอดจาก restart
+// ================================================================
+const PIN_HASH = process.env.ADMIN_PIN_HASH || ADMIN_CREDENTIAL_HASHES.security_code; // PIN เริ่มต้น = รหัสความปลอดภัยเดิม
+const DEVICE_SALT = 'superai_device_salt_2026';
+const TRUSTED_DEVICE_PREFIX = 'trusted_device_';
+
+function hashDeviceToken(token: string): string {
+  return crypto.createHash('sha256').update(token + DEVICE_SALT).digest('hex');
+}
+
+export function verifyPin(pin: string): boolean {
+  return safeCompare(hashPassword(pin), PIN_HASH);
+}
+
+export async function saveTrustedDevice(deviceToken: string, info: { ip: string; device_info: string }): Promise<void> {
+  const { setSetting } = await import('./database.js');
+  setSetting(TRUSTED_DEVICE_PREFIX + hashDeviceToken(deviceToken), JSON.stringify({
+    ip: info.ip,
+    device_info: info.device_info,
+    created_at: new Date().toISOString(),
+    last_used: new Date().toISOString()
+  }));
+}
+
+export async function isTrustedDevice(deviceToken: string): Promise<boolean> {
+  const { getSetting } = await import('./database.js');
+  const rec = await getSetting(TRUSTED_DEVICE_PREFIX + hashDeviceToken(deviceToken));
+  return Boolean(rec);
+}
+
+export async function touchTrustedDevice(deviceToken: string): Promise<void> {
+  const { getSetting, setSetting } = await import('./database.js');
+  const key = TRUSTED_DEVICE_PREFIX + hashDeviceToken(deviceToken);
+  const rec = await getSetting(key);
+  if (rec) {
+    try {
+      const parsed = JSON.parse(rec);
+      parsed.last_used = new Date().toISOString();
+      setSetting(key, JSON.stringify(parsed));
+    } catch { /* non-critical */ }
+  }
+}
+
+/**
+ * ปลดล็อกด้วย PIN จากเครื่องที่ไว้ใจ: ตรวจว่าเครื่องนี้เคยล็อกอินสำเร็จ +
+ * PIN ถูกต้อง แล้วออก session เต็มรูปแบบ (เหมือนล็อกอินปกติ)
+ */
+export async function loginWithDevicePin(deviceToken: string, pin: string, ip: string, userAgent: string): Promise<{ success: boolean; session?: UserSession; token?: string; error?: string }> {
+  const { allowed, lockedUntil } = checkLoginAttempts(ip);
+  if (!allowed) {
+    const minutesLeft = Math.ceil(((lockedUntil || 0) - Date.now()) / 60000);
+    return { success: false, error: `กรอก PIN เกินจำนวนครั้งที่กำหนด กรุณารอ ${minutesLeft} นาที` };
+  }
+  if (!deviceToken) return { success: false, error: 'DEVICE_NOT_TRUSTED' };
+  if (!(await isTrustedDevice(deviceToken))) {
+    return { success: false, error: 'DEVICE_NOT_TRUSTED' };
+  }
+  if (!verifyPin(pin)) {
+    recordLoginAttempt(ip, false);
+    return { success: false, error: 'PIN ไม่ถูกต้อง กรุณาลองใหม่อีกครั้ง' };
+  }
+  const { session, token } = createSession(ip, userAgent);
+  await touchTrustedDevice(deviceToken);
+  return { success: true, session, token };
+}

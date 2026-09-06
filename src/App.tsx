@@ -48,10 +48,12 @@ export default function App() {
   const [isSelfTestOpen, setIsSelfTestOpen] = useState(false);
   const [settingsPageId, setSettingsPageId] = useState<string>('AMULET_PAGE_ID');
   const [theme, setTheme] = useState<'dark' | 'light'>('light');
-  const [isLocked, setIsLocked] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return true;
-    return localStorage.getItem('fb_chatbot_unlocked') !== 'true';
-  });
+  // ทุกครั้งที่เปิดหน้าเว็บ = ต้องผ่าน gate เสมอ (กันคนนอก)
+  // เครื่องที่ไว้ใจ → กรอก PIN สั้น | เครื่องแปลก → ล็อกอินเต็มรูปแบบ
+  const [isLocked, setIsLocked] = useState<boolean>(true);
+  const [pinGateMode, setPinGateMode] = useState<boolean>(() =>
+    typeof window !== 'undefined' && Boolean(localStorage.getItem('fb_chatbot_device_token'))
+  );
 
   // Browser cache is only an offline convenience. The server remains the source of truth.
   const loadLocal = <T,>(key: string, fallback: T): T => {
@@ -143,7 +145,7 @@ export default function App() {
 
   // Lock the system
   const handleLockSystem = () => {
-    localStorage.removeItem('fb_chatbot_unlocked');
+    setPinGateMode(Boolean(localStorage.getItem('fb_chatbot_device_token')));
     setIsLocked(true);
   };
 
@@ -690,14 +692,26 @@ export default function App() {
     (lastModalPageRef.current?.page_id === settingsPageId ? lastModalPageRef.current : null) ||
     pages[0];
 
-  // If system is locked - show login screen
+  // If system is locked - show the gate:
+  // เครื่องที่ไว้ใจ (มี device_token) → PIN gate | เครื่องแปลก → ล็อกอินเต็ม
   if (isLocked) {
+    if (pinGateMode) {
+      return (
+        <SecurityLockScreen
+          theme={theme}
+          onUnlock={() => setIsLocked(false)}
+          onFullLogin={() => {
+            localStorage.removeItem('fb_chatbot_device_token');
+            localStorage.removeItem('superai_session_id');
+            localStorage.removeItem('superai_token');
+            setPinGateMode(false); // switch to full login screen
+          }}
+        />
+      );
+    }
     return (
       <LoginScreen
-        onLoginSuccess={(sessionData) => {
-          setIsLocked(false);
-          localStorage.setItem('fb_chatbot_unlocked', 'true');
-        }}
+        onLoginSuccess={() => setIsLocked(false)}
         theme={theme}
       />
     );
