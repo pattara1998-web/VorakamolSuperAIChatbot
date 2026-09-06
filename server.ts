@@ -4057,7 +4057,7 @@ ${JSON.stringify((page.product?.promotions || [
         }
         // Provider-aware AI call: capped by the timeout race inside
         // generateAiJson (primary model + fast retry) before any fallback.
-        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.35, maxOutputTokens: 1024, mediaParts });
+        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.5, maxOutputTokens: 1024, mediaParts });
         const selectedModel = usedModel;
 
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
