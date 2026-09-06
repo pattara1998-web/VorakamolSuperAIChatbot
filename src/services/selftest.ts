@@ -439,14 +439,20 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     try {
       const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', (webhookRequest({ id: pageId, messaging: [{ sender: { id: sender }, message: { mid: PREFIX + 'm_' + Date.now(), text: 'ราคาเท่าไหร่คะ' } }] })));
       if (status !== 200) throw new Error(`webhook HTTP ${status}`);
-      // Give the async pipeline (AI call or fallback) time to finish
-      await new Promise(r => setTimeout(r, 6000));
-      const logs = (await fetchJson(baseUrl, '/api/data')).data.logs;
-      const msgLog = logs.find((l: any) => l.sender_id === sender && l.type === 'MESSAGE');
+      // Poll for the reply log: a real AI call (Gemini/OpenAI) can take 3-15s
+      // on production — a fixed short sleep fails healthy slow replies.
+      let logs: any[] = [];
+      let msgLog: any = null;
+      let aiLog: any = null;
+      for (let attempt = 0; attempt < 10 && !aiLog; attempt++) {
+        await new Promise(r => setTimeout(r, 2000));
+        logs = (await fetchJson(baseUrl, '/api/data')).data.logs;
+        msgLog = msgLog || logs.find((l: any) => l.sender_id === sender && l.type === 'MESSAGE');
+        aiLog = logs.find((l: any) => l.sender_id === sender && (l.type === 'AI_REPLY'));
+      }
       if (!msgLog) throw new Error('ไม่พบ log รับข้อความของลูกค้า');
       const intentMatch = String(msgLog.content).match(/\[intent:(\w+)\]/);
-      const aiLog = logs.find((l: any) => l.sender_id === sender && (l.type === 'AI_REPLY'));
-      if (!aiLog) throw new Error('ไม่พบ log การตอบกลับ (AI หรือ fallback)');
+      if (!aiLog) throw new Error('ไม่พบ log การตอบกลับ (รอ 20 วินาทีแล้ว — AI อาจใช้เวลานานผิดปกติ)');
       const isFallback = String(aiLog.content).includes('สำรอง');
       const latencyMatch = String(aiLog.content).match(/(\d+)ms/);
       return {

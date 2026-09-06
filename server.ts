@@ -4381,6 +4381,18 @@ ${JSON.stringify(categorySummary, null, 2)}
 
     dbBridge.addSSEClient(clientId, res, pageId);
     addLog('INFO', 'SSE', 'SYSTEM', `SSE client connected: ${clientId} (page: ${pageId || 'ALL'})`, 'INFO');
+
+    // Heartbeat: proxies (Render/Cloudflare/nginx) kill idle connections after
+    // ~60-100s, which forced the browser to reconnect constantly. A comment
+    // ping every 25s keeps the stream alive; EventSource ignores comments.
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(': ping' + String.fromCharCode(10) + String.fromCharCode(10));
+      } catch {
+        clearInterval(heartbeat);
+      }
+    }, 25000);
+    res.on('close', () => clearInterval(heartbeat));
   });
 
   // ================================================================

@@ -29,6 +29,7 @@ export function useSSE(options: SSEOptions) {
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const reconnectDelayRef = useRef(1500);
   const disposedRef = useRef(false);
 
   useEffect(() => {
@@ -56,6 +57,7 @@ export function useSSE(options: SSEOptions) {
 
       es.addEventListener('connected', (e: MessageEvent) => {
         setConnected(true);
+        reconnectDelayRef.current = 1500; // healthy again -> reset backoff
         const data = safeParse(e);
         if (data) console.log('[SSE] Connected:', data.clientId);
       });
@@ -102,8 +104,10 @@ export function useSSE(options: SSEOptions) {
         setConnected(false);
         es.close();
         if (!disposedRef.current) {
-          // Auto-reconnect after 3 seconds
-          reconnectTimerRef.current = setTimeout(connect, 3000);
+          // Auto-reconnect with backoff: quick first (1.5s), then up to 15s —
+          // a dropped proxy connection recovers instantly without spam.
+          reconnectDelayRef.current = Math.min(reconnectDelayRef.current * 2, 15000);
+          reconnectTimerRef.current = setTimeout(connect, reconnectDelayRef.current);
         }
       };
     };

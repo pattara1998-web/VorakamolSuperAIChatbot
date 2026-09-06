@@ -54,7 +54,7 @@ export const AiAdminCopilot: React.FC<AiAdminCopilotProps> = ({
     {
       id: 'welcome',
       role: 'assistant',
-      text: 'สวัสดีค่ะท่านเจ้าของธุรกิจ! ดิฉันคือ Vorakamol SuperAI Copilot ยินดีช่วยเหลือท่านสรุปยอดขายแยกตามหมวดสินค้า ตรวจสอบปัญหาฉุกเฉิน คัดกรองลูกค้า VIP หรือสั่งการงานระบบได้ตลอด 24 ชม. ค่ะ สามารถพิมพ์หรือกดปุ่มไมค์ 🎙️ เพื่อพูดได้เลยนะคะ',
+      text: 'สวัสดีค่ะท่านเจ้าของธุรกิจ! ดิฉันคือ AI ผู้ช่วยส่วนตัวของ Vorakamol SuperAI ยินดีช่วยเหลือท่านสรุปยอดขายแยกตามหมวดสินค้า ตรวจสอบปัญหาฉุกเฉิน คัดกรองลูกค้า VIP หรือสั่งการงานระบบได้ตลอด 24 ชม. ค่ะ สามารถพิมพ์หรือกดปุ่มไมค์ 🎙️ เพื่อพูดได้เลยนะคะ',
       timestamp: new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
     }
   ]);
@@ -214,7 +214,7 @@ export const AiAdminCopilot: React.FC<AiAdminCopilotProps> = ({
             </div>
             <div className="text-left pr-1 hidden sm:block">
               <div className="text-xs font-black tracking-wide flex items-center gap-1.5">
-                <span>AI ผู้ช่วยส่วนตัว Copilot</span>
+                <span>AI ผู้ช่วยส่วนตัว</span>
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
               </div>
               <div className="text-[10px] text-indigo-200">ถามยอดขาย • ตรวจปัญหา • สั่งการระบบ</div>
@@ -241,7 +241,7 @@ export const AiAdminCopilot: React.FC<AiAdminCopilotProps> = ({
               </div>
               <div>
                 <h3 className="font-bold text-xs sm:text-sm flex items-center gap-1.5">
-                  Vorakamol SuperAI Copilot
+                  Vorakamol SuperAI — ผู้ช่วยส่วนตัว
                   <span className="px-1.5 py-0.2 bg-indigo-500/30 text-indigo-200 text-[9px] font-mono rounded font-bold border border-indigo-400/30">
                     v2.7 PRO
                   </span>
