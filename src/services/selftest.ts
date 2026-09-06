@@ -477,10 +477,13 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
       if (!aiLog) throw new Error('ไม่พบ log การตอบกลับ (รอ 20 วินาทีแล้ว — AI อาจใช้เวลานานผิดปกติ)');
       const isFallback = String(aiLog.content).includes('สำรอง');
       const latencyMatch = String(aiLog.content).match(/(\d+)ms/);
+      // ดึงสาเหตุจริงที่ AI ล้มเหลวจาก log เพื่อวินิจฉัยได้ทันที
+      const errMatch = String(aiLog.content).match(/AI Error: (.+)$/);
+      const realError = errMatch ? errMatch[1].slice(0, 160) : '';
       return {
         status: isFallback ? 'WARN' : 'PASS',
-        detail: `ใช้เพจ: ${realPage?.page_name || 'selftest_page'} • intent=${intentMatch?.[1] || '?'} • ${isFallback ? 'ตอบด้วย template สำรอง (AI call ล้มเหลว)' : 'AI ตอบจริง'} • latency ${latencyMatch?.[1] || '?'}ms`,
-        fixHint: isFallback ? 'ดู log AI Error ในหน้าระบบ — AI call ล้มเหลว (key/โมเดล/โควต้า)' : undefined
+        detail: `ใช้เพจ: ${realPage?.page_name || 'selftest_page'} • intent=${intentMatch?.[1] || '?'} • ${isFallback ? `ตอบด้วย template สำรอง — สาเหตุ: ${realError || 'ไม่ทราบ'}` : `AI ตอบจริง (${String(aiLog.content).match(/\(([^|]+)\|/)?.[1]?.trim() || 'โมเดลจาก prompt'} )`} • latency ${latencyMatch?.[1] || '?'}ms`,
+        fixHint: isFallback ? `สาเหตุจริง: ${realError || 'ดู log AI Error ในหน้าระบบ'}` : undefined
       };
     } finally {
       if (!usingRealPage) removeTestPage(pageId);

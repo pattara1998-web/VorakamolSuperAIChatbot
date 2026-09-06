@@ -1069,6 +1069,32 @@ function isModelOrQuotaError(err: any): boolean {
   return /404|NOT_FOUND|no longer available|not supported|not found|429|RESOURCE_EXHAUSTED|quota|does not have access|permission/i.test(msg);
 }
 
+/**
+ * หาโมเดล Gemini ที่ generate ได้จริงสำหรับคีย์ปัจจุบัน (สำคัญมากกับคีย์ฟรี:
+ * list โมเดลเห็น แต่ generate อาจโดนปิดสิทธิ์) — ยิงด้วย config เดียวกับงานจริง
+ * (JSON schema) แล้วคืนตัวแรกที่ใช้ได้ โดยลองโมเดลที่ตั้งไว้ก่อนเสมอ
+ */
+async function probeBestGeminiModel(): Promise<string> {
+  const validator = getGemini();
+  const configured = getProviderModel('GEMINI');
+  const candidates = [...new Set([configured, DEFAULT_GEMINI_MODEL, ...GEMINI_GENERATION_FALLBACKS])].filter(Boolean);
+  let lastErr: any = null;
+  for (const m of candidates) {
+    try {
+      await validator.models.generateContent({
+        model: m,
+        contents: 'Reply only: OK',
+        config: { responseMimeType: 'application/json', responseSchema: AI_REPLY_SCHEMA, maxOutputTokens: 8 }
+      });
+      return m;
+    } catch (err: any) {
+      lastErr = err;
+      if (!isModelOrQuotaError(err)) throw err;
+    }
+  }
+  throw lastErr || new Error('ไม่พบโมเดลที่ใช้ได้เลย');
+}
+
 // Shared Gemini response schema for the chat-brain reply (kept in one place so
 // the Gemini path and the OpenAI-compatible JSON instruction stay in sync).
 const AI_REPLY_SCHEMA = {
@@ -1118,6 +1144,30 @@ async function startServer() {
 
   // Load the persisted store (PostgreSQL) before accepting any traffic.
   await loadPersistedData();
+
+  // AUTO: เลือกโมเดล Gemini ที่ดีที่สุดที่คีย์ใช้ได้จริงให้เป็นค่าเริ่มต้น
+  // (ผู้ใช้ไม่ต้องทำอะไร — ถ้าไม่พอใจค่อยไปเลือกเองในหน้าตั้งค่า AI)
+  const autoProbeGemini = async (trigger: string) => {
+    if (getCurrentProvider() !== 'GEMINI') return;
+    if (!(db.settings.geminiApiKey || process.env.GEMINI_API_KEY)) return;
+    try {
+      const best = await probeBestGeminiModel();
+      if (db.settings.geminiModel !== best) {
+        const previous = db.settings.geminiModel;
+        db.settings.geminiModel = best;
+        persistData();
+        addLog('INFO', 'AI', 'SYSTEM', `🤖 เลือกโมเดลที่ดีที่สุดที่คีย์ใช้ได้อัตโนมัติ: ${best} (เดิม: ${previous || 'ไม่ได้ตั้ง'}) [${trigger}]`, 'SUCCESS');
+        console.log(`[AI] Auto-selected working model: ${best} (was ${previous || 'unset'}) [${trigger}]`);
+      } else {
+        console.log(`[AI] Model verified working: ${best} [${trigger}]`);
+      }
+    } catch (err: any) {
+      console.warn(`[AI] Auto model probe failed [${trigger}]:`, String(err?.message || err).slice(0, 150));
+      addLog('INFO', 'AI', 'SYSTEM', `⚠️ ตรวจโมเดล Gemini อัตโนมัติไม่สำเร็จ: ${String(err?.message || err).slice(0, 120)}`, 'WARNING');
+    }
+  };
+  autoProbeGemini('startup');
+  setInterval(() => autoProbeGemini('periodic-30min'), 30 * 60 * 1000);
 
   // CORS middleware for iframe & cross-origin safety
   app.use((req, res, next) => {
@@ -2053,21 +2103,19 @@ async function startServer() {
       let note = '';
       if (p === 'GEMINI') {
         // คีย์ฟรีมักไม่มีสิทธิ์ generate กับโมเดลใหม่ — ยิงจริงหาโมเดลที่ใช้ได้
-        const validator = new GoogleGenAI({ apiKey: getProviderApiKey('GEMINI') });
-        const cand = [...new Set([chosenModel, DEFAULT_GEMINI_MODEL, ...GEMINI_GENERATION_FALLBACKS].filter(Boolean))];
-        let workingModel = '';
-        for (const m of cand) {
-          try {
-            await validator.models.generateContent({ model: m, contents: 'Reply only: OK', config: { maxOutputTokens: 2 } });
-            workingModel = m;
-            break;
-          } catch (e: any) {
-            if (!isModelOrQuotaError(e)) throw e;
+        // (ลองโมเดลที่ผู้ใช้เลือกก่อน ถ้าใช้ไม่ได้ระบบเลือกตัวที่ดีที่สุดให้เอง)
+        const staged = chosenModel;
+        if (staged) db.settings.geminiModel = staged;
+        const previous = staged || db.settings.geminiModel;
+        try {
+          chosenModel = await probeBestGeminiModel();
+          if (staged && chosenModel !== staged) {
+            note = ` (โมเดลที่เลือกไว้คีย์ฟรีใช้ไม่ได้ — ระบบเลือก ${chosenModel} ให้อัตโนมัติ)`;
           }
+        } catch (err: any) {
+          db.settings.geminiModel = previous;
+          throw new Error(`คีย์นี้ไม่สามารถใช้โมเดลใดได้เลย: ${String(err?.message || err).slice(0, 120)}`);
         }
-        if (!workingModel) throw new Error('คีย์นี้ไม่สามารถใช้โมเดลใดได้เลย (ตรวจสอบโควต้า/สิทธิ์)');
-        chosenModel = workingModel;
-        if (chosenModel !== model) note = ` (โมเดลที่เลือกไว้คีย์ฟรีใช้ไม่ได้ — ระบบเลือก ${workingModel} ให้อัตโนมัติ)`;
       }
       if (chosenModel) {
         (db.settings as any)[info.modelSetting] = chosenModel;
