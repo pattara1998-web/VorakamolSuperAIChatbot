@@ -1295,6 +1295,60 @@ async function startServer() {
     }
   });
 
+  // สั่งส่งรายงานทันที (ปุ่มทดสอบในแดชบอร์ด)
+  app.post('/api/reports/send-now', async (req: Request, res: Response) => {
+    const scope = (req.body || {}).scope === 'interval' ? 'interval' : 'daily';
+    try {
+      // reuse buildExecutiveReport จาก scheduler (ประกาศใน closure ของ startServer ไม่ได้
+      // จึงสร้าง text ตรงนี้ด้วยตรรกะเดียวกัน)
+      const dateStr = new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(0, 10);
+      const expenses = await dbService.getExpensesForDate(dateStr);
+      const adSpend = expenses.reduce((s: number, e: any) => s + (Number(e.ad_spend) || 0), 0);
+      const shipPaid = expenses.reduce((s: number, e: any) => s + (Number(e.shipping_cost) || 0), 0);
+      const otherCost = expenses.reduce((s: number, e: any) => s + (Number(e.other_cost) || 0), 0);
+      const todayOrders = db.orders.filter(o => String(o.created_at || '').startsWith(dateStr) && !o.is_cancelled);
+      const revenue = todayOrders.reduce((s: number, o: any) => s + (Number(o.total_amount) || 0), 0);
+      let productCost = 0;
+      for (const o of todayOrders) {
+        const page = db.pages.find(p => p.page_id === o.page_id);
+        productCost += (Number((page?.product as any)?.cost_price) || 0) * (Number(o.quantity) || 1);
+      }
+      const profit = revenue - productCost - adSpend - otherCost;
+      const text = `${scope === 'daily' ? '📊 รายงานผู้บริหารประจำวัน' : '⏱️ รายงานย่อ'} — ${dateStr}
+` +
+        `🧾 ยอดขายวันนี้: ฿${revenue.toLocaleString()} (${todayOrders.length} ออเดอร์)
+` +
+        `📦 ต้นทุน: ฿${productCost.toLocaleString()} | 📣 แอด: ฿${adSpend.toLocaleString()} | 🚚 ส่ง: ฿${shipPaid.toLocaleString()} | 🧮 อื่นๆ: ฿${otherCost.toLocaleString()}
+` +
+        `${profit >= 0 ? '✅' : '⚠️'} กำไรสุทธิวันนี้: ฿${profit.toLocaleString()}`;
+
+      // ส่งผ่านช่องทางที่แต่ละเพจตั้งไว้ (Telegram/LINE)
+      let sent = 0;
+      const seen = new Set<string>();
+      for (const page of db.pages) {
+        if (!page.is_active) continue;
+        const ch = (page as any).notification_channel || 'NONE';
+        if (ch === 'NONE') continue;
+        try {
+          if ((ch === 'TELEGRAM' || ch === 'BOTH') && page.telegram_bot_token && page.telegram_chat_id && !seen.has('tg_' + page.telegram_chat_id)) {
+            seen.add('tg_' + page.telegram_chat_id);
+            await deliverTelegram(page, text);
+            sent++;
+          }
+          if ((ch === 'LINE' || ch === 'BOTH') && page.line_notify_token && !seen.has('ln_' + page.line_notify_token)) {
+            seen.add('ln_' + page.line_notify_token);
+            await deliverLine(page, text);
+            sent++;
+          }
+        } catch { /* skip */ }
+      }
+      addLog('INFO', 'REPORT', 'SYSTEM', `📤 ส่งรายงานทันที (${scope}) สำเร็จ ${sent} ช่องทาง`, sent > 0 ? 'SUCCESS' : 'WARNING');
+      res.json({ success: true, sent, message: `ส่งรายงานแล้ว ${sent} ช่องทาง (Telegram/LINE ของเพจที่ตั้งค่าไว้)` });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: `ส่งไม่สำเร็จ: ${err.message}` });
+    }
+  });
+
   // Logout endpoint
   app.post('/api/auth/logout', (req: Request, res: Response) => {
     const sessionId = req.headers['x-session-id'] as string;
@@ -2185,6 +2239,93 @@ async function startServer() {
         };
       }).filter(p => p.revenue > 0 || p.adSpend > 0)
     });
+  });
+
+  // ================================================================
+  // DAILY EXPENSE REMINDER + AUTO EXECUTIVE REPORT SCHEDULER
+  // ================================================================
+
+  // เพจที่ "มีกิจกรรมวันนี้" (มีแชททักเข้า หรือ มีออเดอร์) + สถานะกรอกค่าใช้จ่าย
+  // ใช้เด้งเตือนกรอกค่าแอด/ค่าส่ง — เพจที่เงียบไม่โผล่
+  app.get('/api/expenses/reminder', async (req: Request, res: Response) => {
+    const today = new Date().toISOString().slice(0, 10);
+
+    // เพจที่มีลูกค้าแชทเข้าวันนี้
+    const chatRows = await dbService.executeRaw(
+      "SELECT DISTINCT page_id FROM chat_history WHERE created_at >= ? AND role = 'customer'",
+      [today]
+    );
+    const chatPages = new Set(chatRows.map(r => r.page_id));
+    // เพจที่มีออเดอร์วันนี้
+    for (const o of db.orders) {
+      if (String(o.created_at || '').startsWith(today) && o.page_id) chatPages.add(o.page_id);
+    }
+
+    const pages = [...chatPages]
+      .map(pid => db.pages.find(p => p.page_id === pid))
+      .filter(Boolean)
+      .map(async p => {
+        const e = await dbService.getPageExpense(p!.page_id, today).catch(() => undefined);
+        const ordersToday = db.orders.filter(o => o.page_id === p!.page_id && String(o.created_at || '').startsWith(today));
+        const revenueToday = ordersToday.reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
+        const msgToday = await dbService.executeRaw(
+          'SELECT COUNT(*) AS cnt FROM chat_history WHERE page_id = ? AND created_at >= ? AND role = ?',
+          [p!.page_id, today, 'customer']
+        ).catch(() => [{ cnt: 0 }] as any[]);
+        return {
+          page_id: p!.page_id,
+          page_name: p!.page_name,
+          orders_today: ordersToday.length,
+          revenue_today: revenueToday,
+          chats_today: Number((msgToday[0] as any)?.cnt) || 0,
+          filled: Boolean(e) && ((Number(e?.ad_spend) || 0) > 0 || (Number(e?.shipping_cost) || 0) > 0 || (Number(e?.other_cost) || 0) > 0 || e?.note),
+          ad_spend: Number(e?.ad_spend) || 0,
+          shipping_cost: Number(e?.shipping_cost) || 0,
+          other_cost: Number(e?.other_cost) || 0
+        };
+      });
+
+    res.json({ success: true, date: today, pages: await Promise.all(pages) });
+  });
+
+  // ── ตั้งค่าตารางรายงานอัตโนมัติ (เก็บใน settings — รอด restart) ──
+  const DEFAULT_REPORT_SCHEDULE = {
+    daily: { enabled: true, time: '00:00' },      // รายงานผู้บริหาร (default เที่ยงคืน)
+    interval: { enabled: false, every_hours: 3 }   // รายงานย่อทุก N ชั่วโมง (default ปิด)
+  };
+
+  const getReportSchedule = (): any => {
+    try {
+      const raw = activeReportScheduleCache;
+      if (raw) return raw;
+    } catch { /* ignore */ }
+    return { ...DEFAULT_REPORT_SCHEDULE };
+  };
+
+  app.get('/api/reports/schedule', async (req: Request, res: Response) => {
+    const saved = await dbService.getSetting('report_schedule');
+    let cfg = { ...DEFAULT_REPORT_SCHEDULE };
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        cfg = { daily: { ...cfg.daily, ...parsed.daily }, interval: { ...cfg.interval, ...parsed.interval } };
+      } catch { /* default */ }
+    }
+    res.json({ success: true, schedule: cfg, last_daily_date: await dbService.getSetting('report_last_daily_date') || '', last_interval_ts: await dbService.getSetting('report_last_interval_ts') || '' });
+  });
+
+  app.post('/api/reports/schedule', async (req: Request, res: Response) => {
+    const { daily, interval } = req.body || {};
+    const cfg: any = { ...DEFAULT_REPORT_SCHEDULE };
+    if (daily && typeof daily === 'object') {
+      cfg.daily = { enabled: Boolean(daily.enabled), time: /^\d{2}:\d{2}$/.test(String(daily.time || '')) ? daily.time : '00:00' };
+    }
+    if (interval && typeof interval === 'object') {
+      cfg.interval = { enabled: Boolean(interval.enabled), every_hours: Math.min(24, Math.max(1, Number(interval.every_hours) || 3)) };
+    }
+    await dbService.setSetting('report_schedule', JSON.stringify(cfg));
+    activeReportScheduleCache = cfg;
+    res.json({ success: true, schedule: cfg });
   });
 
   // ================================================================
@@ -6191,9 +6332,143 @@ ${String(rawText).slice(0, 12000)}
   }
 }
 
-startServer().catch(err => {
-  console.error('Fatal server startup error:', err);
-});
+let activeReportScheduleCache: any = null;
+
+startServer()
+  .then(async () => {
+  // ── Auto Executive Report Scheduler (ตรวจทุก 60 วินาที เวลาไทย UTC+7) ──
+  const THAI_OFFSET_MS = 7 * 3600 * 1000;
+  const thaiNow = () => {
+    const d = new Date(Date.now() + THAI_OFFSET_MS);
+    return {
+      date: d.toISOString().slice(0, 10),
+      time: d.toISOString().slice(11, 16) // HH:MM
+    };
+  };
+
+  const loadSchedule = async () => {
+    try {
+      const saved = await dbService.getSetting('report_schedule');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          daily: { enabled: true, time: '00:00', ...parsed.daily },
+          interval: { enabled: false, every_hours: 3, ...parsed.interval }
+        };
+      }
+    } catch { /* default */ }
+    return { daily: { enabled: true, time: '00:00' }, interval: { enabled: false, every_hours: 3 } };
+  };
+
+  const sendReportToChannels = async (text: string) => {
+    let sent = 0;
+    const seenChats = new Set<string>();
+    for (const page of db.pages) {
+      if (!page.is_active || !Boolean((page as any).is_connected)) continue;
+      const channel = page.notification_channel || 'NONE';
+      if (channel === 'NONE') continue;
+      try {
+        if ((channel === 'TELEGRAM' || channel === 'BOTH') && page.telegram_bot_token && page.telegram_chat_id && !seenChats.has('tg_' + page.telegram_chat_id)) {
+          seenChats.add('tg_' + page.telegram_chat_id);
+          await deliverTelegram(page, text);
+          sent++;
+        }
+        if ((channel === 'LINE' || channel === 'BOTH') && page.line_notify_token && !seenChats.has('ln_' + page.line_notify_token)) {
+          seenChats.add('ln_' + page.line_notify_token);
+          await deliverLine(page, text);
+          sent++;
+        }
+      } catch (err: any) {
+        console.warn('[Report] send failed:', err?.message);
+      }
+    }
+    return sent;
+  };
+
+  const buildExecutiveReport = async (scope: 'daily' | 'interval') => {
+    const dateStr = thaiNow().date;
+    const expenses = await dbService.getExpensesForDate(dateStr);
+    const adSpend = expenses.reduce((s, e) => s + (Number(e.ad_spend) || 0), 0);
+    const shipPaid = expenses.reduce((s, e) => s + (Number(e.shipping_cost) || 0), 0);
+    const otherCost = expenses.reduce((s, e) => s + (Number(e.other_cost) || 0), 0);
+
+    const todayOrders = db.orders.filter(o => String(o.created_at || '').startsWith(dateStr) && !o.is_cancelled);
+    const revenue = todayOrders.reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
+    let productCost = 0;
+    for (const o of todayOrders) {
+      const page = db.pages.find(p => p.page_id === o.page_id);
+      const cost = Number((page?.product as any)?.cost_price) || 0;
+      productCost += cost * (Number(o.quantity) || 1);
+    }
+    const profit = revenue - productCost - adSpend - otherCost;
+    const scopeLabel = scope === 'daily' ? '📊 รายงานผู้บริหารประจำวัน' : '⏱️ รายงานย่ออัตโนมัติ';
+
+    let text = `${scopeLabel} — ${dateStr}\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🧾 ยอดขายวันนี้: ฿${revenue.toLocaleString()} (${todayOrders.length} ออเดอร์)\n` +
+      `📦 ต้นทุนสินค้า: ฿${productCost.toLocaleString()}\n` +
+      `📣 งบแอด: ฿${adSpend.toLocaleString()}\n` +
+      `🚚 ค่าส่งที่จ่าย: ฿${shipPaid.toLocaleString()}\n` +
+      `🧮 ค่าใช้จ่ายอื่น: ฿${otherCost.toLocaleString()}\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `${profit >= 0 ? '✅' : '⚠️'} กำไรสุทธิวันนี้: ฿${profit.toLocaleString()}\n`;
+
+    // รายเพจที่มียอด/งบ
+    const perPage = db.pages.map(p => {
+      const po = todayOrders.filter(o => o.page_id === p.page_id);
+      const rev = po.reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
+      const e = expenses.find(x => x.page_id === p.page_id);
+      return { name: p.page_name, rev, orders: po.length, ad: Number(e?.ad_spend) || 0 };
+    }).filter(x => x.rev > 0 || x.ad > 0).sort((a, b) => b.rev - a.rev).slice(0, 8);
+    if (perPage.length) {
+      text += `── รายเพจ ──\n`;
+      for (const x of perPage) {
+        text += `• ${x.name}: ฿${x.rev.toLocaleString()} (${x.orders} ออเดอร์ | แอด ฿${x.ad.toLocaleString()})\n`;
+      }
+    }
+    if (scope === 'daily') {
+      const allProfit = db.orders.filter(o => !o.is_cancelled).reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
+      text += `━━━━━━━━━━━━━━━━━━\n💰 ยอดขายรวมทุกกิจการ (ทั้งหมด): ฿${allProfit.toLocaleString()}\n`;
+    }
+    return text;
+  };
+
+  const runScheduledCheck = async () => {
+    try {
+      const cfg = await loadSchedule();
+      const { date, time } = thaiNow();
+
+      if (cfg.daily.enabled && cfg.daily.time === time) {
+        const lastDate = await dbService.getSetting('report_last_daily_date');
+        if (lastDate !== date) {
+          await dbService.setSetting('report_last_daily_date', date);
+          const text = await buildExecutiveReport('daily');
+          const sent = await sendReportToChannels(text);
+          addLog('INFO', 'REPORT', 'SYSTEM', `📊 ส่งรายงานผู้บริหารรายวันแล้ว (${sent} ช่องทาง)`, 'SUCCESS');
+        }
+      }
+
+      if (cfg.interval.enabled) {
+        const everyMs = cfg.interval.every_hours * 3600 * 1000;
+        const lastTs = Number(await dbService.getSetting('report_last_interval_ts')) || 0;
+        if (Date.now() - lastTs >= everyMs) {
+          await dbService.setSetting('report_last_interval_ts', String(Date.now()));
+          const text = await buildExecutiveReport('interval');
+          const sent = await sendReportToChannels(text);
+          addLog('INFO', 'REPORT', 'SYSTEM', `⏱️ ส่งรายงานย่ออัตโนมัติแล้ว (ทุก ${cfg.interval.every_hours} ชม. | ${sent} ช่องทาง)`, 'SUCCESS');
+        }
+      }
+    } catch (err: any) {
+      console.warn('[Report Scheduler] error:', err?.message);
+    }
+  };
+
+  await runScheduledCheck();
+  setInterval(runScheduledCheck, 60 * 1000);
+})
+  .catch(err => {
+    console.error('Fatal server startup error:', err);
+  });
 
 export { app };
 export default app;

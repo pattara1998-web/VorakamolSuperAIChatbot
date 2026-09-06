@@ -1,5 +1,9 @@
 import React, { useState, useMemo } from 'react';
+import { ExpenseReminderModal } from './ExpenseReminderModal';
 import {
+  Bell,
+  Loader2,
+  Save,
   Trophy,
   TrendingUp,
   ShoppingBag,
@@ -138,6 +142,85 @@ export const SalesDashboardTab: React.FC<SalesDashboardTabProps> = ({
       .finally(() => setAccLoading(false));
   }, []);
   React.useEffect(() => { fetchAccounting(); }, [fetchAccounting]);
+  const dark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? true : false;
+
+  // ── เด้งเตือนกรอกค่าใช้จ่ายรายวัน (ครั้งเดียว/วัน + ปุ่มเปิดเองได้) ──
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const [expenseModalOpen, setExpenseModalOpen] = useState(false);
+  const [expensePendingCount, setExpensePendingCount] = useState<number | null>(null);
+
+  const fetchExpenseReminder = React.useCallback(() => {
+    fetch('/api/expenses/reminder')
+      .then(r => r.json())
+      .then(d => {
+        if (d.success) {
+          const pending = (d.pages || []).filter((p: any) => !p.filled);
+          setExpensePendingCount(pending.length);
+          // เด้งอัตโนมัติวันละครั้ง เมื่อมีเพจรอกรอก
+          if (pending.length > 0 && localStorage.getItem('superai_expense_reminder_' + todayKey) !== 'done') {
+            setExpenseModalOpen(true);
+          }
+        }
+      })
+      .catch(() => {});
+  }, [todayKey]);
+
+  React.useEffect(() => { fetchExpenseReminder(); }, [fetchExpenseReminder]);
+
+  const closeExpenseModal = (dismissForToday = false) => {
+    if (dismissForToday) {
+      try { localStorage.setItem('superai_expense_reminder_' + todayKey, 'done'); } catch { /* noop */ }
+    }
+    setExpenseModalOpen(false);
+    fetchExpenseReminder();
+    fetchAccounting();
+  };
+
+  // ── ตั้งค่ารายงานอัตโนมัติ (ผู้บริหารรายวัน + รายงานย่อทุก N ชม.) ──
+  const [schedule, setSchedule] = useState<any>(null);
+  const [scheduleSaving, setScheduleSaving] = useState(false);
+  const [scheduleSaved, setScheduleSaved] = useState('');
+  const [reportSending, setReportSending] = useState(false);
+  const [reportStatus, setReportStatus] = useState('');
+
+  React.useEffect(() => {
+    fetch('/api/reports/schedule')
+      .then(r => r.json())
+      .then(d => { if (d.success) setSchedule(d.schedule); })
+      .catch(() => {});
+  }, []);
+
+  const saveSchedule = async () => {
+    setScheduleSaving(true); setScheduleSaved('');
+    try {
+      const res = await fetch('/api/reports/schedule', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(schedule)
+      });
+      const r = await res.json();
+      setScheduleSaved(r.success ? '✅ บันทึกตารางรายงานแล้ว — ระบบจะส่งตามเวลาที่ตั้ง (เวลาไทย)' : '❌ ' + (r.message || 'บันทึกไม่สำเร็จ'));
+    } catch { setScheduleSaved('❌ เชื่อมต่อไม่สำเร็จ'); }
+    finally { setScheduleSaving(false); setTimeout(() => setScheduleSaved(''), 5000); }
+  };
+
+  const sendReportNow = async (scope: 'daily' | 'interval') => {
+    setReportSending(true); setReportStatus('กำลังส่ง...');
+    try {
+      const cfg = {
+        daily: { enabled: true, time: schedule?.daily?.time || '00:00' },
+        interval: { enabled: true, every_hours: schedule?.interval?.every_hours || 3 }
+      };
+      await fetch('/api/reports/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+      // บังคับส่งทันที: ตั้ง last sent เป็นค่าว่าง/0 แล้วสั่งรอบตรวจทำงานผ่าน endpoint ใหม่
+      const res = await fetch('/api/reports/send-now', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope })
+      });
+      const r = await res.json();
+      setReportStatus(r.success ? `✅ ${r.message}` : '❌ ' + (r.message || 'ส่งไม่สำเร็จ'));
+    } catch { setReportStatus('❌ เชื่อมต่อไม่สำเร็จ'); }
+    finally { setReportSending(false); setTimeout(() => setReportStatus(''), 6000); }
+  };
   const grossProfitMargin = totalRevenue > 0 ? ((grossProfit / totalRevenue) * 100).toFixed(1) : '0.0';
 
   // Ad Spend & ROAS Metrics (Real Calculations)
@@ -518,6 +601,78 @@ export const SalesDashboardTab: React.FC<SalesDashboardTabProps> = ({
           <p className="text-xs text-slate-500 dark:text-zinc-400">กำลังโหลดข้อมูลบัญชี...</p>
         )}
       </div>
+      {/* ── ปุ่มกรอกค่าใช้จ่ายรายวัน + ตั้งค่ารายงานอัตโนมัติ ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/60 rounded-2xl p-4 flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <p className="text-xs font-bold text-amber-800 dark:text-amber-300 flex items-center gap-1.5">
+              <Bell className="w-3.5 h-3.5" /> ค่าใช้จ่ายวันนี้ (งบแอด/ค่าส่ง)
+              {expensePendingCount !== null && expensePendingCount > 0 && (
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500 text-white">{expensePendingCount} เพจรอกรอก</span>
+              )}
+            </p>
+            <p className="text-[10px] text-amber-700/80 dark:text-amber-400/80 mt-0.5">
+              แสดงเฉพาะเพจที่มีแชท/ออเดอร์เข้าวันนี้ — เพจที่เงียบจะไม่ถูกเด้ง
+            </p>
+          </div>
+          <button
+            onClick={() => setExpenseModalOpen(true)}
+            className="px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold rounded-xl transition-colors shrink-0"
+          >
+            กรอกค่าใช้จ่ายวันนี้
+          </button>
+        </div>
+
+        <div className={`rounded-2xl p-4 border ${dark ? 'bg-[#0F0F12] border-zinc-800' : 'bg-white border-slate-200'}`}>
+          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+            <p className="text-xs font-bold text-slate-800 dark:text-zinc-100 flex items-center gap-1.5">
+              <Send className="w-3.5 h-3.5 text-indigo-500" /> รายงานอัตโนมัติ → Telegram/LINE
+            </p>
+            {scheduleSaved && <span className="text-[10px] font-bold text-emerald-500">{scheduleSaved}</span>}
+          </div>
+          {schedule ? (
+            <div className="space-y-2.5">
+              <div className="flex items-center gap-2 flex-wrap text-[11px]">
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input type="checkbox" checked={schedule.daily.enabled} onChange={e => setSchedule({ ...schedule, daily: { ...schedule.daily, enabled: e.target.checked } })} className="accent-indigo-600" />
+                  <b>รายงานผู้บริหาร</b> เวลา
+                </label>
+                <input type="time" value={schedule.daily.time} onChange={e => setSchedule({ ...schedule, daily: { ...schedule.daily, time: e.target.value } })} className={`rounded-lg px-2 py-1 border text-xs outline-none ${dark ? 'bg-[#16161C] border-zinc-800 text-zinc-100' : 'bg-white border-slate-200'}`} />
+                <span className="text-slate-400">(เวลาไทย — default เที่ยงคืน)</span>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap text-[11px]">
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input type="checkbox" checked={schedule.interval.enabled} onChange={e => setSchedule({ ...schedule, interval: { ...schedule.interval, enabled: e.target.checked } })} className="accent-indigo-600" />
+                  <b>รายงานย่อทุก</b>
+                </label>
+                <input type="number" min={1} max={24} value={schedule.interval.every_hours} onChange={e => setSchedule({ ...schedule, interval: { ...schedule.interval, every_hours: Number(e.target.value) || 3 } })} className={`w-14 rounded-lg px-2 py-1 border text-xs outline-none ${dark ? 'bg-[#16161C] border-zinc-800 text-zinc-100' : 'bg-white border-slate-200'}`} />
+                <span className="text-slate-400">ชั่วโมง</span>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button onClick={saveSchedule} disabled={scheduleSaving} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[11px] font-bold disabled:opacity-50 flex items-center gap-1.5">
+                  {scheduleSaving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />} บันทึกตาราง
+                </button>
+                <button onClick={() => sendReportNow('daily')} disabled={reportSending} className="px-3 py-1.5 rounded-lg text-[11px] font-bold border border-emerald-300 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/30 disabled:opacity-50">
+                  ส่งรายงานเดี๋ยวนี้
+                </button>
+                {reportStatus && <span className="text-[10px] font-medium text-emerald-500">{reportStatus}</span>}
+              </div>
+              <p className="text-[9px] text-slate-400 dark:text-zinc-500">ส่งเข้า Telegram/LINE ของแต่ละเพจตามที่ตั้งไว้ในแท็บ 8. ส่งสรุปไป Telegram/LINE</p>
+            </div>
+          ) : (
+            <p className="text-[11px] text-slate-400">กำลังโหลดตารางรายงาน...</p>
+          )}
+        </div>
+      </div>
+
+      {expenseModalOpen && (
+        <ExpenseReminderModal
+          theme={theme}
+          onClose={() => closeExpenseModal(true)}
+          onSaved={() => { fetchAccounting(); }}
+        />
+      )}
+
       {/* SECTION 1: EXECUTIVE FINANCIAL & OPERATIONAL KPI CARDS */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {/* 1. Total Gross Revenue & Profit */}
