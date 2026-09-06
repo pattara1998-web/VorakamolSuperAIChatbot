@@ -1158,7 +1158,19 @@ const AI_REPLY_SCHEMA = {
     },
     replyText: {
       type: Type.STRING,
-      description: 'ข้อความตอบกลับลูกค้า สั้นกระชับ สุภาพ เหมือนแอดมินคนจริง'
+      description: 'ข้อความตอบกลับหลัก (ใช้ \n เว้นบรรทัดจัดรูปแบบสวยงาม มีอิโมจิเหมือนแอดมินจริง)'
+    },
+    messages: {
+      type: Type.ARRAY,
+      description: 'ตอบเป็นหลายข้อความต่อเนื่องเหมือนแอดมินจริง (1-3 ข้อความ): ข้อความแรก = คำตอบ/พรีเซน ข้อความถัดไป = รูปประกอบ/รายละเอียดเพิ่ม/ปิดการขาย แต่ละข้อความสั้น จัดบรรทัดสวยงาม',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          text: { type: Type.STRING, description: 'ข้อความสั้นๆ จัดบรรทัดด้วย \n ใส่อิโมจิเหมือนแอดมินจริง ไม่เกิน 400 ตัวอักษร' },
+          image: { type: Type.STRING, description: 'รูปแนบ: main (รูปสินค้า), promotion (รูปโปรโมชั่น), review (รูปรีวิว) หรือเว้นว่างถ้าไม่ส่งรูป' }
+        },
+        required: ['text']
+      }
     },
     sequenceStep: {
       type: Type.NUMBER,
@@ -3993,6 +4005,7 @@ ${usedRepliesText}
 8. ⛔ ความแม่นยำสำคัญที่สุด: ตอบเฉพาะข้อมูลที่มีอยู่ในระบบเท่านั้น — ห้ามเด็ดขาดที่จะแต่งราคา สเปก โปรโมชั่น โบนัส ระยะเวลา หรือนโยบายที่ไม่มีในข้อมูลด้านล่าง ถ้าลูกค้าถามสิ่งที่ไม่มีข้อมูล ให้ตอบสุภาพว่า "เรื่องนี้ขอตรวจสอบกับแอดมินก่อนนะคะ แอดมินจะตามกลับโดยเร็ว" แล้วชวนคุยเรื่องที่มีข้อมูลแทน
 9. 🏆 โหมดนักขายมืออาชีพ: เมื่อลูกค้าแสดงความสนใจ (ถามราคา/โปร/บอกสนใจ/ต่อรอง) ต้องพรีเซนเต็มรูปแบบในข้อความเดียว: จุดขายหลัก → ราคาปกติ vs ราคาโปร (โชว์ส่วนลด) → ของแถม/สิทธิพิเศษ → ปิดแบบให้ลูกค้าเลือกแพ็ก เขียนสั้น แบ่งบรรทัดแบบแชทจริง อ่านง่าย ไม่เกิน 4-5 บรรทัด
 10. 🎯 เทคนิคปิดการขาย: ใช้ Choice Close (ให้ลูกค้าเลือกระหว่างแพ็ก ไม่ใช่เลือกว่าจะซื้อไหม) เช่น "เอาแพ็กเดี่ยวหรือแพ็กคู่ดีคะ" + ใช้ความเร่งด่วนจากโปรจริงเท่านั้น (เช่น "โปรรอบนี้เท่านั้น") + ลูกค้าถามอะไรก็ตอบจากข้อมูลจริงแล้วดึงกลับสู่การปิดการขายเสมอ
+11. 🎨 จัดรูปแบบข้อความให้สวยงามอ่านง่ายเหมือนแอดมินมืออาชีพ: ใช้บรรทัดสั้น เว้นบรรทัด (\n) แยกหัวข้อชัดเจน ใช้อิโมจินำหน้าบรรทัด เช่น 🔥 ชื่อสินค้า / ✅ จุดเด่น / 💰 ราคาปกติ → ราคาโปร / 🎁 ของแถม / 🚚 ส่งของ / ⭐ การันตี — ห้ามยัดทุกอย่างในบรรทัดเดียวให้ดูรก และตอบเป็นหลายข้อความต่อเนื่อง (messages array) เหมือนแอดมินจริงที่ส่งไล่ ๆ กัน รูปที่แนบได้: main / promotion / review
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
@@ -4065,6 +4078,37 @@ ${JSON.stringify((page.product?.promotions || [
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
         let replyText = parsed.replyText || page.sequence?.step1_opening_text || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นแจ้งได้เลยนะคะ 🙏';
 
+        // ── สร้างรายการข้อความที่จะส่ง: รองรับหลายข้อความ + รูปประกอบแบบแอดมินจริง ──
+        const buildOutgoing = (p: any): Array<{ text: string; imageUrl?: string }> => {
+          const out: Array<{ text: string; imageUrl?: string }> = [];
+          const imgMap: Record<string, string | undefined> = {
+            main: page.product?.images?.main || undefined,
+            detail: page.product?.images?.detail || undefined,
+            promotion: page.product?.images?.promotion || undefined,
+            review: page.product?.images?.review || undefined,
+            closing: page.product?.images?.closing || undefined
+          };
+          if (Array.isArray(p.messages)) {
+            for (const m of p.messages.slice(0, 4)) {
+              if (!m?.text?.trim()) continue;
+              let imageUrl: string | undefined;
+              if (m.image && imgMap[String(m.image).trim().toLowerCase()]) {
+                imageUrl = imgMap[String(m.image).trim().toLowerCase()];
+              }
+              out.push({ text: String(m.text).trim().slice(0, 1200), imageUrl });
+            }
+          }
+          if (out.length === 0 && p.replyText?.trim()) {
+            out.push({ text: String(p.replyText).trim().slice(0, 1200) });
+          }
+          return out;
+        };
+        let outgoing = buildOutgoing(parsed);
+        // ข้อความรวมสำหรับ log/anti-repeat
+        const combinedText = outgoing.map(o => o.text).join('\n•\n') || replyText;
+        replyText = combinedText;
+
+
         // ── PRICE GUARD: กันราคามั่ว — ตัวเลขหน้า ฿ ในคำตอบต้องเป็นราคาจริงของเพจ ──
         const allowedPrices = [
           Number(page.product?.display_price) || 0,
@@ -4086,7 +4130,9 @@ ${JSON.stringify((page.product?.promotions || [
             mediaParts,
             extraInstruction: `⛔ ข้อความก่อนหน้าใส่ราคาที่ไม่มีในระบบ (${priceNumbers.join(',')}) — ผิดกฎ! อนุญาตเฉพาะราคาเหล่านี้เท่านั้น: ${allowedText} บาท ห้ามใช้ตัวเลขอื่นนอกจากนี้เด็ดขาด ตอบใหม่อีกครั้งอย่างถูกต้อง`
           });
-          replyText = guardResult.parsed.replyText || replyText;
+          const rebuilt = buildOutgoing(guardResult.parsed);
+          if (rebuilt.length) outgoing = rebuilt;
+          replyText = outgoing.map(o => o.text).join('\n•\n');
           parsed.orderData = { ...(parsed.orderData || {}), ...(guardResult.parsed.orderData || {}) };
           const stillBad = (replyText.match(/฿\s?([\d,]+)/g) || []).map(s => Number(s.replace(/[฿,\s]/g, ''))).some(n => !allowedPrices.includes(n));
           if (stillBad) {
@@ -4121,7 +4167,9 @@ ${JSON.stringify((page.product?.promotions || [
               extraInstruction: 'สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม'
             });
             const regenParsed: any = regenResult.parsed;
-            replyText = regenParsed.replyText || replyText;
+            const regenOut = buildOutgoing(regenParsed);
+            if (regenOut.length) outgoing = regenOut;
+            replyText = regenOut.map(o => o.text).join('\n•\n') || (regenParsed.replyText || replyText);
             intent = regenParsed.intent === 'ORDER' || regenParsed.isOrderDetected ? 'ORDER' : intent;
             regenerationCount++;
           } catch (regenErr) {
@@ -4171,14 +4219,25 @@ ${JSON.stringify((page.product?.promotions || [
         // Send the AI answer with human-like pacing
         await sleep(pageDelay);
 
-        if (shouldSendQuickReplies) {
-          await sendFacebookQuickReplies(page.page_access_token || '', senderId, replyText, page.quick_replies);
-          addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${page.quick_replies.length} ปุ่ม พร้อมข้อความตอบกลับ`, 'SUCCESS');
-        } else {
-          await sendFacebookMessage(page.page_access_token || '', senderId, replyText);
+        // ส่งแบบแอดมินจริง: หลายข้อความไล่กัน + รูปประกอบ (เว้นจังหวะสั้น ๆ)
+        for (let i = 0; i < outgoing.length; i++) {
+          const msg = outgoing[i];
+          const isLast = i === outgoing.length - 1;
+          if (msg.imageUrl) {
+            await sendFacebookImage(page.page_access_token || '', senderId, msg.imageUrl);
+            await sleep(Math.min(500, pageDelay));
+          }
+          if (isLast && shouldSendQuickReplies) {
+            await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, page.quick_replies);
+            addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${page.quick_replies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})`, 'SUCCESS');
+          } else {
+            await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
+          }
+          if (!isLast) await sleep(Math.min(600, pageDelay));
+          try { dbService.addChatMessage(pageId, senderId, 'admin', msg.text); } catch { /* non-critical */ }
         }
         // Remember what we answered for the conversation memory + anti-repeat.
-        pushHistory(pageId, senderId, 'admin', replyText);
+        pushHistory(pageId, senderId, 'admin', replyText.replace(/\n•\n/g, ' | '));
 
         // Send configured sales sequence step
         const sequenceStep = shouldTriggerSalesSequence ? 1 : Math.min(6, Math.max(1, Number(parsed.sequenceStep) || 1));
