@@ -1009,27 +1009,66 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
     const contents: any = options.mediaParts?.length
       ? [{ text: fullPrompt }, ...options.mediaParts.map(m => ({ inlineData: m }))]
       : fullPrompt;
+
+    // กู้คำตอบที่ JSON ถูกตัดครึ่ง (โมเดลใช้ token ไปกับ thinking จนงบไม่พอ —
+    // อาการ: "Unexpected end of JSON input"): ตัด think block -> ดึง {...} ->
+    // ถ้ายังพังพยายามปิดวงเล็บที่ขาดให้ครบ
+    const parseGeminiJson = (raw: string): any => {
+      const text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+      try { return JSON.parse(text); } catch { /* fall through */ }
+      try { return parseLooseJson(text); } catch { /* fall through */ }
+      const opened = (text.match(/\{/g) || []).length;
+      const closed = (text.match(/\}/g) || []).length;
+      if (opened > closed) {
+        try { return JSON.parse(text + '}'.repeat(opened - closed)); } catch { /* give up */ }
+      }
+      throw new Error('JSON_TRUNCATED');
+    };
+
     let lastErr: any = null;
     for (const model of candidates) {
-      try {
-        const response = await generateWithFastRetry(getGemini(), model, {
-          contents,
-          config: {
-            responseMimeType: 'application/json',
-            temperature,
-            maxOutputTokens,
-            responseSchema: AI_REPLY_SCHEMA
+      // งบ output: ถ้า JSON ถูกตัดเพราะ MAX_TOKENS จะยิงซ้ำโมเดลเดิมด้วยงบสองเท่า (สูงสุด 1 ครั้ง)
+      let budget = maxOutputTokens;
+      for (let tokenRetry = 0; tokenRetry < 2; tokenRetry++) {
+        try {
+          const response = await generateWithFastRetry(getGemini(), model, {
+            contents,
+            config: {
+              responseMimeType: 'application/json',
+              temperature,
+              maxOutputTokens: budget,
+              responseSchema: AI_REPLY_SCHEMA
+            }
+          }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
+          // โมเดลนี้ยิงได้จริง — จำไว้เป็นค่าเริ่มต้นของครั้งต่อไป
+          if (model !== db.settings.geminiModel) {
+            db.settings.geminiModel = model;
           }
-        }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
-        // โมเดลนี้ยิงได้จริง — จำไว้เป็นค่าเริ่มต้นของครั้งต่อไป
-        if (model !== db.settings.geminiModel) {
-          db.settings.geminiModel = model;
+          const rawText = String(response.text || '').trim();
+          try {
+            const parsed = rawText ? parseGeminiJson(rawText) : {};
+            return { parsed, model, latencyMs: Date.now() - started };
+          } catch {
+            const finish = String(response.candidates?.[0]?.finishReason || '').toUpperCase();
+            if (finish === 'MAX_TOKENS' && budget < 2048) {
+              budget = Math.min(budget * 2, 2048); // JSON ถูกตัด -> เพิ่มงบยิงซ้ำโมเดลเดิม
+              continue;
+            }
+            if (rawText) {
+              // มีข้อความแต่กู้ JSON ไม่ได้ — คืนค่าว่างให้ระบบใช้ข้อความเปิดแทน template ดิบ
+              return { parsed: {}, model, latencyMs: Date.now() - started };
+            }
+            throw new Error('JSON_TRUNCATED');
+          }
+        } catch (err: any) {
+          lastErr = err;
+          if (String(err?.message).includes('JSON_TRUNCATED') && budget < 2048) {
+            budget = Math.min(budget * 2, 2048);
+            continue;
+          }
+          if (!isModelOrQuotaError(err)) throw err;
+          break; // โมเดลนี้ไม่พร้อมใช้ -> ลองโมเดลถัดไป
         }
-        return { parsed: JSON.parse(response.text?.trim() || '{}'), model, latencyMs: Date.now() - started };
-      } catch (err: any) {
-        lastErr = err;
-        // โมเดลนี้ไม่พร้อมใช้/โควต้าหมด -> สลับโมเดลถัดไป | error อื่น (network/key) -> โยนต่อ
-        if (!isModelOrQuotaError(err)) throw err;
       }
     }
     throw lastErr || new Error('GEMINI_ALL_MODELS_FAILED');
@@ -3730,7 +3769,7 @@ ${JSON.stringify((page.product?.promotions || [
         }
         // Provider-aware AI call: capped by the timeout race inside
         // generateAiJson (primary model + fast retry) before any fallback.
-        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.9, maxOutputTokens: 500, mediaParts });
+        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.9, maxOutputTokens: 1024, mediaParts });
         const selectedModel = usedModel;
 
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
@@ -3758,7 +3797,7 @@ ${JSON.stringify((page.product?.promotions || [
           try {
             const regenResult = await generateAiJson(freshPrompt, {
               temperature: 1.0,
-              maxOutputTokens: 500,
+              maxOutputTokens: 1024,
               extraInstruction: 'สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม'
             });
             const regenParsed: any = regenResult.parsed;
