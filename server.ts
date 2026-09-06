@@ -46,6 +46,17 @@ interface DatabaseStore {
     geminiApiKey: string;
     geminiApiKeyUpdatedAt?: string;
     geminiModel?: string;
+    // Multi-provider AI configuration
+    aiProvider?: string; // 'GEMINI' | 'OPENAI' | 'QWEN' | 'ZAI' | 'LMSTUDIO'
+    openaiApiKey?: string;
+    openaiModel?: string;
+    qwenApiKey?: string;
+    qwenModel?: string;
+    zaiApiKey?: string;
+    zaiModel?: string;
+    lmStudioBaseUrl?: string;
+    lmStudioModel?: string;
+    aiSettingsUpdatedAt?: string;
   };
 }
 
@@ -816,6 +827,261 @@ function resolveAiModel(preferred?: string): string {
   return db.settings.geminiModel || DEFAULT_GEMINI_MODEL;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-provider AI gateway. The chat brain can run on any of these providers
+// — selection, keys and per-provider model are all stored in the settings
+// table (see POST /api/settings/ai). Every non-Gemini provider speaks the
+// OpenAI chat-completions dialect, so one caller covers them all.
+// ---------------------------------------------------------------------------
+type AiProvider = 'GEMINI' | 'OPENAI' | 'QWEN' | 'ZAI' | 'LMSTUDIO';
+
+interface ProviderInfo {
+  label: string;
+  baseUrl: string;        // OpenAI-compatible base URL ('' = native client)
+  needsKey: boolean;
+  keySetting: string;     // db.settings field holding the API key
+  modelSetting: string;   // db.settings field holding the selected model
+  defaultModel: string;   // used when the user has not picked one
+  fastModel: string;      // quick-retry model on primary failure
+  setupHint: string;
+}
+
+const AI_PROVIDERS: Record<AiProvider, ProviderInfo> = {
+  GEMINI: {
+    label: 'Google Gemini',
+    baseUrl: '',
+    needsKey: true,
+    keySetting: 'geminiApiKey',
+    modelSetting: 'geminiModel',
+    defaultModel: DEFAULT_GEMINI_MODEL,
+    fastModel: 'gemini-2.5-flash-lite',
+    setupHint: 'สร้างคีย์ฟรีได้ที่ aistudio.google.com/apikey'
+  },
+  OPENAI: {
+    label: 'OpenAI (ChatGPT)',
+    baseUrl: 'https://api.openai.com/v1',
+    needsKey: true,
+    keySetting: 'openaiApiKey',
+    modelSetting: 'openaiModel',
+    defaultModel: 'gpt-4o-mini',
+    fastModel: 'gpt-4o-mini',
+    setupHint: 'สร้างคีย์ได้ที่ platform.openai.com/api-keys'
+  },
+  QWEN: {
+    label: 'Alibaba Qwen (DashScope)',
+    baseUrl: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+    needsKey: true,
+    keySetting: 'qwenApiKey',
+    modelSetting: 'qwenModel',
+    defaultModel: 'qwen-plus',
+    fastModel: 'qwen-turbo',
+    setupHint: 'สร้างคีย์ได้ที่ dashscope.console.aliyun.com (ใช้ Region International)'
+  },
+  ZAI: {
+    label: 'Z.AI / Zhipu (GLM)',
+    baseUrl: 'https://api.z.ai/api/paas/v4',
+    needsKey: true,
+    keySetting: 'zaiApiKey',
+    modelSetting: 'zaiModel',
+    defaultModel: 'glm-4-flash',
+    fastModel: 'glm-4-flash',
+    setupHint: 'สร้างคีย์ได้ที่ z.ai/manage-apikey/apikey-list (glm-4-flash ฟรี)'
+  },
+  LMSTUDIO: {
+    label: 'LM Studio (AI ในเครื่อง)',
+    baseUrl: '',
+    needsKey: false,
+    keySetting: '',
+    modelSetting: 'lmStudioModel',
+    defaultModel: '',
+    fastModel: '',
+    setupHint: 'เปิด LM Studio → Developer → Start Server (พอร์ต 1234) แล้วกดโหลดรายชื่อโมเดล'
+  }
+};
+
+function getCurrentProvider(): AiProvider {
+  const p = String(db.settings.aiProvider || 'GEMINI').toUpperCase() as AiProvider;
+  return AI_PROVIDERS[p] ? p : 'GEMINI';
+}
+
+function getProviderApiKey(provider: AiProvider): string {
+  if (provider === 'GEMINI') return db.settings.geminiApiKey || process.env.GEMINI_API_KEY || '';
+  if (provider === 'LMSTUDIO') return '';
+  const key = (db.settings as any)[AI_PROVIDERS[provider].keySetting] || '';
+  // Env fallbacks so a key can be configured without touching the UI
+  if (!key && provider === 'OPENAI') return process.env.OPENAI_API_KEY || '';
+  if (!key && provider === 'QWEN') return process.env.QWEN_API_KEY || '';
+  if (!key && provider === 'ZAI') return process.env.ZAI_API_KEY || '';
+  return key;
+}
+
+function getProviderModel(provider: AiProvider): string {
+  const info = AI_PROVIDERS[provider];
+  const chosen = String((db.settings as any)[info.modelSetting] || '').trim();
+  return chosen || info.defaultModel;
+}
+
+function getLmStudioBaseUrl(): string {
+  let base = String(db.settings.lmStudioBaseUrl || process.env.LMSTUDIO_BASE_URL || 'http://localhost:1234').replace(/\/+$/, '');
+  // Normalize: LM Studio serves the OpenAI dialect under /v1 — users often
+  // paste just http://localhost:1234, so append the version path if missing.
+  if (!/\/v\d+$/.test(base)) base += '/v1';
+  return base;
+}
+
+/** True when the currently selected provider has everything it needs to run. */
+function isAiConfigured(): boolean {
+  const provider = getCurrentProvider();
+  if (provider === 'LMSTUDIO') return Boolean(getProviderModel('LMSTUDIO')); // model picked via the real /models list
+  return Boolean(getProviderApiKey(provider));
+}
+
+function providerBaseUrl(provider: AiProvider): string {
+  if (provider === 'LMSTUDIO') return getLmStudioBaseUrl();
+  return AI_PROVIDERS[provider].baseUrl;
+}
+
+async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = data?.error?.message || data?.message || `HTTP ${res.status}`;
+      throw Object.assign(new Error(detail), { status: res.status });
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * One AI call on the OpenAI-compatible chat-completions dialect.
+ * Returns the raw assistant text. Throws with a Thai-friendly message.
+ */
+async function callOpenAiCompatible(provider: AiProvider, prompt: string, model: string, maxTokens: number, temperature: number, jsonMode: boolean): Promise<string> {
+  const info = AI_PROVIDERS[provider];
+  const apiKey = getProviderApiKey(provider);
+  if (info.needsKey && !apiKey) throw Object.assign(new Error(`${info.label}: ยังไม่ได้ตั้งค่า API Key`), { status: 401 });
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const body: Record<string, any> = {
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    temperature,
+    max_tokens: maxTokens
+  };
+  if (jsonMode) body.response_format = { type: 'json_object' };
+
+  const data = await fetchJsonWithTimeout(`${providerBaseUrl(provider)}/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body)
+  }, AI_TIMEOUT_MS);
+
+  const text = data?.choices?.[0]?.message?.content;
+  if (typeof text !== 'string' || !text.trim()) throw new Error(`${info.label}: ไม่ได้รับข้อความตอบกลับจากโมเดล`);
+  return text;
+}
+
+/** Strip markdown fences / leading junk before JSON.parse. */
+function parseLooseJson(raw: string): any {
+  const trimmed = String(raw || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const first = trimmed.indexOf('{');
+    const last = trimmed.lastIndexOf('}');
+    if (first >= 0 && last > first) return JSON.parse(trimmed.slice(first, last + 1));
+    throw new Error('โมเดลตอบกลับมาไม่ใช่ JSON ที่อ่านได้');
+  }
+}
+
+/**
+ * Provider-aware AI call returning parsed JSON + metadata.
+ * GEMINI uses the native SDK with a strict response schema and a fast-retry
+ * on the lite model; every other provider uses the OpenAI-compatible caller.
+ */
+async function generateAiJson(prompt: string, options: { temperature?: number; maxOutputTokens?: number; extraInstruction?: string } = {}): Promise<{ parsed: any; model: string; latencyMs: number }> {
+  const provider = getCurrentProvider();
+  const temperature = options.temperature ?? 0.9;
+  const maxOutputTokens = options.maxOutputTokens ?? 500;
+  const fullPrompt = options.extraInstruction ? `${prompt}\n\n${options.extraInstruction}` : prompt;
+  const started = Date.now();
+
+  if (provider === 'GEMINI') {
+    const model = getProviderModel('GEMINI');
+    const response = await generateWithFastRetry(getGemini(), model, {
+      contents: fullPrompt,
+      config: {
+        responseMimeType: 'application/json',
+        temperature,
+        maxOutputTokens,
+        responseSchema: AI_REPLY_SCHEMA
+      }
+    }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
+    return { parsed: JSON.parse(response.text?.trim() || '{}'), model, latencyMs: Date.now() - started };
+  }
+
+  const info = AI_PROVIDERS[provider];
+  const model = getProviderModel(provider);
+  const jsonInstruction = `${options.extraInstruction ? options.extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "sequenceStep": 1-6, "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}}`;
+
+  const raw = await callOpenAiCompatible(provider, fullPrompt, model, maxOutputTokens, temperature, true)
+    .catch(async (primaryErr: any) => {
+      // One quick retry on the provider's fast model before giving up.
+      const fast = info.fastModel && info.fastModel !== model ? info.fastModel : model;
+      try {
+        return await callOpenAiCompatible(provider, fullPrompt, fast, maxOutputTokens, temperature, false);
+      } catch {
+        throw primaryErr;
+      }
+    });
+
+  return { parsed: parseLooseJson(raw), model, latencyMs: Date.now() - started };
+}
+
+// Shared Gemini response schema for the chat-brain reply (kept in one place so
+// the Gemini path and the OpenAI-compatible JSON instruction stay in sync).
+const AI_REPLY_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    intent: {
+      type: Type.STRING,
+      description: 'GREETING, QUESTION, PRICE, PROMOTION, SHIPPING, TRUST, NEGOTIATION หรือ ORDER'
+    },
+    replyText: {
+      type: Type.STRING,
+      description: 'ข้อความตอบกลับลูกค้า สั้นกระชับ สุภาพ เหมือนแอดมินคนจริง'
+    },
+    sequenceStep: {
+      type: Type.NUMBER,
+      description: 'ขั้นตอน Sales Sequence 1-6'
+    },
+    isOrderDetected: {
+      type: Type.BOOLEAN,
+      description: 'ตรวจพบเจตนาสั่งซื้อและข้อมูลที่อยู่/เบอร์โทรหรือไม่'
+    },
+    orderData: {
+      type: Type.OBJECT,
+      properties: {
+        customer_name: { type: Type.STRING },
+        phone_number: { type: Type.STRING },
+        address: { type: Type.STRING },
+        product_id: { type: Type.STRING },
+        quantity: { type: Type.NUMBER },
+        unit_price: { type: Type.NUMBER },
+        total_amount: { type: Type.NUMBER }
+      }
+    }
+  },
+  required: ['intent', 'replyText', 'isOrderDetected']
+};
+
 const app = express();
 // Render (and most PaaS) injects a dynamic PORT env var; fall back to 3000 for local dev.
 const PORT = Number(process.env.PORT) || 3000;
@@ -1135,12 +1401,12 @@ async function startServer() {
       total_orders: db.orders.length,
       total_customers: db.customers.length,
       active_emergencies: db.emergencyAlerts.filter(e => !e.is_resolved).length,
-      ai_configured: Boolean(db.settings.geminiApiKey || process.env.GEMINI_API_KEY)
+      ai_configured: isAiConfigured()
     });
   });
 
   app.get('/api/system/readiness', (req: Request, res: Response) => {
-    const hasAi = Boolean(db.settings.geminiApiKey || process.env.GEMINI_API_KEY);
+    const hasAi = isAiConfigured();
     const hasMetaCredentials = Boolean(process.env.META_APP_ID || process.env.FACEBOOK_APP_ID) && Boolean(process.env.META_APP_SECRET || process.env.FACEBOOK_APP_SECRET);
     const pages = db.pages.map(page => {
       const token = decryptToken(page.page_access_token || '');
@@ -1154,7 +1420,7 @@ async function startServer() {
       };
     });
     const issues = [
-      !hasAi && 'ยังไม่ได้ตั้งค่า Gemini API key',
+      !hasAi && 'ยังไม่ได้ตั้งค่า AI Provider (Gemini/OpenAI/Qwen/Z.AI/LM Studio)',
       !hasMetaCredentials && 'ยังไม่ได้ตั้งค่า Meta App ID/Secret บนเซิร์ฟเวอร์',
       !STORE_SECRET && 'ยังไม่ได้ตั้งค่า ENCRYPTION_SECRET_KEY สำหรับเก็บ token และ API key อย่างปลอดภัย',
       ...pages.filter(page => !page.ready).map(page => `เพจ ${page.page_name} ยังไม่พร้อมรับ-ส่งข้อความจริง`)
@@ -1168,7 +1434,17 @@ async function startServer() {
     res.json({
       geminiApiKeyConfigured: !!(db.settings.geminiApiKey || process.env.GEMINI_API_KEY),
       geminiApiKeyUpdatedAt: db.settings.geminiApiKeyUpdatedAt || null,
-      geminiModel: db.settings.geminiModel || DEFAULT_GEMINI_MODEL
+      geminiModel: db.settings.geminiModel || DEFAULT_GEMINI_MODEL,
+      aiProvider: getCurrentProvider(),
+      aiSettingsUpdatedAt: db.settings.aiSettingsUpdatedAt || null,
+      openaiApiKeyConfigured: Boolean(getProviderApiKey('OPENAI')),
+      qwenApiKeyConfigured: Boolean(getProviderApiKey('QWEN')),
+      zaiApiKeyConfigured: Boolean(getProviderApiKey('ZAI')),
+      lmStudioBaseUrl: getLmStudioBaseUrl(),
+      lmStudioModel: db.settings.lmStudioModel || '',
+      openaiModel: db.settings.openaiModel || AI_PROVIDERS.OPENAI.defaultModel,
+      qwenModel: db.settings.qwenModel || AI_PROVIDERS.QWEN.defaultModel,
+      zaiModel: db.settings.zaiModel || AI_PROVIDERS.ZAI.defaultModel
     });
   });
 
@@ -1223,6 +1499,105 @@ async function startServer() {
       });
     } catch (error: any) {
       res.status(400).json({ success: false, message: `ไม่สามารถยืนยัน Gemini API key ได้: ${error.message || 'โปรดตรวจสอบคีย์และโควต้าการใช้งาน'}` });
+    }
+  });
+
+  // ================================================================
+  // MULTI-PROVIDER AI SETTINGS (Gemini / OpenAI / Qwen / Z.AI / LM Studio)
+  // ================================================================
+
+  app.get('/api/ai/providers', (req: Request, res: Response) => {
+    res.json({
+      current: getCurrentProvider(),
+      providers: (Object.keys(AI_PROVIDERS) as AiProvider[]).map(id => ({
+        id,
+        label: AI_PROVIDERS[id].label,
+        needsKey: AI_PROVIDERS[id].needsKey,
+        defaultModel: AI_PROVIDERS[id].defaultModel,
+        configured: id === getCurrentProvider() ? isAiConfigured() : Boolean(getProviderApiKey(id)),
+        model: getProviderModel(id),
+        setupHint: AI_PROVIDERS[id].setupHint
+      }))
+    });
+  });
+
+  // List the REAL models a provider currently offers (LM Studio -> its local
+  // server /v1/models; Gemini -> generativelanguage; others -> {base}/models)
+  // so the UI never makes the user type a model id blind.
+  app.get('/api/ai/models', async (req: Request, res: Response) => {
+    const provider = String(req.query.provider || getCurrentProvider()).toUpperCase() as AiProvider;
+    if (!AI_PROVIDERS[provider]) return res.status(400).json({ success: false, message: 'Provider ไม่ถูกต้อง' });
+    try {
+      let models: { id: string; label: string }[] = [];
+      if (provider === 'GEMINI') {
+        const key = getProviderApiKey('GEMINI');
+        if (!key) return res.status(400).json({ success: false, message: 'กรุณาใส่ Gemini API Key ก่อน' });
+        const data = await fetchJsonWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}&pageSize=100`, { method: 'GET' }, 10000);
+        models = (data.models || [])
+          .filter((m: any) => (m.supportedGenerationMethods || []).includes('generateContent'))
+          .map((m: any) => ({ id: String(m.name || '').replace(/^models\//, ''), label: m.displayName || String(m.name || '').replace(/^models\//, '') }));
+      } else {
+        const apiKey = getProviderApiKey(provider);
+        const headers: Record<string, string> = {};
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+        const data = await fetchJsonWithTimeout(`${providerBaseUrl(provider)}/models`, { method: 'GET', headers }, 10000);
+        models = (data.data || [])
+          .filter((m: any) => m && m.id)
+          .map((m: any) => ({ id: String(m.id), label: String(m.id) }));
+      }
+      res.json({ success: true, provider, models });
+    } catch (err: any) {
+      res.status(502).json({ success: false, message: `ดึงรายชื่อโมเดลไม่สำเร็จ: ${err.message}` });
+    }
+  });
+
+  // Save + validate the active AI provider. Validation always performs a real
+  // network probe (models list) so a broken key or unreachable LM Studio is
+  // caught here, not when the first customer message arrives.
+  app.post('/api/settings/ai', async (req: Request, res: Response) => {
+    const { provider, apiKey, baseUrl, model } = req.body;
+    const p = String(provider || '').toUpperCase() as AiProvider;
+    if (!AI_PROVIDERS[p]) return res.status(400).json({ success: false, message: 'Provider ไม่ถูกต้อง' });
+    const info = AI_PROVIDERS[p];
+
+    // Stage the credentials before probing so validation uses the new values.
+    if (p === 'GEMINI' && typeof apiKey === 'string' && apiKey.trim().length >= 10) {
+      db.settings.geminiApiKey = apiKey.trim();
+    }
+    if (p !== 'GEMINI' && p !== 'LMSTUDIO' && typeof apiKey === 'string' && apiKey.trim()) {
+      (db.settings as any)[info.keySetting] = apiKey.trim();
+    }
+    if (p === 'LMSTUDIO' && typeof baseUrl === 'string' && baseUrl.trim()) {
+      db.settings.lmStudioBaseUrl = baseUrl.trim().replace(/\/+$/, '');
+    }
+
+    try {
+      // Real probe: fetch the provider's model list (validates key + reachability).
+      const probeUrl = p === 'GEMINI'
+        ? `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(getProviderApiKey('GEMINI'))}&pageSize=1`
+        : `${providerBaseUrl(p)}/models`;
+      const headers: Record<string, string> = {};
+      if (p !== 'GEMINI' && info.needsKey) headers['Authorization'] = `Bearer ${getProviderApiKey(p)}`;
+      await fetchJsonWithTimeout(probeUrl, { method: 'GET', headers }, 10000);
+
+      if (typeof model === 'string' && model.trim()) {
+        (db.settings as any)[info.modelSetting] = model.trim();
+      }
+      db.settings.aiProvider = p;
+      db.settings.aiSettingsUpdatedAt = new Date().toISOString();
+      persistData();
+      res.json({
+        success: true,
+        provider: p,
+        model: getProviderModel(p),
+        message: `บันทึกสำเร็จ — ระบบจะใช้ ${info.label} โมเดล ${getProviderModel(p)} ตอบแชทลูกค้า`
+      });
+    } catch (err: any) {
+      persistData();
+      const hint = p === 'LMSTUDIO'
+        ? `เชื่อมต่อ LM Studio ไม่ได้ (${getLmStudioBaseUrl()}) — เปิด LM Studio → Developer → Start Server แล้วลองอีกครั้ง`
+        : `ยืนยันไม่สำเร็จ: ${err.message}`;
+      res.status(400).json({ success: false, message: hint });
     }
   });
 
@@ -2378,8 +2753,8 @@ async function startServer() {
         return;
       }
 
-      if (!(db.settings.geminiApiKey || process.env.GEMINI_API_KEY)) {
-        addLog('INFO', senderId || 'UNKNOWN', pageId, '⛔ ไม่ตอบอัตโนมัติ: ยังไม่ได้ตั้งค่า Gemini API key ที่ใช้งานได้', 'ERROR');
+      if (!isAiConfigured()) {
+        addLog('INFO', senderId || 'UNKNOWN', pageId, `⛔ ไม่ตอบอัตโนมัติ: ยังไม่ได้ตั้งค่า AI Provider (${getCurrentProvider()})`, 'ERROR');
         // Send notification to user that API key is not configured
         await sendFacebookMessage(page.page_access_token || '', senderId, '🙏 สวัสดีค่ะ ระบบ AI ยังไม่ได้ตั้งค่า API Key กรุณาติดต่อแอดมินเพื่อตั้งค่าก่อนนะคะ แอดมินจะตอบกลับให้เร็วที่สุดค่ะ');
         return;
@@ -2559,7 +2934,7 @@ async function startServer() {
       }
 
       // AI Persona & Model Execution
-      const selectedModel = resolveAiModel(page.ai_model);
+      const selectedModel = getProviderModel(getCurrentProvider());
       const adminName = page.admin_name || 'น้ำหวาน';
       const aiTone = page.ai_tone || 'FRIENDLY';
       const customInstructions = page.ai_custom_instructions || 'ตอบสั้นกระชับ สุภาพ เหมือนแอดมินคนจริง และเน้นปิดการขาย';
@@ -2645,7 +3020,6 @@ async function startServer() {
           .join('\n');
       }
 
-      const ai = getGemini();
 
       // Conversation memory: the last few exchanges so the answer continues
       // the chat instead of ignoring what was already said. (Each entry is
@@ -2735,56 +3109,11 @@ ${JSON.stringify((page.product?.promotions || [
 `;
 
       try {
-        // Timeout race: a hung Gemini call must never stall the customer —
-        // cap it, retry once on the lite model, then fall back to a template.
-        const aiStart = Date.now();
-        const response = await generateWithFastRetry(ai, selectedModel, {
-          contents: promptContext,
-          config: {
-            responseMimeType: 'application/json',
-            // Higher temperature => varied wording between replies (less
-            // repetition); capped output keeps generation fast and chat-sized.
-            temperature: 0.9,
-            maxOutputTokens: 500,
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                intent: {
-                  type: Type.STRING,
-                  description: 'GREETING, QUESTION, PRICE, PROMOTION, SHIPPING, TRUST, NEGOTIATION หรือ ORDER'
-                },
-                replyText: {
-                  type: Type.STRING,
-                  description: 'ข้อความตอบกลับลูกค้า สั้นกระชับ สุภาพ เหมือนแอดมินคนจริง'
-                },
-                sequenceStep: {
-                  type: Type.NUMBER,
-                  description: 'ขั้นตอน Sales Sequence 1-6'
-                },
-                isOrderDetected: {
-                  type: Type.BOOLEAN,
-                  description: 'ตรวจพบเจตนาสั่งซื้อและข้อมูลที่อยู่/เบอร์โทรหรือไม่'
-                },
-                orderData: {
-                  type: Type.OBJECT,
-                  properties: {
-                    customer_name: { type: Type.STRING },
-                    phone_number: { type: Type.STRING },
-                    address: { type: Type.STRING },
-                    product_id: { type: Type.STRING },
-                    quantity: { type: Type.NUMBER },
-                    unit_price: { type: Type.NUMBER },
-                    total_amount: { type: Type.NUMBER }
-                  }
-                }
-              },
-              required: ['intent', 'replyText', 'isOrderDetected']
-            }
-          }
-        }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
-        const aiLatencyMs = Date.now() - aiStart;
+        // Provider-aware AI call: capped by the timeout race inside
+        // generateAiJson (primary model + fast retry) before any fallback.
+        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.9, maxOutputTokens: 500 });
+        const selectedModel = usedModel;
 
-        const parsed: any = JSON.parse(response.text?.trim() || '{}');
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
         let replyText = parsed.replyText || page.sequence?.step1_opening_text || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นแจ้งได้เลยนะคะ 🙏';
 
@@ -2808,37 +3137,12 @@ ${JSON.stringify((page.product?.promotions || [
           const freshPrompt = promptContext + `\n\n⚠️ สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม`;
 
           try {
-            const regenResponse = await generateWithFastRetry(ai, selectedModel, {
-              contents: freshPrompt,
-              config: {
-                responseMimeType: 'application/json',
-                temperature: 1.0,
-                maxOutputTokens: 500,
-                responseSchema: {
-                  type: Type.OBJECT,
-                  properties: {
-                    intent: { type: Type.STRING, description: 'QUESTION หรือ ORDER' },
-                    replyText: { type: Type.STRING, description: 'ข้อความตอบกลับใหม่ ที่ไม่ซ้ำกับครั้งก่อน' },
-                    sequenceStep: { type: Type.NUMBER, description: 'ขั้นตอน Sales Sequence 1-6' },
-                    isOrderDetected: { type: Type.BOOLEAN, description: 'ตรวจพบเจตนาสั่งซื้อและข้อมูลที่อยู่/เบอร์โทรหรือไม่' },
-                    orderData: {
-                      type: Type.OBJECT,
-                      properties: {
-                        customer_name: { type: Type.STRING },
-                        phone_number: { type: Type.STRING },
-                        address: { type: Type.STRING },
-                        product_id: { type: Type.STRING },
-                        quantity: { type: Type.NUMBER },
-                        unit_price: { type: Type.NUMBER },
-                        total_amount: { type: Type.NUMBER }
-                      }
-                    }
-                  },
-                  required: ['intent', 'replyText', 'isOrderDetected']
-                }
-              }
-            }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
-            const regenParsed: any = JSON.parse(regenResponse.text?.trim() || '{}');
+            const regenResult = await generateAiJson(freshPrompt, {
+              temperature: 1.0,
+              maxOutputTokens: 500,
+              extraInstruction: 'สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม'
+            });
+            const regenParsed: any = regenResult.parsed;
             replyText = regenParsed.replyText || replyText;
             intent = regenParsed.intent === 'ORDER' || regenParsed.isOrderDetected ? 'ORDER' : intent;
             regenerationCount++;

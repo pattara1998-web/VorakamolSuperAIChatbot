@@ -22,8 +22,29 @@ export interface DatabaseStore {
     geminiApiKey: string;
     geminiApiKeyUpdatedAt?: string;
     geminiModel?: string;
+    // Multi-provider AI configuration
+    aiProvider?: string; // 'GEMINI' | 'OPENAI' | 'QWEN' | 'ZAI' | 'LMSTUDIO'
+    openaiApiKey?: string;
+    openaiModel?: string;
+    qwenApiKey?: string;
+    qwenModel?: string;
+    zaiApiKey?: string;
+    zaiModel?: string;
+    lmStudioBaseUrl?: string;
+    lmStudioModel?: string;
+    aiSettingsUpdatedAt?: string;
   };
 }
+
+// Every AI-provider setting is stored in the settings table under these keys.
+export const PROVIDER_SETTING_KEYS = [
+  'aiProvider',
+  'openaiApiKey', 'openaiModel',
+  'qwenApiKey', 'qwenModel',
+  'zaiApiKey', 'zaiModel',
+  'lmStudioBaseUrl', 'lmStudioModel',
+  'aiSettingsUpdatedAt'
+] as const;
 
 export async function loadFromDatabase(db: DatabaseStore): Promise<boolean> {
   try {
@@ -92,6 +113,14 @@ export async function loadFromDatabase(db: DatabaseStore): Promise<boolean> {
       db.settings.geminiApiKeyUpdatedAt = geminiUpdatedAt;
     }
 
+    // Multi-provider AI settings
+    for (const key of PROVIDER_SETTING_KEYS) {
+      const val = await dbService.getSetting(`ai_${key}`);
+      if (val !== null) {
+        (db.settings as any)[key] = val;
+      }
+    }
+
     return true;
   } catch (err) {
     console.error('[DB Bridge] Failed to load from PostgreSQL:', err);
@@ -144,6 +173,14 @@ export async function saveToDatabase(db: DatabaseStore): Promise<void> {
     }
     if (db.settings.geminiApiKeyUpdatedAt) {
       await dbService.setSetting('gemini_apiKeyUpdatedAt', db.settings.geminiApiKeyUpdatedAt);
+    }
+
+    // Multi-provider AI settings
+    for (const key of PROVIDER_SETTING_KEYS) {
+      const val = (db.settings as any)[key];
+      if (val !== undefined && val !== null && val !== '') {
+        await dbService.setSetting(`ai_${key}`, String(val));
+      }
     }
 
     // Cleanup old data
