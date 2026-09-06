@@ -486,9 +486,14 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
       || db.pages.find(p => Boolean((p as any).is_connected) && p.is_active && p.auto_reply && (p.page_access_token || '').length > 20);
     const usingRealPage = Boolean(realPage);
     const pageId = usingRealPage ? realPage!.page_id : addTestPage();
+    // เพจทดสอบต้องมีสินค้าจำลองครบ (ราคา/โปร 3 แพ็ก/รายละเอียด) เพื่อทดสอบความแม่นยำ
+    if (usingRealPage) {
+      const seed = await fetchJson(baseUrl, '/api/testpage/seed-product', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page_id: pageId }) });
+      if (seed.status !== 200) throw new Error(`seed สินค้าจำลองไม่สำเร็จ: HTTP ${seed.status}`);
+    }
     const sender = usingRealPage ? `selftest_e2e_real_${Date.now()}` : PREFIX + 'e2e_' + Date.now();
     try {
-      const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', (webhookRequest({ id: pageId, messaging: [{ sender: { id: sender }, message: { mid: PREFIX + 'm_' + Date.now(), text: 'ราคาเท่าไหร่คะ' } }] })));
+      const { status } = await fetchJson(baseUrl, '/api/webhook/facebook', (webhookRequest({ id: pageId, messaging: [{ sender: { id: sender }, message: { mid: PREFIX + 'm_' + Date.now(), text: 'สนใจแพ็กเดี่ยว ราคาเท่าไหร่คะ' } }] })));
       if (status !== 200) throw new Error(`webhook HTTP ${status}`);
       // Poll for the reply log: a real AI call (Gemini/OpenAI) can take 3-15s
       // on production — a fixed short sleep fails healthy slow replies.
@@ -509,9 +514,18 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
       // ดึงสาเหตุจริงที่ AI ล้มเหลวจาก log เพื่อวินิจฉัยได้ทันที
       const errMatch = String(aiLog.content).match(/AI Error: (.+)$/);
       const realError = errMatch ? errMatch[1].slice(0, 160) : '';
+      // ── ตรวจความแม่นยำ: คำตอบต้องมีราคา 299 (แพ็กเดี่ยวจากสินค้าจำลอง) ──
+      let priceAccurate = true;
+      if (!isFallback && usingRealPage) {
+        const fullReply = String((aiLog as any).details?.fullReply || aiLog.content);
+        priceAccurate = fullReply.includes('299');
+      }
+      if (!isFallback && usingRealPage && !priceAccurate) {
+        return { status: 'WARN', detail: `AI ตอบจริงแต่ราคาไม่ตรงแพ็กเดี่ยว (ควรมี 299)`, fixHint: 'ระบบ Price Guard อาจตัดประโยคราคา — ตรวจ log PRICE GUARD ในหน้าระบบ' };
+      }
       return {
         status: isFallback ? 'WARN' : 'PASS',
-        detail: `ใช้เพจ: ${realPage?.page_name || 'selftest_page'} • intent=${intentMatch?.[1] || '?'} • ${isFallback ? `ตอบด้วย template สำรอง — สาเหตุ: ${realError || 'ไม่ทราบ'}` : `AI ตอบจริง (${String(aiLog.content).match(/\(([^|]+)\|/)?.[1]?.trim() || 'โมเดลจาก prompt'} )`} • latency ${latencyMatch?.[1] || '?'}ms`,
+        detail: `ใช้เพจ: ${realPage?.page_name || 'selftest_page'} • intent=${intentMatch?.[1] || '?'} • ${isFallback ? `ตอบด้วย template สำรอง — สาเหตุ: ${realError || 'ไม่ทราบ'}` : `AI ตอบจริง ราคาแม่นยำ ✅ (299) • โมเดล ${String(aiLog.content).match(/\(([^|]+)\|/)?.[1]?.trim() || '?'}`} • latency ${latencyMatch?.[1] || '?'}ms`,
         fixHint: isFallback ? `สาเหตุจริง: ${realError || 'ดู log AI Error ในหน้าระบบ'}` : undefined
       };
     } finally {
@@ -822,6 +836,64 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
       removeTestPage(pageId);
       await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [sender]).catch(() => {});
     }
+  });
+
+
+  // ── สังเคราะห์ไฟล์ทดสอบในเครื่อง (ไม่พึ่งอินเทอร์เน็ตภายนอก) ──
+  const tinyPngDataUri = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const makeTinyWavDataUri = () => {
+    const sampleRate = 8000, seconds = 1;
+    const n = sampleRate * seconds;
+    const buf = Buffer.alloc(44 + n * 2);
+    buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write('WAVE', 8);
+    buf.write('fmt ', 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22);
+    buf.writeUInt32LE(sampleRate, 24); buf.writeUInt32LE(sampleRate * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34);
+    buf.write('data', 36); buf.writeUInt32LE(n * 2, 40);
+    for (let i = 0; i < n; i++) buf.writeInt16LE(Math.round(3000 * Math.sin(2 * Math.PI * 440 * i / sampleRate)), 44 + i * 2);
+    return 'data:audio/wav;base64,' + buf.toString('base64');
+  };
+
+  const mediaE2E = async (id: string, kind: 'image' | 'audio', dataUri: string): Promise<{ status: TestStatus; detail: string }> => {
+    const pageId = addTestPage();
+    const sender = `${PREFIX}media_${kind}_${Date.now()}`;
+    try {
+      const hook = webhookRequest({
+        id: pageId,
+        messaging: [{
+          sender: { id: sender },
+          message: {
+            mid: PREFIX + 'md_' + Date.now(),
+            attachments: [{ type: kind, payload: { url: dataUri } }]
+          }
+        }]
+      });
+      const send = await fetchJson(baseUrl, '/api/webhook/facebook', hook);
+      if (send.status !== 200) throw new Error(`webhook HTTP ${send.status}`);
+      let aiLog: any = null;
+      for (let attempt = 0; attempt < 8 && !aiLog; attempt++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const logs = (await fetchJson(baseUrl, '/api/data')).data.logs;
+        aiLog = logs.find((l: any) => l.sender_id === sender && l.type === 'AI_REPLY');
+      }
+      if (!aiLog) throw new Error(`ไม่พบการตอบกลับสื่อ${kind === 'image' ? 'รูป' : 'เสียง'}`);
+      const isFallback = String(aiLog.content).includes('สำรอง');
+      return {
+        status: isFallback ? 'WARN' : 'PASS',
+        detail: isFallback ? 'ตอบ fallback (AI ยังไม่ตั้งค่า/โควต้า) — แต่ pipeline รับสื่อทำงานไม่ crash' : `AI วิเคราะห์${kind === 'image' ? 'รูป' : 'เสียง'}และตอบกลับสำเร็จ: ${String(aiLog.content).slice(0, 80)}`
+      };
+    } finally {
+      removeTestPage(pageId);
+      await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [sender]).catch(() => {});
+    }
+  };
+
+  await run('media-image-e2e', 'Webhook E2E', 'ลูกค้าส่งรูป → AI วิเคราะห์รูปและตอบ (Gemini Vision)', async (): Promise<{ status: TestStatus; detail: string }> => {
+    return mediaE2E('image', 'image', tinyPngDataUri);
+  });
+
+  await run('media-audio-e2e', 'Webhook E2E', 'ลูกค้าส่งข้อความเสียง → AI ฟังเสียงและตอบ (Gemini Audio)', async (): Promise<{ status: TestStatus; detail: string }> => {
+    return mediaE2E('audio', 'audio', makeTinyWavDataUri());
   });
 
   // ===================== F. BACKUP =====================

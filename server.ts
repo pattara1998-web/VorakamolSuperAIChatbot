@@ -3990,6 +3990,7 @@ ${usedRepliesText}
 5. ห้ามอ้างว่าเป็น AI ห้ามแนะนำตัวซ้ำทุกข้อความ ห้ามทักทายใหม่ทุกครั้งเมื่อกำลังคุยอยู่
 6. ปิดท้ายทุกข้อความด้วยคำถามสั้นๆ ชวนตัดสินใจหรือชวนคุยต่อ (เช่น "เอาแพ็กนี้เลยไหมคะ" / "สนใจแบบไหนคะ") — ยกเว้นตอนลูกค้ากำลังส่งข้อมูลที่อยู่
 7. ถ้าลูกค้าให้ชื่อ/เบอร์โทร/ที่อยู่ ให้จดจำใช้ตลอดบทสนทนา ไม่ต้องถามซ้ำสิ่งที่ลูกค้าบอกไปแล้ว
+8. ⛔ ความแม่นยำสำคัญที่สุด: ตอบเฉพาะข้อมูลที่มีอยู่ในระบบเท่านั้น — ห้ามเด็ดขาดที่จะแต่งราคา สเปก โปรโมชั่น โบนัส ระยะเวลา หรือนโยบายที่ไม่มีในข้อมูลด้านล่าง ถ้าลูกค้าถามสิ่งที่ไม่มีข้อมูล ให้ตอบสุภาพว่า "เรื่องนี้ขอตรวจสอบกับแอดมินก่อนนะคะ แอดมินจะตามกลับโดยเร็ว" แล้วชวนคุยเรื่องที่มีข้อมูลแทน
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
@@ -4056,11 +4057,41 @@ ${JSON.stringify((page.product?.promotions || [
         }
         // Provider-aware AI call: capped by the timeout race inside
         // generateAiJson (primary model + fast retry) before any fallback.
-        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.9, maxOutputTokens: 1024, mediaParts });
+        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.35, maxOutputTokens: 1024, mediaParts });
         const selectedModel = usedModel;
 
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
         let replyText = parsed.replyText || page.sequence?.step1_opening_text || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นแจ้งได้เลยนะคะ 🙏';
+
+        // ── PRICE GUARD: กันราคามั่ว — ตัวเลขหน้า ฿ ในคำตอบต้องเป็นราคาจริงของเพจ ──
+        const allowedPrices = [
+          Number(page.product?.display_price) || 0,
+          Number(page.product?.base_price) || 0,
+          Number(matchedProduct.display_price) || 0,
+          Number(matchedProduct.price_1) || 0,
+          Number(matchedProduct.price_2) || 0,
+          Number(matchedProduct.price_3) || 0,
+          ...((page.product?.promotions || []) as any[]).flatMap(pr => [Number(pr.price) || 0, Number(pr.original_price) || 0])
+        ].filter(n => n > 0);
+        const priceNumbers = (replyText.match(/฿\s?([\d,]+)/g) || []).map(s => Number(s.replace(/[฿,\s]/g, '')));
+        const hasSuspiciousPrice = allowedPrices.length > 0 && priceNumbers.some(n => !allowedPrices.includes(n));
+        if (hasSuspiciousPrice) {
+          addLog('INFO', senderId, pageId, `⚠️ PRICE GUARD: AI ตอบราคาที่ไม่มีในข้อมูลจริง → สั่งคิดใหม่พร้อมรายการราคาที่ถูกต้อง (${priceNumbers.join(',')})`, 'WARNING');
+          const allowedText = allowedPrices.map(n => n.toLocaleString()).join(', ');
+          const guardResult = await generateAiJson(promptContext, {
+            temperature: 0.3,
+            maxOutputTokens: 1024,
+            mediaParts,
+            extraInstruction: `⛔ ข้อความก่อนหน้าใส่ราคาที่ไม่มีในระบบ (${priceNumbers.join(',')}) — ผิดกฎ! อนุญาตเฉพาะราคาเหล่านี้เท่านั้น: ${allowedText} บาท ห้ามใช้ตัวเลขอื่นนอกจากนี้เด็ดขาด ตอบใหม่อีกครั้งอย่างถูกต้อง`
+          });
+          replyText = guardResult.parsed.replyText || replyText;
+          parsed.orderData = { ...(parsed.orderData || {}), ...(guardResult.parsed.orderData || {}) };
+          const stillBad = (replyText.match(/฿\s?([\d,]+)/g) || []).map(s => Number(s.replace(/[฿,\s]/g, ''))).some(n => !allowedPrices.includes(n));
+          if (stillBad) {
+            addLog('ERROR', senderId, pageId, '⛔ PRICE GUARD: ยังตอบราคามั่วหลังแก้ — ตัดประโยคราคาออกจากคำตอบ', 'ERROR');
+            replyText = replyText.replace(/[^\s]*฿\s?[\d,]+[^\n]*/g, '').replace(/\s{2,}/g, ' ').trim() || `ตอบนะคะ ${page.product?.product_name || 'สินค้า'} ราคา ฿${(page.product?.display_price || 0).toLocaleString()} สนใจแพ็กไหนคะ`;
+          }
+        }
 
         // Merge regex-extracted order info: if the AI missed the phone or
         // address but the customer clearly typed one, fill it in here so a
@@ -4083,7 +4114,7 @@ ${JSON.stringify((page.product?.promotions || [
 
           try {
             const regenResult = await generateAiJson(freshPrompt, {
-              temperature: 1.0,
+              temperature: 0.5,
               maxOutputTokens: 1024,
               extraInstruction: 'สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม'
             });
@@ -5522,6 +5553,44 @@ ${JSON.stringify(categorySummary, null, 2)}
       addLog('INFO', 'DATABASE', 'SYSTEM', `🧹 กวาดเพจปลอมออก ${removed.length} หน้า: ${removed.slice(0, 5).join(', ')}`, 'SUCCESS');
     }
     res.json({ success: true, removed: removed.length, remaining: db.pages.length });
+  });
+
+  // สินค้าจำลองครบทุกอย่างสำหรับ "เพจทดสอบ" (จำลองการขายจริง: ราคา/โปร/สเปก/ต้นทุน)
+  app.post('/api/testpage/seed-product', async (req: Request, res: Response) => {
+    const page_id = (req.body || {}).page_id as string;
+    if (!page_id) return res.status(400).json({ success: false, message: 'ต้องระบุ page_id' });
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+
+    page.product = {
+      product_id: 'TEST-MOVIE-001',
+      product_name: 'แพ็กเกจดูหนัง "มันดูทั้งคืน" (สมาชิกรายเดือน)',
+      category: 'CHINA',
+      base_price: 599,
+      display_price: 299,
+      cost_price: 60,
+      shipping_cost: 0,
+      description: 'สมาชิกดูหนัง-ซีรีส์-ดูบอลสด คมชัดระดับ 4K ใช้ได้ทุกอุปกรณ์ (มือถือ/แท็บเล็ต/ทีวี/คอม)\n• ดูได้ไม่จำกัดเรื่อง ตลอด 24 ชั่วโมง\n• ส่งไอดีทาง Inbox ภายใน 5 นาที\n• รับประกันตลอดอายุสมาชิก\n• หนังใหม่อัปเดตทุกวัน',
+      promotions: [
+        { name: 'แพ็กเดี่ยว 1 เดือน', quantity: 1, price: 299, original_price: 599, free_shipping: true, gift_quantity: 0, free_gifts: '', description: 'ดูเดี่ยว ส่งไอดีไวภายใน 5 นาที' },
+        { name: 'แพ็กคู่ 3 เดือน', quantity: 2, price: 799, original_price: 1797, free_shipping: true, gift_quantity: 1, free_gifts: 'ฟิล์มกันรอยมือถือ', description: 'คุ้มสุด เหลือเพียง ฿266/เดือน' },
+        { name: 'แพ็กหอ 6 เดือน', quantity: 3, price: 1299, original_price: 3594, free_shipping: true, gift_quantity: 2, free_gifts: 'รีโมทสำรอง + ปกหนัง', description: 'ดูพร้อมกันได้ 3 เครื่อง เหมาะกับหอ/บ้าน' }
+      ],
+      images: { main: page.page_cover || '', detail: '', promotion: '', review: '', closing: '' }
+    } as any;
+    page.sequence = {
+      step1_opening_text: 'สวัสดีค่ะ ยินดีต้อนรับสู่ "มันดูทั้งคืน" 🎬 ดูหนัง-ซีรีส์-บอลสด 4K ไม่จำกัด สนใจแพ็กไหนดีคะ (เดี่ยว 299 / คู่ 3 เดือน 799 / หอ 6 เดือน 1,299)',
+      step2_product_image: '',
+      step3_promotion_detail: 'โปรเดือนนี้: แพ็กคู่ 3 เดือน 799 บาท (จากปกติ 1,797) + แถมฟิล์มกันรอย 1 ชิ้น คุ้มสุดค่ะ',
+      step4_promotion_image: '',
+      step5_review_image: '',
+      step6_closing_text: 'สมัครวันนี้ ส่งไอดีภายใน 5 นาที รับประกันตลอดอายุสมาชิกค่ะ 🙏'
+    } as any;
+    dbService.upsertPage(dbBridge.flattenPage(page));
+    persistData();
+    dbBridge.broadcastSSE('product_seeded', { page_id }, page_id);
+    addLog('INFO', 'TESTPAGE', page_id, '🎬 ใส่สินค้าจำลองครบทุกอย่างให้เพจทดสอบแล้ว (ราคา 299/799/1299)', 'SUCCESS');
+    res.json({ success: true, message: `ใส่สินค้าจำลองครบแล้ว: ${page.product.product_name} (299/799/1299)`, product: page.product });
   });
 
   // Fresh page avatar proxy: Facebook CDN URLs stored in the DB expire after
