@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Megaphone, Search, FileVideo, ImageIcon, File as FileIcon, Play, Square,
+  Megaphone, Search, FileVideo, ImageIcon, File as FileIcon, Play, Square, User,
   CheckCircle2, XCircle, Loader2, AlertTriangle, Users, Clock, Star
 } from 'lucide-react';
 import type { PageConfig } from '../types';
@@ -51,6 +51,7 @@ export const BroadcastTab: React.FC<BroadcastTabProps> = ({ pages, selectedPageI
   const [batchSize, setBatchSize] = useState(50);
   const [batchPauseSec, setBatchPauseSec] = useState(60);
   const [tag, setTag] = useState('');
+  const [preset, setPreset] = useState('');
   const [jobId, setJobId] = useState('');
   const [status, setStatus] = useState<JobStatus | null>(null);
   const [error, setError] = useState('');
@@ -73,6 +74,16 @@ export const BroadcastTab: React.FC<BroadcastTabProps> = ({ pages, selectedPageI
       else setError(data.message || 'สแกนไม่สำเร็จ');
     } catch { setError('เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ'); }
     finally { setScanning(false); }
+  };
+
+  const applyPreset = (key: string, daysBack: number, onlyThatDay = false) => {
+    const fmt = (d: Date) => d.toISOString().slice(0, 10);
+    const today = new Date();
+    const sinceD = new Date(today);
+    sinceD.setDate(today.getDate() - daysBack);
+    setSince(fmt(sinceD));
+    setUntil(onlyThatDay ? fmt(sinceD) : '');
+    setPreset(key);
   };
 
   const doUpload = async () => {
@@ -185,6 +196,20 @@ export const BroadcastTab: React.FC<BroadcastTabProps> = ({ pages, selectedPageI
                 <input type="date" value={until} onChange={e => setUntil(e.target.value)} className={`w-full ${inputCls}`} />
               </div>
             </div>
+            <div className="flex gap-1.5 flex-wrap">
+              {[
+                { key: 'yesterday', label: 'เมื่อวาน', days: 1, only: true },
+                { key: '7d', label: '7 วันที่ผ่านมา', days: 7 },
+                { key: '14d', label: '14 วัน', days: 14 },
+                { key: '30d', label: '1 เดือน', days: 30 }
+              ].map(b => (
+                <button key={b.key} type="button"
+                  onClick={() => applyPreset(b.key, b.days, b.only)}
+                  className={`px-2.5 py-1.5 rounded-lg text-[10px] font-bold border transition-colors ${preset === b.key ? 'bg-indigo-600 text-white border-indigo-600' : dark ? 'bg-[#16161C] border-zinc-800 text-zinc-300 hover:border-indigo-500' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-400'}`}>
+                  {b.label}
+                </button>
+              ))}
+            </div>
             <div>
               <label className={`text-[10px] font-bold block mb-1 ${subtle}`}>สถานะติดดาว</label>
               <div className="flex gap-1.5">
@@ -205,7 +230,25 @@ export const BroadcastTab: React.FC<BroadcastTabProps> = ({ pages, selectedPageI
               <div className={`p-3 rounded-lg border ${dark ? 'bg-emerald-950/20 border-emerald-800/40' : 'bg-emerald-50 border-emerald-200'}`}>
                 <p className={`text-xs font-bold ${dark ? 'text-emerald-300' : 'text-emerald-700'}`}>พบเป้าหมาย {scan.total} คน</p>
                 {scan.targets.length > 0 && (
-                  <p className={`text-[10px] mt-1 ${subtle} truncate`}>ตัวอย่าง: {scan.targets.slice(0, 4).map(t => t.name).join(', ')}{scan.total > 4 ? ' ...' : ''}</p>
+                  <div className="mt-2 space-y-1.5">
+                    {scan.targets.slice(0, 6).map(t => (
+                      <div key={t.sender_id} className="flex items-center gap-2">
+                        <div className={`w-6 h-6 rounded-full overflow-hidden relative shrink-0 flex items-center justify-center ${dark ? 'bg-zinc-800' : 'bg-slate-200'}`}>
+                          <User className="w-3 h-3 text-slate-400" />
+                          <img
+                            src={`/api/inbox/avatar?page_id=${encodeURIComponent(selectedPageId)}&sender_id=${encodeURIComponent(t.sender_id)}`}
+                            onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                            className="absolute inset-0 w-full h-full object-cover"
+                            alt=""
+                          />
+                        </div>
+                        <span className={`text-[11px] font-medium truncate ${dark ? 'text-zinc-200' : 'text-slate-700'}`}>{t.name}</span>
+                        {t.starred && <Star className="w-3 h-3 text-amber-400 fill-amber-400 shrink-0" />}
+                        <span className={`text-[9px] ml-auto shrink-0 ${subtle}`}>{t.last_message_at ? new Date(t.last_message_at).toLocaleDateString('th-TH') : ''}</span>
+                      </div>
+                    ))}
+                    {scan.total > 6 && <p className={`text-[10px] ${subtle}`}>+ อีก {scan.total - 6} คน</p>}
+                  </div>
                 )}
               </div>
             )}

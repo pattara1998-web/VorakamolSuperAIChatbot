@@ -125,6 +125,19 @@ export const SalesDashboardTab: React.FC<SalesDashboardTabProps> = ({
   const estimatedCOGS = totalRevenue > 0 ? Math.round(totalRevenue * (cogsPercent / 100)) : 0;
   const estimatedShippingCost = totalOrdersCount * shippingPerOrder;
   const grossProfit = totalRevenue > 0 ? Math.max(0, totalRevenue - estimatedCOGS - estimatedShippingCost) : 0;
+
+  // ── สรุปบัญชีจริง: ยอดขาย - ต้นทุนสินค้า - ค่าแอด - ค่าใช้จ่าย (จากข้อมูลจริงทุกตัว) ──
+  const [accSummary, setAccSummary] = useState<any>(null);
+  const [accLoading, setAccLoading] = useState(false);
+  const fetchAccounting = React.useCallback(() => {
+    setAccLoading(true);
+    fetch('/api/accounting/summary')
+      .then(r => r.json())
+      .then(d => { if (d.success) setAccSummary(d); })
+      .catch(() => {})
+      .finally(() => setAccLoading(false));
+  }, []);
+  React.useEffect(() => { fetchAccounting(); }, [fetchAccounting]);
   const grossProfitMargin = totalRevenue > 0 ? ((grossProfit / totalRevenue) * 100).toFixed(1) : '0.0';
 
   // Ad Spend & ROAS Metrics (Real Calculations)
@@ -444,6 +457,67 @@ export const SalesDashboardTab: React.FC<SalesDashboardTabProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* ── สรุปบัญชีจริง (ต้นทุนสินค้า + งบแอด + ค่าใช้จ่าย + กำไร) ── */}
+      <div className="bg-white dark:bg-[#0F0F12] border-2 border-emerald-200 dark:border-emerald-900/60 rounded-2xl p-5 shadow-sm">
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+          <h3 className="text-sm font-bold text-slate-900 dark:text-zinc-100 flex items-center gap-2">
+            💰 สรุปบัญชีจริง — กำไรขาดทุนจากตัวเลขที่กรอกเอง
+          </h3>
+          <button onClick={fetchAccounting} disabled={accLoading} className="text-[11px] font-bold text-indigo-600 dark:text-indigo-400 flex items-center gap-1 disabled:opacity-50">
+            <RefreshCw className={`w-3 h-3 ${accLoading ? 'animate-spin' : ''}`} /> รีเฟรช
+          </button>
+        </div>
+        {accSummary ? (
+          <>
+            <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-4">
+              {[
+                { label: 'ยอดขายวันนี้', val: accSummary.today.revenue, cls: 'text-emerald-600 dark:text-emerald-400' },
+                { label: 'ต้นทุนสินค้า', val: accSummary.today.productCost, cls: 'text-rose-600 dark:text-rose-400' },
+                { label: 'งบแอดวันนี้', val: accSummary.today.adSpend, cls: 'text-orange-600 dark:text-orange-400' },
+                { label: 'ค่าใช้จ่ายอื่น', val: accSummary.today.otherCost, cls: 'text-slate-500 dark:text-zinc-400' },
+                { label: 'ออเดอร์วันนี้', val: accSummary.today.orders, cls: 'text-indigo-600 dark:text-indigo-400' },
+                { label: '💰 กำไรสุทธิวันนี้', val: accSummary.today.profit, cls: accSummary.today.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400' }
+              ].map(item => (
+                <div key={item.label} className="rounded-xl bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 p-3 text-center">
+                  <div className={`text-lg font-black font-mono ${item.cls}`}>{typeof item.val === 'number' && item.label !== 'ออเดอร์วันนี้' ? '฿' : ''}{typeof item.val === 'number' ? item.val.toLocaleString() : item.val}</div>
+                  <div className="text-[10px] font-bold text-slate-500 dark:text-zinc-400 mt-0.5">{item.label}</div>
+                </div>
+              ))}
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+              {[
+                { label: 'ยอดขายรวมทั้งหมด', val: accSummary.all.revenue },
+                { label: 'ต้นทุนรวมทั้งหมด', val: accSummary.all.productCost },
+                { label: 'ค่าส่งรวม (ต่อชิ้น)', val: accSummary.all.shipping },
+                { label: 'กำไรรวมทั้งหมด', val: accSummary.all.profit }
+              ].map(item => (
+                <div key={item.label} className="flex items-center justify-between px-3 py-2 rounded-lg bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 text-xs">
+                  <span className="text-slate-500 dark:text-zinc-400">{item.label}</span>
+                  <span className="font-mono font-black text-slate-800 dark:text-zinc-100">฿{item.val.toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+            {accSummary.perPage.length > 0 && (
+              <div className="space-y-1.5">
+                <p className="text-[10px] font-bold text-slate-500 dark:text-zinc-400">รายเพจ (วันนี้ — เฉพาะเพจที่มียอด/งบ):</p>
+                {accSummary.perPage.map((p: any) => (
+                  <div key={p.page_id} className="flex items-center gap-2 text-[11px] px-2.5 py-1.5 rounded-lg bg-slate-50 dark:bg-[#16161C]">
+                    <span className="truncate flex-1 font-medium text-slate-700 dark:text-zinc-200">{p.page_name}</span>
+                    <span className="font-mono text-emerald-600 dark:text-emerald-400">ขาย ฿{p.revenue.toLocaleString()}</span>
+                    <span className="font-mono text-orange-500">แอด ฿{p.adSpend.toLocaleString()}</span>
+                    <span className={`font-mono font-bold ${p.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-500'}`}>กำไร ฿{p.profit.toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <p className="text-[10px] text-slate-400 dark:text-zinc-500 mt-3">
+              กรอกงบแอด/ค่าส่ง/ค่าใช้จ่ายของแต่ละเพจได้ที่: ตั้งค่าเพจ → แท็บ "12. บัญชี & กำไรรายวัน 💰" | ต้นทุนสินค้ากรอกได้ที่ฐานข้อมูลสินค้า
+            </p>
+          </>
+        ) : (
+          <p className="text-xs text-slate-500 dark:text-zinc-400">กำลังโหลดข้อมูลบัญชี...</p>
+        )}
+      </div>
       {/* SECTION 1: EXECUTIVE FINANCIAL & OPERATIONAL KPI CARDS */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {/* 1. Total Gross Revenue & Profit */}

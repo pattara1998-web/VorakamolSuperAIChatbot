@@ -54,6 +54,8 @@ export const ProductTemplateModal: React.FC<ProductTemplateModalProps> = ({
     product_name: '',
     category: '',
     display_price: 0,
+    cost_price: 0,
+    shipping_cost: 0,
     price_1: 0,
     price_2: 0,
     price_3: 0,
@@ -1601,6 +1603,36 @@ export const ProductTemplateModal: React.FC<ProductTemplateModalProps> = ({
                         value={formData.display_price || 0}
                         onChange={e => setFormData({ ...formData, display_price: Number(e.target.value) })}
                         className="w-full bg-white dark:bg-[#0A0A0C] border border-slate-200 dark:border-zinc-800 rounded-lg pl-7 pr-3 py-2 text-xs font-mono font-bold focus:border-emerald-500 outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block font-bold text-rose-700 dark:text-rose-400 mb-1">
+                      ต้นทุนสินค้า (cost_price)
+                    </label>
+                    <div className="relative">
+                      <span className="absolute left-3 top-2 text-rose-400 font-bold">฿</span>
+                      <input
+                        type="number"
+                        value={formData.cost_price || 0}
+                        onChange={e => setFormData({ ...formData, cost_price: Number(e.target.value) })}
+                        className="w-full bg-white dark:bg-[#0A0A0C] border border-rose-200 dark:border-rose-900 rounded-lg pl-7 pr-3 py-2 text-xs font-mono font-bold text-rose-700 dark:text-rose-300 focus:border-rose-500 outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block font-bold text-sky-700 dark:text-sky-400 mb-1">
+                      ค่าส่งสินค้า (shipping_cost)
+                    </label>
+                    <div className="relative">
+                      <span className="absolute left-3 top-2 text-sky-400 font-bold">฿</span>
+                      <input
+                        type="number"
+                        value={formData.shipping_cost || 0}
+                        onChange={e => setFormData({ ...formData, shipping_cost: Number(e.target.value) })}
+                        className="w-full bg-white dark:bg-[#0A0A0C] border border-sky-200 dark:border-sky-900 rounded-lg pl-7 pr-3 py-2 text-xs font-mono font-bold text-sky-700 dark:text-sky-300 focus:border-sky-500 outline-none"
                       />
                     </div>
                   </div>

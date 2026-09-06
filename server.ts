@@ -1844,6 +1844,24 @@ async function startServer() {
     }
     await dbService.updateConversationState(page_id, sender_id, { is_unread: 0, unread_count: 0 }).catch(() => {});
 
+    // ยังไม่มีรูป/ชื่อจริง? ดึงโปรไฟล์จาก Facebook มาเก็บ cache ทันที (ครั้งเดียวจบ)
+    const curState = await dbService.getConversationState(page_id, sender_id).catch(() => null);
+    if (curState && !curState.participant_pic && rawToken?.startsWith('EAA')) {
+      fetch(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(sender_id)}?fields=first_name,last_name,profile_pic&access_token=${encodeURIComponent(rawToken)}`)
+        .then(r => r.json())
+        .then(async (pf: any) => {
+          if (pf.profile_pic) {
+            const name = [pf.first_name, pf.last_name].filter(Boolean).join(' ').trim();
+            await dbService.updateConversationState(page_id, sender_id, {
+              participant_pic: pf.profile_pic,
+              ...(name ? { participant_name: name } : {})
+            }).catch(() => {});
+            dbBridge.broadcastSSE('inbox_state_changed', { page_id, sender_id }, page_id);
+          }
+        })
+        .catch(() => {});
+    }
+
     res.json({ success: true, messages, source, page_id, sender_id });
   });
 
@@ -1886,7 +1904,10 @@ async function startServer() {
       const g: any = await fetch(url, { signal: controller.signal });
       clearTimeout(timer);
       const gd: any = await g.json();
-      if (gd.error || !gd.profile_pic) return res.status(404).json({ error: 'NO_PROFILE' });
+      if (gd.error || !gd.profile_pic) {
+        // Fallback: /{psid}/picture redirect endpoint (บาง PSID fields ไม่ได้แต่ picture ได้)
+        return res.redirect(302, `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(sender_id)}/picture?type=normal&access_token=${encodeURIComponent(rawToken)}`);
+      }
 
       const name = [gd.first_name, gd.last_name].filter(Boolean).join(' ').trim();
       await dbService.updateConversationState(page_id, sender_id, {
@@ -2058,6 +2079,112 @@ async function startServer() {
     if (!job) return res.status(404).json({ success: false, message: 'ไม่พบ job' });
     job.stopped = true;
     res.json({ success: true, message: 'สั่งหยุดแล้ว — จะหยุดหลังข้อความปัจจุบันเสร็จ' });
+  });
+
+  // ================================================================
+  // ACCOUNTING: งบแอด/ค่าใช้จ่ายรายวันต่อเพจ + สรุปกำไรขาดทุน
+  // ================================================================
+
+  // อ่านค่าใช้จ่ายของเพจในวันที่กำหนด (default วันนี้)
+  app.get('/api/expenses', async (req: Request, res: Response) => {
+    const page_id = req.query.page_id as string;
+    const expense_date = (req.query.date as string) || new Date().toISOString().slice(0, 10);
+    if (!page_id) return res.status(400).json({ success: false, message: 'ต้องระบุ page_id' });
+    const row = await dbService.getPageExpense(page_id, expense_date);
+    res.json({
+      success: true,
+      page_id,
+      expense_date,
+      ad_spend: Number(row?.ad_spend) || 0,
+      shipping_cost: Number(row?.shipping_cost) || 0,
+      other_cost: Number(row?.other_cost) || 0,
+      note: row?.note || ''
+    });
+  });
+
+  // บันทึกงบยิงแอด/ค่าส่ง/ค่าใช้จ่ายอื่นของเพจในวันนั้น
+  app.post('/api/expenses', async (req: Request, res: Response) => {
+    const { page_id, expense_date, ad_spend, shipping_cost, other_cost, note } = req.body || {};
+    if (!page_id || !expense_date) return res.status(400).json({ success: false, message: 'ต้องระบุ page_id และ expense_date' });
+    if (!db.pages.find(p => p.page_id === page_id)) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    await dbService.upsertPageExpense(page_id, expense_date, {
+      ad_spend: Number(ad_spend) || 0,
+      shipping_cost: Number(shipping_cost) || 0,
+      other_cost: Number(other_cost) || 0,
+      note: typeof note === 'string' ? note.slice(0, 300) : ''
+    });
+    persistData();
+    res.json({ success: true, page_id, expense_date });
+  });
+
+  // สรุปบัญชี: ยอดขาย / ต้นทุนสินค้า / ค่าแอด / ค่าใช้จ่าย / กำไร (รายวัน + รวมทั้งหมด)
+  app.get('/api/accounting/summary', async (req: Request, res: Response) => {
+    const today = (req.query.date as string) || new Date().toISOString().slice(0, 10);
+
+    const calc = (orderList: any[]) => {
+      let revenue = 0, productCost = 0, shipping = 0, orderCount = 0;
+      for (const o of orderList) {
+        if (o.is_cancelled || o.payment_status === 'CANCELLED') continue;
+        const qty = Number(o.quantity) || 1;
+        const amount = Number(o.total_amount) || 0;
+        revenue += amount;
+        orderCount++;
+        // ต้นทุนจากสินค้าของเพจนั้น (cost_price + shipping_cost ต่อชิ้น)
+        const page = db.pages.find(p => p.page_id === o.page_id);
+        const prod: any = page?.product || {};
+        const cost = Number(prod.cost_price) || 0;
+        const ship = Number(prod.shipping_cost) || 0;
+        productCost += cost * qty;
+        shipping += ship * qty;
+      }
+      return { revenue, productCost, shipping, orderCount };
+    };
+
+    const todaysOrders = db.orders.filter(o => String(o.created_at || '').startsWith(today));
+    const todayCalc = calc(todaysOrders);
+    const allCalc = calc(db.orders);
+
+    const expensesToday = await dbService.getExpensesForDate(today);
+    const adSpend = expensesToday.reduce((s, e) => s + (Number(e.ad_spend) || 0), 0);
+    const shippingPaid = expensesToday.reduce((s, e) => s + (Number(e.shipping_cost) || 0), 0);
+    const otherCost = expensesToday.reduce((s, e) => s + (Number(e.other_cost) || 0), 0);
+
+    const todayProfit = todayCalc.revenue - todayCalc.productCost - adSpend - otherCost;
+    const allProfit = allCalc.revenue - allCalc.productCost - allCalc.shipping;
+
+    res.json({
+      success: true,
+      date: today,
+      today: {
+        revenue: todayCalc.revenue,
+        orders: todayCalc.orderCount,
+        productCost: todayCalc.productCost,
+        adSpend,
+        shippingPaid,
+        otherCost,
+        profit: todayProfit
+      },
+      all: {
+        revenue: allCalc.revenue,
+        orders: allCalc.orderCount,
+        productCost: allCalc.productCost,
+        shipping: allCalc.shipping,
+        profit: allProfit
+      },
+      perPage: db.pages.map(p => {
+        const e = expensesToday.find(x => x.page_id === p.page_id);
+        const pageOrders = todaysOrders.filter(o => o.page_id === p.page_id);
+        const pageRevenue = pageOrders.reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
+        return {
+          page_id: p.page_id,
+          page_name: p.page_name,
+          revenue: pageRevenue,
+          adSpend: Number(e?.ad_spend) || 0,
+          otherCost: Number(e?.other_cost) || 0,
+          profit: pageRevenue - (Number(e?.ad_spend) || 0) - (Number(e?.other_cost) || 0)
+        };
+      }).filter(p => p.revenue > 0 || p.adSpend > 0)
+    });
   });
 
   // ================================================================
@@ -5205,6 +5332,27 @@ ${JSON.stringify(categorySummary, null, 2)}
   // ================================================================
   // Connection Status with isConnected flag
   // ================================================================
+  // กวาดเพจปลอม/เพจทดสอบที่หลงเหลือออกจากระบบ (ใช้ได้ทุกเมื่อ — ข้อมูลจริงไม่กระทบ)
+  app.post('/api/pages/cleanup-fake', async (req: Request, res: Response) => {
+    const FAKE_IDS = ['selftest_page', 'persist_test_page', 'ai_test_page', 'test_upgrade_page', 'test_smoke_page', 'template-default', 'AMULET_PAGE_ID', 'CHINA_PAGE_ID', 'AMULET_PAGE_ID_2'];
+    const FAKE_NAMES = ['เพจทดสอบ', 'เพจสำหรับทดสอบระบบ', 'เพจทดสอบ Persistence', 'AI Test Page', 'SmokeTestPage', 'เพจใหม่', 'เพจทดสอบอัปเกรด'];
+    const removed: string[] = [];
+    for (const p of [...db.pages]) {
+      const fakeId = FAKE_IDS.includes(p.page_id) || p.page_id.startsWith('selftest_') || p.page_id.startsWith('test_');
+      const fakeName = FAKE_NAMES.some(n => (p.page_name || '').includes(n)) && !Boolean((p as any).is_connected);
+      if (fakeId || fakeName) {
+        removed.push(p.page_name + '(' + p.page_id + ')');
+        db.pages = db.pages.filter(x => x.page_id !== p.page_id);
+        await dbService.deletePage(p.page_id).catch(() => {});
+      }
+    }
+    if (removed.length) {
+      persistData();
+      addLog('INFO', 'DATABASE', 'SYSTEM', `🧹 กวาดเพจปลอมออก ${removed.length} หน้า: ${removed.slice(0, 5).join(', ')}`, 'SUCCESS');
+    }
+    res.json({ success: true, removed: removed.length, remaining: db.pages.length });
+  });
+
   // Fresh page avatar proxy: Facebook CDN URLs stored in the DB expire after
   // a while, which made page profile pictures disappear from the UI. Redirect
   // to a live Graph API picture URL generated with the stored page token.

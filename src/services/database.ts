@@ -313,6 +313,20 @@ async function initTables() {
     ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS participant_pic TEXT DEFAULT '';
     ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS bot_paused INTEGER DEFAULT 0;
 
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS cost_price DOUBLE PRECISION DEFAULT 0;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS shipping_cost DOUBLE PRECISION DEFAULT 0;
+
+    CREATE TABLE IF NOT EXISTS page_daily_expenses (
+      page_id TEXT NOT NULL,
+      expense_date TEXT NOT NULL,
+      ad_spend DOUBLE PRECISION DEFAULT 0,
+      shipping_cost DOUBLE PRECISION DEFAULT 0,
+      other_cost DOUBLE PRECISION DEFAULT 0,
+      note TEXT DEFAULT '',
+      updated_at TEXT DEFAULT ${PG_NOW_DEFAULT},
+      PRIMARY KEY (page_id, expense_date)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_products_page ON products(page_id);
     CREATE INDEX IF NOT EXISTS idx_customers_page ON customers(page_id);
     CREATE INDEX IF NOT EXISTS idx_orders_page ON orders(page_id);
@@ -879,6 +893,46 @@ export async function recordOutgoingMessage(pageId: string, senderId: string, te
        updated_at = EXCLUDED.updated_at`,
     [pageId, senderId, now, String(text || '').slice(0, 200), now]
   );
+}
+
+// ===================== PAGE DAILY EXPENSES (งบแอด/ค่าส่ง/ค่าใช้จ่ายรายวัน) =====================
+
+export interface PageDailyExpenseRow {
+  page_id: string;
+  expense_date: string;
+  ad_spend: number;
+  shipping_cost: number;
+  other_cost: number;
+  note: string;
+  updated_at: string;
+}
+
+export async function getPageExpense(pageId: string, expenseDate: string): Promise<PageDailyExpenseRow | undefined> {
+  const res = await q('SELECT * FROM page_daily_expenses WHERE page_id = ? AND expense_date = ? LIMIT 1', [pageId, expenseDate]);
+  return res.rows[0] ?? undefined;
+}
+
+export async function upsertPageExpense(pageId: string, expenseDate: string, patch: { ad_spend?: number; shipping_cost?: number; other_cost?: number; note?: string }): Promise<void> {
+  const cols: Record<string, any> = {
+    page_id: pageId, expense_date: expenseDate,
+    ad_spend: patch.ad_spend ?? 0, shipping_cost: patch.shipping_cost ?? 0,
+    other_cost: patch.other_cost ?? 0, note: patch.note ?? '',
+    updated_at: new Date().toISOString()
+  };
+  const keys = Object.keys(cols);
+  const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
+  await q(
+    `INSERT INTO page_daily_expenses (${keys.join(', ')}) VALUES (${placeholders})
+     ON CONFLICT (page_id, expense_date) DO UPDATE SET
+       ad_spend = EXCLUDED.ad_spend, shipping_cost = EXCLUDED.shipping_cost,
+       other_cost = EXCLUDED.other_cost, note = EXCLUDED.note, updated_at = EXCLUDED.updated_at`,
+    keys.map(k => cols[k] ?? null)
+  );
+}
+
+export async function getExpensesForDate(expenseDate: string): Promise<PageDailyExpenseRow[]> {
+  const res = await q('SELECT * FROM page_daily_expenses WHERE expense_date = ?', [expenseDate]);
+  return res.rows;
 }
 
 // ===================== DATA MIGRATION (JSON -> PostgreSQL) =====================

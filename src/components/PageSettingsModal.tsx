@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { AccountingTab } from './AccountingTab';
 import {
   X,
   Save,
@@ -25,6 +26,7 @@ import {
   FileImage,
   Eye,
   Bell,
+  DollarSign,
   AtSign,
   FileText,
   Copy,
