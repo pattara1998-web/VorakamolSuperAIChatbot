@@ -115,9 +115,9 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
       hasProductData: Boolean(p.product?.product_name && (p.product?.display_price > 0 || p.product?.description)),
       adminName: p.admin_name || 'น้ำหวาน',
       model: p.ai_model || 'gemini-3.6-flash',
-      // Real Facebook pages: load the avatar through the server proxy (fresh
-      // Graph URL) — stored CDN URLs expire and made pictures disappear.
-      avatar: /^\d+$/.test(p.page_id)
+      // รูปโปรไฟล์จริงจาก Facebook ผ่าน server proxy — ใช้กับทุกเพจที่มี token
+      // (เพจ FB รุ่นใหม่ ID เป็นตัวอักษรด้วย) onError จะ fallback ให้เอง
+      avatar: (p.page_access_token || '').startsWith('EAA')
         ? `/api/pages/${p.page_id}/avatar`
         : (p.page_avatar || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=200&h=200&q=80'),
       cover: p.page_cover || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1200&q=80',
