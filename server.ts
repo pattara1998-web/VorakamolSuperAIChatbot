@@ -1026,10 +1026,11 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
     };
 
     let lastErr: any = null;
-    for (const model of candidates) {
-      // งบ output: ถ้า JSON ถูกตัดเพราะ MAX_TOKENS จะยิงซ้ำโมเดลเดิมด้วยงบสองเท่า (สูงสุด 1 ครั้ง)
-      let budget = maxOutputTokens;
-      for (let tokenRetry = 0; tokenRetry < 2; tokenRetry++) {
+    const runModelChain = async () => {
+      for (const model of candidates) {
+        // งบ output: ถ้า JSON ถูกตัดเพราะ MAX_TOKENS จะยิงซ้ำโมเดลเดิมด้วยงบสองเท่า (สูงสุด 1 ครั้ง)
+        let budget = maxOutputTokens;
+        for (let tokenRetry = 0; tokenRetry < 2; tokenRetry++) {
         try {
           const response = await generateWithFastRetry(getGemini(), model, {
             contents,
@@ -1072,6 +1073,18 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
       }
     }
     throw lastErr || new Error('GEMINI_ALL_MODELS_FAILED');
+    };
+
+    try {
+      return await runModelChain();
+    } catch (chainErr: any) {
+      // คีย์ฟรีโดนเพดานต่อนาทีบ่อย (429) — พักสั้นแล้วลองทั้ง chain อีกครั้งก่อนยอมแพ้
+      if (isModelOrQuotaError(chainErr)) {
+        await new Promise(r => setTimeout(r, 2500));
+        return await runModelChain();
+      }
+      throw chainErr;
+    }
   }
 
   const info = AI_PROVIDERS[provider];
@@ -4214,16 +4227,27 @@ ${JSON.stringify((page.product?.promotions || [
 
       } catch (aiErr: any) {
         console.error('Gemini AI execution error:', aiErr);
-        // Short, relevant fallback — never dump the whole product sheet. A
-        // small rotating set keeps repeated failures from reading as a stuck
-        // record if the customer keeps messaging during an outage.
+        // ลูกค้าต้องได้คำตอบที่ "ขายต่อ" เสมอ — ใช้ intent ที่จับได้ + ข้อมูลราคาจริง
+        // จากเพจ ไม่มีคำว่า "ระบบมีปัญหา" ให้ลูกค้าเสียมู้ดซื้อ
         const price = (page.product?.display_price || matchedProduct.display_price || 0).toLocaleString();
-        const fallbackTemplates = [
-          `ขออภัยค่ะ ระบบขัดข้องชั่วครู่ 🙏 ${page.product?.product_name || 'สินค้าของเรา'} ราคา ฿${price} สอบถามเพิ่มเติมได้เลยนะคะ แอดมินจะรีบตอบให้เร็วที่สุดค่ะ`,
-          `🙏 ขออภัยด้วยนะคะ ตอนนี้ระบบตอบอัตโนมัติมีปัญหาชั่วคราว แอดมินจะรีบกลับมาตอบเร็วที่สุดค่ะ (สนใจ ${page.product?.product_name || 'สินค้า'} ราคา ฿${price})`,
-          `สวัสดีค่ะ 🙏 ขอโทษที่ตอบช้า ระบบกำลังซ่อมบำรุงค่ะ ฝากข้อความไว้ได้เลยนะคะ แอดมินจะรีบตอบให้เองค่ะ`
-        ];
-        const fallbackReply = fallbackTemplates[Math.floor(Math.random() * fallbackTemplates.length)];
+        const productName = page.product?.product_name || 'สินค้าของเรา';
+        const promos = (page.product?.promotions || []) as any[];
+        const promoLines = promos.filter(pr => pr && pr.name).map(pr => `"${pr.name}" ฿${Number(pr.price || 0).toLocaleString()}`).join(' / ');
+        const freeShipPromo = promos.find(pr => pr.free_shipping === true);
+        const freeShipLine = freeShipPromo ? ' แพ็กนี้ส่งฟรีค่ะ' : '';
+        const smartFallbacks: Record<string, () => string> = {
+          PRICE: () => `${productName} โปรอยู่ ฿${price} ค่ะ${promoLines ? ` (${promoLines})` : ''} สนใจเอาแพ็กไหนดีคะ`,
+          PROMOTION: () => `โปรโมชั่นตอนนี้ค่ะ: ${promoLines || `ซื้อเดี่ยว ฿${price}`}${freeShipPromo ? ' + ส่งฟรี' : ''} สนใจแพ็กไหนคะ`,
+          GREETING: () => `สวัสดีค่ะ ยินดีให้ข้อมูล ${productName} ค่ะ สอบถามราคาหรือโปรโมชั่นได้เลยนะคะ`,
+          SHIPPING: () => `จัดส่งไวภายใน 1-2 วันทำการค่ะ${freeShipPromo ? ' และมีแพ็กส่งฟรีด้วยค่ะ' : ''} สนใจสั่งเลยไหมคะ`,
+          TRUST: () => `รับประกันความแท้/คุณภาพเต็มที่ค่ะ และมีเก็บเงินปลายทางให้จ่ายสบายใจ สนใจดูราคา-โปรต่อไหมคะ`,
+          NEGOTIATION: () => `ราคานี้เป็นโปรพิเศษอยู่แล้วค่ะ${promos.length ? ` แถมของตามแพ็ก: ${promoLines}` : ''} สนใจเอาแพ็กไหนดีคะ`,
+          ORDER: () => `จัดให้เลยค่ะ 🙏 รบกวนแจ้ง ชื่อ-ที่อยู่-เบอร์โทร ให้ครบนะคะ เดี๋ยวจัดส่งให้ทันทีค่ะ`,
+          FOLLOWUP: () => `ตามคุณลูกค้าเลยค่ะ สนใจราคาโปร ฿${price} ใช่ไหมคะ`,
+          QUESTION: () => `${productName} โปรอยู่ ฿${price} ค่ะ อยากทราบสเปกหรือโปรโมชั่นเพิ่มแจ้งได้เลยนะคะ`
+        };
+        const smart = smartFallbacks[intentHint];
+        const fallbackReply = smart ? smart() : `${productName} โปรอยู่ ฿${price} ค่ะ สอบถามเพิ่มเติมได้เลยนะคะ`;
         addLog('AI_REPLY', senderId, pageId, `🤖 ตอบกลับแบบสำรอง (AI Error: ${aiErr.message})`, 'INFO');
         await sleep(Math.min(Number(page.reply_delay_ms ?? 300), 500));
         await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply);
