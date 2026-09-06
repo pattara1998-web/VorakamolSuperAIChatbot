@@ -184,19 +184,120 @@ const META_GRAPH_API_VERSION = process.env.META_GRAPH_API_VERSION || 'v24.0';
 const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 1500);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // Hard cap on any single AI call so a hung Gemini request can never leave a
-// customer waiting for minutes — we race the call against a timer and fall
-// back to a short template reply instead.
-const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 25000);
+// customer waiting for minutes — we race the call against a timer and, on
+// timeout, retry once on the lite model before falling back to a template.
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 9000);
+const AI_FAST_RETRY_MS = Number(process.env.AI_FAST_RETRY_MS || 6000);
+const AI_FAST_MODEL = process.env.AI_FAST_MODEL || 'gemini-2.5-flash-lite';
 function withTimeout<T>(promise: Promise<T>, ms: number, label = 'AI'): Promise<T> {
   return Promise.race([
     promise,
     new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label}_TIMEOUT`)), ms))
   ]);
 }
+// Two-stage AI call: primary model first; if it stalls or errors, one quick
+// retry on the lite model. Bounds worst-case latency at primaryMs + fastMs
+// instead of dropping straight to a template reply — only a total AI outage
+// (auth/quota/network down) reaches the fallback template.
+async function generateWithFastRetry(ai: any, primaryModel: string, params: any, primaryMs: number, fastMs: number): Promise<any> {
+  try {
+    return await withTimeout(ai.models.generateContent({ ...params, model: primaryModel }), primaryMs);
+  } catch (primaryErr: any) {
+    try {
+      return await withTimeout(ai.models.generateContent({ ...params, model: AI_FAST_MODEL }), fastMs);
+    } catch {
+      throw primaryErr;
+    }
+  }
+}
 // Dedupe stores: webhook pushes + Graph API polling may deliver the same
 // message/comment twice — never process (or reply to) an event twice.
 const processedMessageIds = new Set<string>();
 const processedCommentIds = new Set<string>();
+
+// ---------------------------------------------------------------------------
+// Thai-aware understanding helpers. Customers type with elongated characters
+// ("ราคาค่าาาา"), slang, emoji and no spaces — raw substring matching misses
+// all of that. Everything below runs instantly (no AI call) and its output is
+// fed INTO the AI prompt as a hint, plus used as a regex safety-net for
+// order data the AI may fail to extract.
+// ---------------------------------------------------------------------------
+function normalizeThaiText(input: string): string {
+  return String(input || '')
+    .toLowerCase()
+    .replace(/(.)\1{2,}/g, '$1')                       // "ค่าาาา" → "ค่าา"
+    .replace(/[\u200b-\u200f\uFEFF]/g, '')             // zero-width / bidi marks
+    // Keep \p{M}: Thai tone marks and combining vowels are Unicode marks,
+    // stripping them would mangle every word ("เท่าไหร่" → "เทา ไหร").
+    .replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+type IntentHint = 'GREETING' | 'PRICE' | 'PROMOTION' | 'SHIPPING' | 'TRUST' | 'NEGOTIATION' | 'ORDER' | 'FOLLOWUP' | 'QUESTION';
+
+// Ordered by priority: order signals outrank price signals, price outranks
+// greeting — "สวัสดีคะราคาเท่าไหร่" must classify as PRICE, not GREETING.
+const INTENT_KEYWORDS: Array<[IntentHint, string[]]> = [
+  ['ORDER', ['สั่งซื้อ', 'จอง', 'โอนเงิน', 'โอนแล้ว', 'ชำระเงินแล้ว', 'ชำระเงิน', 'ยืนยันออเดอร์', 'เอาไปเลย', 'ตัดสินใจแล้ว', 'กรอกที่อยู่', 'ส่งที่อยู่', 'เอา 2', 'เอา 3', 'เอาสอง', 'เอาสาม', 'ซื้อเลย']],
+  ['NEGOTIATION', ['ลดได้ไหม', 'ลดได้มั้ย', 'ลดหน่อย', 'ลดอีก', 'ต่อรอง', 'ถูกกว่านี้', 'ขอราคาพิเศษ', 'แพงไป', 'แพงสุด', 'ขอส่วนลด']],
+  ['TRUST', ['ของแท้', 'ของปลอม', 'โกง', 'หลอก', 'มั่นใจ', 'เชื่อถือ', 'รับประกัน', 'รีวิว', 'เคลม', 'ยังไงถึงไว้ใจ', 'ขายมานานไหม']],
+  ['SHIPPING', ['ส่งกี่วัน', 'ส่งเมื่อไหร่', 'ส่งทางไหน', 'ส่งฟรี', 'ค่าส่ง', 'เก็บเงินปลายทาง', 'มีcod', 'พัสดุ', 'จัดส่ง', 'ส่งด่วน', 'ลงทะเบียน']],
+  ['PROMOTION', ['โปรโมชั่น', 'โปรโมชั้น', 'มีโปร', 'โปรไหน', 'ของแถม', 'แถมไร', 'แถมอะไร', 'แพ็คเกจ', 'แพ็คไหน', 'ชุดไหน', 'ซื้อ 2 แถม', 'คุ้มสุด']],
+  ['PRICE', ['ราคา', 'เท่าไหร่', 'เท่าไร', 'กี่บาท', 'เหลือเท่าไหร่', 'จ่ายเท่าไหร่', 'ตัวละ']],
+  ['GREETING', ['สวัสดี', 'หวัดดี', 'hello', 'hi ', 'สอบถาม', 'ทักครับ', 'ทักค่ะ', 'แอดมินอยู่ไหม', 'มาจากเพจ', 'ดีครับ', 'ดีค่ะ']],
+  ['FOLLOWUP', ['เมื่อกี้', 'ก่อนหน้า', 'ตามที่คุย', 'ที่บอกไว้', 'อันที่ถาม']]
+];
+
+function classifyIntentInstant(rawText: string): IntentHint {
+  const text = normalizeThaiText(rawText);
+  if (!text) return 'QUESTION';
+  for (const [intent, keywords] of INTENT_KEYWORDS) {
+    if (keywords.some(k => text.includes(normalizeThaiText(k)))) return intent;
+  }
+  return 'QUESTION';
+}
+
+// Regex safety-net: pull phone/address straight from the message so an order
+// is never lost just because the AI omitted a field in its JSON.
+function extractOrderInfo(rawText: string): { phone_number: string; address: string } {
+  const text = String(rawText || '');
+  const compact = text.replace(/[-\s.]/g, '');
+  const phoneMatch = compact.match(/(?<!\d)0\d{8,9}(?!\d)/);
+  const addressMatch = text.match(/.{0,50}(?:\d{1,4}\/\d{1,5}|หมู่ที่?\s?\d|ม\.\s?\d|ซอย|ถนน|ต\.|อ\.|จังหวัด|แขวง|เขต|ตำบล|อำเภอ).{0,140}/);
+  return {
+    phone_number: phoneMatch ? phoneMatch[0] : '',
+    address: addressMatch ? addressMatch[0].trim() : ''
+  };
+}
+
+// Per-intent sales playbook injected into every prompt so the AI does not just
+// answer — it sells. Strategies only ever use REAL product data (promotions,
+// free_shipping flags) already in the prompt; nothing here invents facts.
+const SALES_PLAYBOOK: Record<IntentHint, string> = {
+  GREETING: 'ลูกค้าเปิดแชท: ทักทายสั้น สุภาพ เป็นกันเอง 1 ประโยค แล้วถามกลับทันทีว่าสนใจเรื่องไหน (ราคา/โปรโมชั่น/สินค้า) ห้ามยัดรายละเอียดยาวตอนทักแรก',
+  PRICE: 'ลูกค้าถามราคา: ตอบราคาโปรโมชั่นตรงๆ ทันที (ใช้ตัวเลขจริงจากข้อมูลด้านล่าง) + ชี้จุดคุณค่า 1 ข้อ + ปิดท้ายด้วยการชวนเลือกแพ็กเกจ',
+  PROMOTION: 'ลูกค้าถามโปรโมชั่น/ของแถม: สรุปแพ็กเกจที่มีจริงแบบกระชับ เทียบให้เห็นว่าแพ็กไหนคุ้มสุด แล้วชวนเลือกซื้อแพ็กนั้น',
+  SHIPPING: 'ลูกค้าถามการจัดส่ง: ตอบตามข้อมูลจริงเท่านั้น (บอกส่งฟรีได้เฉพาะแพ็กที่ free_shipping=true) ย้ำเก็บเงินปลายทางถ้ามี แล้วชวนสั่ง',
+  TRUST: 'ลูกค้ากังวลความน่าเชื่อถือ: ไม่โต้ตอบเสียงดัง ย้ำจุดแข็งที่มีข้อมูลจริง เช่น รับประกันของแท้/รีวิวลูกค้า/เก็บเงินปลายทาง (ถ้ามี) ให้ลูกค้าตัดสินใจได้สบายใจ แล้วเสนอให้เริ่มจากแพ็กเล็กก็ได้',
+  NEGOTIATION: 'ลูกค้าต่อรองราคา: ยึดราคาที่ตั้งไว้ ห้ามลดราคาเองนอกโปรโมชั่น แต่นำเสนอมูลค่าเพิ่มจากโปร/ของแถมที่มีจริงแทน แล้วปิดการขาย',
+  ORDER: 'ลูกค้าแสดงเจตนาซื้อ/ให้ข้อมูล: ขอบคุณ + ยืนยันรายการสั้นๆ + ถ้าข้อมูลยังไม่ครบ (ชื่อ/เบอร์โทร/ที่อยู่) ให้ถามเฉพาะชิ้นที่ขาด ทีละอย่าง อย่าถามรวบทุกอย่างพร้อมกัน',
+  FOLLOWUP: 'ลูกค้าอ้างถึงบทสนทนาเดิม: ต่อประเด็นเดิมทันที ห้ามทักทายใหม่ ห้ามเริ่มเรื่องใหม่',
+  QUESTION: 'คำถามทั่วไป: ตอบตรงคำถามจากข้อมูลสินค้าเท่านั้น สั้นกระชับ แล้วปิดด้วยคำถามชวนคุยต่อ'
+};
+
+// Spec lines whose value is missing ("ไม่ระบุ") burn input tokens on every
+// single message without adding any knowledge — strip them before prompting.
+function compactSpecText(specs: string): string {
+  return specs
+    .split('\n')
+    .filter(line => {
+      const t = line.trim();
+      if (!t) return false;
+      return !t.endsWith(': ไม่ระบุ') && !t.endsWith(':');
+    })
+    .join('\n');
+}
 
 // ---------------------------------------------------------------------------
 // Per-conversation chat memory. Without it the AI only ever sees ONE message,
@@ -227,8 +328,24 @@ function pushHistory(pageId: string, senderId: string, role: 'customer' | 'admin
   } catch { /* non-critical */ }
 }
 function getRecentHistory(pageId: string, senderId: string, limit = 8): HistoryEntry[] {
-  const list = conversationHistory.get(`${pageId}:${senderId}`) || [];
-  return list.slice(-limit);
+  const key = `${pageId}:${senderId}`;
+  let list = conversationHistory.get(key);
+  if (!list || list.length === 0) {
+    // After a server restart the in-memory map is empty and the AI would act
+    // like it never spoke to this customer — seed it from SQLite chat_history.
+    try {
+      const rows = dbService.getRecentChatHistory(pageId, senderId, 12);
+      if (rows && rows.length > 0) {
+        list = rows.map(r => ({
+          role: r.role === 'admin' ? 'admin' as const : 'customer' as const,
+          text: String(r.text || '').slice(0, 600),
+          timestamp: Date.parse(r.created_at) || Date.now()
+        }));
+        conversationHistory.set(key, list);
+      }
+    } catch { /* non-critical: empty memory just means a fresh conversation */ }
+  }
+  return (list || []).slice(-limit);
 }
 function getRecentAdminReplies(pageId: string, senderId: string, limit = 4): string[] {
   return getRecentHistory(pageId, senderId, 20)
@@ -2328,7 +2445,8 @@ async function startServer() {
       }
 
       // Handle MESSENGER MESSAGE Event
-      addLog('MESSAGE', senderId, pageId, `📩 ลูกค้าทักแชท: "${messageText}"`, 'INFO', { senderId, pageId });
+      const intentHint: IntentHint = classifyIntentInstant(messageText);
+      addLog('MESSAGE', senderId, pageId, `📩 ลูกค้าทักแชท [intent:${intentHint}]: "${messageText}"`, 'INFO', { senderId, pageId, intentHint });
       // Remember the customer's message in conversation memory BEFORE any
       // mutation so first-message detection below stays truthful.
       const isNewCustomer = !db.customers.some(c => c.psid === senderId);
@@ -2510,10 +2628,11 @@ async function startServer() {
       const ai = getGemini();
 
       // Conversation memory: the last few exchanges so the answer continues
-      // the chat instead of ignoring what was already said.
+      // the chat instead of ignoring what was already said. (Each entry is
+      // capped at 200 chars in the prompt — full text lives in the DB.)
       const historyEntries = getRecentHistory(pageId, senderId, 8);
       const historyText = historyEntries.length
-        ? historyEntries.map(h => `${h.role === 'customer' ? 'ลูกค้า' : adminName}: ${h.text}`).join('\n')
+        ? historyEntries.map(h => `${h.role === 'customer' ? 'ลูกค้า' : adminName}: ${String(h.text).slice(0, 200)}`).join('\n')
         : '(ยังไม่มีประวัติบทสนทนา — นี่คือข้อความแรก)';
       // Replies already used in this conversation — the AI must not repeat them.
       const usedReplies = getRecentAdminReplies(pageId, senderId, 4);
@@ -2528,6 +2647,9 @@ async function startServer() {
 - โทนเสียง: ${aiTone}
 - ความยาวคำตอบ: ${brevityMode ? 'ตอบสั้น กระชับ ตรงประเด็น 1-3 ประโยค เหมือนคนพิมพ์แชทมือถือจริง' : 'ให้ข้อมูลครบถ้วน ชัดเจน แต่ไม่เกิน 5 ประโยค'}
 - คำสั่งเฉพาะของเพจนี้: ${customInstructions}
+
+🎯 เจตนาลูกค้าที่ระบบวิเคราะห์เบื้องต้น: ${intentHint}
+📋 กลยุทธ์การตอบสำหรับเจตนานี้: ${SALES_PLAYBOOK[intentHint]}
 
 👤 ข้อมูลลูกค้าคนนี้:
 - สถานะ: ${isReturningCustomer ? `⭐ ลูกค้าเก่า (เคยสั่งซื้อ ${customerOrderCount} ครั้ง ยอดรวม ฿${customerTotalSpent.toLocaleString()} ดาว ${customerStarRating}/5)` : '🆕 ลูกค้าใหม่ (ยังไม่เคยสั่งซื้อ)'}
@@ -2547,6 +2669,8 @@ ${usedRepliesText}
 3. ตอบเหมือนมนุษย์แอดมินคุยจริง พิมพ์สั้น เป็นธรรมชาติ ใช้คำอุดมคติของแอดมินไทย
 4. ตัวเลขราคา/โปรโมชั่น ใช้จากข้อมูลสินค้าด้านล่างเท่านั้น ห้ามเดา ห้ามมั่ว
 5. ห้ามอ้างว่าเป็น AI ห้ามแนะนำตัวซ้ำทุกข้อความ ห้ามทักทายใหม่ทุกครั้งเมื่อกำลังคุยอยู่
+6. ปิดท้ายทุกข้อความด้วยคำถามสั้นๆ ชวนตัดสินใจหรือชวนคุยต่อ (เช่น "เอาแพ็กนี้เลยไหมคะ" / "สนใจแบบไหนคะ") — ยกเว้นตอนลูกค้ากำลังส่งข้อมูลที่อยู่
+7. ถ้าลูกค้าให้ชื่อ/เบอร์โทร/ที่อยู่ ให้จดจำใช้ตลอดบทสนทนา ไม่ต้องถามซ้ำสิ่งที่ลูกค้าบอกไปแล้ว
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
@@ -2557,7 +2681,7 @@ ${usedRepliesText}
 - รายการของแถมในกล่อง: ${combinedSpecs.box_contents || 'ของแถมพิเศษ'}
 
 📋 ข้อมูลสเปกสินค้าแบบละเอียด (Detailed Product Specifications):
-${specsText}
+${compactSpecText(specsText)}
 - โปรโมชั่นทั้งหมดที่มี (ชื่อแพ็กเกจคือชื่อที่ร้านกำหนดเอง ให้ใช้ชื่อนี้ตามนั้น):
 ${JSON.stringify((page.product?.promotions || [
   { name: 'โปรโมชั่น 1 ชิ้น', price: matchedProduct.price_1 || 0 },
@@ -2570,15 +2694,12 @@ ${JSON.stringify((page.product?.promotions || [
   free_shipping: p.free_shipping === true,
   gift_quantity: p.gift_quantity || 0,
   free_gifts: p.free_gifts || ''
-})), null, 2)}
+})))}
 
 แพตเทิร์นการขาย 6 สเต็ปของเพจนี้ (ใช้เป็นแนวทาง ไม่ต้องเรียงทุกข้อความ):
 - สเต็ป 1 (ข้อความเปิด): ${page.sequence?.step1_opening_text || matchedProduct.opening_text}
 - สเต็ป 3 (รายละเอียดโปรโมชั่น): ${page.sequence?.step3_promotion_detail || matchedProduct.promotion_text}
 - สเต็ป 6 (ข้อความปิดการขาย): ${page.sequence?.step6_closing_text || matchedProduct.closing_text}
-
-ข้อมูลลูกค้าปัจจุบัน:
-${JSON.stringify({ name: customer.customer_name, status: customer.status, order_count: customer.order_count, notes: customer.notes }, null, 2)}
 
 กฎเหล็กเพิ่มเติม:
 1. ให้ข้อมูลเฉพาะสินค้าและโปรโมชั่นของเพจนี้ ห้ามแต่งข้อมูล ห้ามเดา
@@ -2594,23 +2715,23 @@ ${JSON.stringify({ name: customer.customer_name, status: customer.status, order_
 `;
 
       try {
-        // Timeout race: a hung Gemini call must never stall the customer for
-        // minutes — cap it and fall back to a short template reply.
-        const response = await withTimeout(ai.models.generateContent({
-          model: selectedModel,
+        // Timeout race: a hung Gemini call must never stall the customer —
+        // cap it, retry once on the lite model, then fall back to a template.
+        const aiStart = Date.now();
+        const response = await generateWithFastRetry(ai, selectedModel, {
           contents: promptContext,
           config: {
             responseMimeType: 'application/json',
             // Higher temperature => varied wording between replies (less
             // repetition); capped output keeps generation fast and chat-sized.
             temperature: 0.9,
-            maxOutputTokens: 600,
+            maxOutputTokens: 500,
             responseSchema: {
               type: Type.OBJECT,
               properties: {
                 intent: {
                   type: Type.STRING,
-                  description: 'QUESTION หรือ ORDER'
+                  description: 'GREETING, QUESTION, PRICE, PROMOTION, SHIPPING, TRUST, NEGOTIATION หรือ ORDER'
                 },
                 replyText: {
                   type: Type.STRING,
@@ -2640,11 +2761,21 @@ ${JSON.stringify({ name: customer.customer_name, status: customer.status, order_
               required: ['intent', 'replyText', 'isOrderDetected']
             }
           }
-        }), AI_TIMEOUT_MS);
+        }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
+        const aiLatencyMs = Date.now() - aiStart;
 
         const parsed: any = JSON.parse(response.text?.trim() || '{}');
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
         let replyText = parsed.replyText || page.sequence?.step1_opening_text || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นแจ้งได้เลยนะคะ 🙏';
+
+        // Merge regex-extracted order info: if the AI missed the phone or
+        // address but the customer clearly typed one, fill it in here so a
+        // valid order is never lost to an AI oversight. (Only overwrite when
+        // the regex actually found something — never blank AI-provided data.)
+        const regexOrder = extractOrderInfo(messageText);
+        parsed.orderData = { ...(parsed.orderData || {}) };
+        if (regexOrder.phone_number) parsed.orderData.phone_number = regexOrder.phone_number;
+        if (regexOrder.address) parsed.orderData.address = regexOrder.address;
 
         // Check if AI generated a repeated reply - regenerate ONCE with
         // different wording (more retries would double the reply latency).
@@ -2655,15 +2786,14 @@ ${JSON.stringify({ name: customer.customer_name, status: customer.status, order_
           
           // Re-run AI with instruction to not repeat
           const freshPrompt = promptContext + `\n\n⚠️ สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม`;
-          
+
           try {
-            const regenResponse = await withTimeout(ai.models.generateContent({
-              model: selectedModel,
+            const regenResponse = await generateWithFastRetry(ai, selectedModel, {
               contents: freshPrompt,
               config: {
                 responseMimeType: 'application/json',
                 temperature: 1.0,
-                maxOutputTokens: 600,
+                maxOutputTokens: 500,
                 responseSchema: {
                   type: Type.OBJECT,
                   properties: {
@@ -2687,7 +2817,7 @@ ${JSON.stringify({ name: customer.customer_name, status: customer.status, order_
                   required: ['intent', 'replyText', 'isOrderDetected']
                 }
               }
-            }), AI_TIMEOUT_MS);
+            }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
             const regenParsed: any = JSON.parse(regenResponse.text?.trim() || '{}');
             replyText = regenParsed.replyText || replyText;
             intent = regenParsed.intent === 'ORDER' || regenParsed.isOrderDetected ? 'ORDER' : intent;
@@ -2711,14 +2841,15 @@ ${JSON.stringify({ name: customer.customer_name, status: customer.status, order_
           'AI_REPLY',
           senderId,
           pageId,
-          `🤖 AI Closing (${selectedModel} | ${adminName}): "${replyText.substring(0, 100)}${replyText.length > 100 ? '...' : ''}"`,
+          `🤖 AI Closing (${selectedModel} | ${adminName} | ${aiLatencyMs}ms | intent:${intentHint}): "${replyText.substring(0, 100)}${replyText.length > 100 ? '...' : ''}"`,
           'SUCCESS',
-          { fullReply: replyText, matchedProduct: page.product?.product_name || matchedProduct.product_name, model: selectedModel, regenerations: regenerationCount }
+          { fullReply: replyText, matchedProduct: page.product?.product_name || matchedProduct.product_name, model: selectedModel, regenerations: regenerationCount, aiLatencyMs, intentHint }
         );
 
-        // Per-page reply delay (configurable, default fast). Cap at 3000ms so
-        // a misconfigured huge delay can never leave customers hanging again.
-        const pageDelay = Math.min(Number(page.reply_delay_ms ?? 500), 3000);
+        // Per-page reply delay (configurable). 300ms default reads as "typing"
+        // to the customer without leaving them hanging; cap at 3000ms so a
+        // misconfigured huge delay can never stall a conversation.
+        const pageDelay = Math.min(Number(page.reply_delay_ms ?? 300), 3000);
 
         // Purchase-intent keywords: when the customer shows buying interest the
         // closing sales sequence fires immediately.
@@ -2827,12 +2958,18 @@ ${JSON.stringify({ name: customer.customer_name, status: customer.status, order_
 
       } catch (aiErr: any) {
         console.error('Gemini AI execution error:', aiErr);
-        // Short, relevant fallback — never dump the whole product sheet, that
-        // is what made replies look like essays that ignore the question.
+        // Short, relevant fallback — never dump the whole product sheet. A
+        // small rotating set keeps repeated failures from reading as a stuck
+        // record if the customer keeps messaging during an outage.
         const price = (page.product?.display_price || matchedProduct.display_price || 0).toLocaleString();
-        const fallbackReply = `ขออภัยค่ะ ระบบขัดข้องชั่วครู่ 🙏 ${page.product?.product_name || 'สินค้าของเรา'} ราคา ฿${price} สอบถามเพิ่มเติมได้เลยนะคะ แอดมินจะรีบตอบให้เร็วที่สุดค่ะ`;
+        const fallbackTemplates = [
+          `ขออภัยค่ะ ระบบขัดข้องชั่วครู่ 🙏 ${page.product?.product_name || 'สินค้าของเรา'} ราคา ฿${price} สอบถามเพิ่มเติมได้เลยนะคะ แอดมินจะรีบตอบให้เร็วที่สุดค่ะ`,
+          `🙏 ขออภัยด้วยนะคะ ตอนนี้ระบบตอบอัตโนมัติมีปัญหาชั่วคราว แอดมินจะรีบกลับมาตอบเร็วที่สุดค่ะ (สนใจ ${page.product?.product_name || 'สินค้า'} ราคา ฿${price})`,
+          `สวัสดีค่ะ 🙏 ขอโทษที่ตอบช้า ระบบกำลังซ่อมบำรุงค่ะ ฝากข้อความไว้ได้เลยนะคะ แอดมินจะรีบตอบให้เองค่ะ`
+        ];
+        const fallbackReply = fallbackTemplates[Math.floor(Math.random() * fallbackTemplates.length)];
         addLog('AI_REPLY', senderId, pageId, `🤖 ตอบกลับแบบสำรอง (AI Error: ${aiErr.message})`, 'INFO');
-        await sleep(Math.min(Number(page.reply_delay_ms ?? 500), 500));
+        await sleep(Math.min(Number(page.reply_delay_ms ?? 300), 500));
         await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply);
         await sendConfiguredSequenceStep(page, senderId, 1);
       }
