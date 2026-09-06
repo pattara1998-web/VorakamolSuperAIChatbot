@@ -917,6 +917,7 @@ export default function App() {
 
       {/* Dedicated Per-Page Settings Modal ("ปุ่มตั้งค่าเพจ") */}
       <PageSettingsModal
+        key={settingsPageId}
         isOpen={isPageSettingsOpen}
         onClose={() => setIsPageSettingsOpen(false)}
         page={currentPageForModal}
