@@ -68,6 +68,7 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
   const [pageActive, setPageActive] = useState<boolean>(true);
   const [pageConnected, setPageConnected] = useState<boolean | null>(null);
   const [graphError, setGraphError] = useState<string>('');
+  const [pageSearch, setPageSearch] = useState('');
   const [attachImage, setAttachImage] = useState<{ dataUrl: string; name: string; mime: string } | null>(null);
   const [messagesEndRef] = [useRef<HTMLDivElement>(null)];
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -361,18 +362,28 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
           </div>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Page switcher (fix: กดสลับเพจได้แล้ว — App ส่ง setSelectedPageId มาแล้ว) */}
+          {/* Page switcher + search (พิมพ์ค้นหาชื่อเพจ กรอง dropdown แบบเรียลไทม์) */}
+          <div className="relative">
+            <Search className={`w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none ${dark ? 'text-zinc-500' : 'text-slate-400'}`} />
+            <input
+              type="text"
+              value={pageSearch}
+              onChange={e => setPageSearch(e.target.value)}
+              placeholder="ค้นหาเพจ..."
+              className={`text-xs rounded-lg pl-8 pr-2.5 py-2 border outline-none w-[130px] sm:w-[170px] ${dark ? 'bg-[#141418] text-zinc-200 border-zinc-800 focus:border-indigo-500' : 'bg-white text-zinc-800 border-slate-200 focus:border-indigo-500'}`}
+              title="พิมพ์ค้นหาชื่อเพจที่ต้องการ"
+            />
+          </div>
           <select
             value={selectedPageId}
             onChange={e => setSelectedPageId?.(e.target.value)}
-            className={`text-xs font-medium rounded-lg px-2.5 py-2 border outline-none cursor-pointer max-w-[180px] sm:max-w-[260px] truncate ${
-              dark ? 'bg-[#141418] text-zinc-200 border-zinc-800 focus:border-indigo-500' : 'bg-white text-zinc-800 border-slate-200 focus:border-indigo-500'
-            }`}
+            className={`text-xs font-medium rounded-lg px-2.5 py-2 border outline-none cursor-pointer max-w-[180px] sm:max-w-[260px] truncate ${dark ? 'bg-[#141418] text-zinc-200 border-zinc-800 focus:border-indigo-500' : 'bg-white text-zinc-800 border-slate-200 focus:border-indigo-500'}`}
             title="เลือกเพจเพื่อดูแชทของเพจนั้น"
           >
-            {pages.map(p => (
-              <option key={p.page_id} value={p.page_id}>{p.page_name}{p.is_active === false ? ' (ปิดใช้งาน)' : ''}</option>
-            ))}
+            {pages.filter(p => (p.page_name || '').toLowerCase().includes(pageSearch.trim().toLowerCase()))
+              .map(p => (
+                <option key={p.page_id} value={p.page_id}>{p.page_name}{p.is_active === false ? ' (ปิดใช้งาน)' : ''}</option>
+              ))}
           </select>
 
           {/* AI auto-reply toggle for the current page */}
