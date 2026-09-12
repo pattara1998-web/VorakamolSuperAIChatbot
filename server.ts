@@ -2886,7 +2886,10 @@ async function startServer() {
       await sendFacebookMessage(page.page_access_token || '', recipientId, step.text_content.trim());
     }
     if (step.type !== 'TEXT' && step.image_url?.trim()) {
-      await sendFacebookImageSmart(page.page_access_token || '', recipientId, step.image_url.trim(), page.page_id);
+      const imgRes = await sendFacebookImageSmart(page.page_access_token || '', recipientId, step.image_url.trim(), page.page_id);
+      if (!imgRes.success) {
+        addLog('INFO', recipientId, page.page_id, `❌ ส่งรูปสเต็ป ${stepNumber} ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+      }
     }
     return { sent: true };
   }
@@ -4334,16 +4337,26 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           addLog('AI_REPLY', senderId, pageId, '⚠️ AI ไม่คืนข้อความตอบกลับ — ใช้ข้อความสำรองตามบริบทบทสนทนา (ไม่ส่งข้อความเปิดซ้ำ)', 'WARNING');
         }
 
-        // ── สร้างรายการข้อความที่จะส่ง: รองรับหลายข้อความ + รูปประกอบแบบแอดมินจริง ──
+        // ── สร้างรายการข้อความที่จะส่ง รูปหาได้จาก 3 แหล่ง เรียงลำดับ: ──
+        // product.images (ฐานข้อมูลสินค้า) → image_* (ตัวแทน sequence) →
+        // รูปในสเต็ปที่ตั้งค่าไว้ในหน้า "ลำดับการส่งภาพและข้อความปิดการขาย"
+        // (sales_sequence_steps) → เพื่อให้รูปที่อัปโหลดไว้ที่ไหนก็ถูกส่งจริง
+        const productImages = (page.product?.images as any) || {};
+        const seqSteps = (page.sales_sequence_steps || []) as any[];
+        const stepImgOf = (n: number): string | undefined => {
+          const s = seqSteps.find(x => Number(x?.step_number) === n);
+          return s?.image_url?.trim() || undefined;
+        };
+        const imgMap: Record<string, string | undefined> = {
+          main: productImages.main || (page.product as any)?.image_main?.trim() || stepImgOf(1) || undefined,
+          detail: productImages.detail || (page.product as any)?.image_detail?.trim() || stepImgOf(2) || undefined,
+          promotion: productImages.promotion || (page.product as any)?.image_promotion?.trim() || stepImgOf(3) || undefined,
+          review: productImages.review || (page.product as any)?.image_review?.trim() || stepImgOf(4) || undefined,
+          closing: productImages.closing || (page.product as any)?.image_closing?.trim() || stepImgOf(5) || stepImgOf(6) || undefined,
+          step6: productImages.closing || (page.product as any)?.image_closing?.trim() || stepImgOf(6) || stepImgOf(5) || undefined
+        };
         const buildOutgoing = (p: any): Array<{ text: string; imageUrl?: string }> => {
           const out: Array<{ text: string; imageUrl?: string }> = [];
-          const imgMap: Record<string, string | undefined> = {
-            main: page.product?.images?.main || undefined,
-            detail: page.product?.images?.detail || undefined,
-            promotion: page.product?.images?.promotion || undefined,
-            review: page.product?.images?.review || undefined,
-            closing: page.product?.images?.closing || undefined
-          };
           if (Array.isArray(p.messages)) {
             for (const m of p.messages.slice(0, 4)) {
               if (!m?.text?.trim()) continue;
@@ -4362,18 +4375,23 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         let outgoing = buildOutgoing(parsed);
         // AUTO-ATTACH: ถ้า AI ไม่ระบุรูปเลย ให้แนบรูปสินค้าที่เพจตั้งไว้อัตโนมัติตามเจตนา
         // เพื่อให้ "รูปที่ตั้งไว้" ถูกส่งให้ลูกค้าเสมอ ไม่ใช่แค่ข้อความล้วน
+        // (ใช้ intentHint ที่ระบบวิเคราะห์จากข้อความจริง — ละเอียดกว่า intent คร่าวๆ)
         const intentImageKeys: Record<string, string[]> = {
-          PRICE: ['main'],
+          GREETING: ['main'],
+          PRICE: ['main', 'promotion'],
           PROMOTION: ['promotion', 'main'],
           TRUST: ['review', 'main'],
           NEGOTIATION: ['promotion', 'main'],
           SHIPPING: ['main'],
           ORDER: ['closing', 'promotion', 'main'],
-          GREETING: ['main'],
+          FOLLOWUP: ['promotion', 'main'],
           QUESTION: ['main']
         };
-        const autoKeys = intentImageKeys[intent] || ['main'];
-        const autoImg = autoKeys.map(k => (page.product?.images as any)?.[k]).find(Boolean) as string | undefined;
+        const ORDER_KEYS = ['closing', 'promotion', 'main'];
+        const autoKeys = intent === 'ORDER'
+          ? ORDER_KEYS
+          : (intentImageKeys[intentHint] || intentImageKeys[String(parsed.intent || '').toUpperCase()] || ['main']);
+        const autoImg = autoKeys.map(k => imgMap[k]).find(Boolean) as string | undefined;
         if (autoImg && !outgoing.some(o => o.imageUrl)) {
           if (outgoing.length) outgoing[outgoing.length - 1].imageUrl = autoImg;
           else outgoing.push({ text: replyText, imageUrl: autoImg });
@@ -4501,7 +4519,12 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           const msg = outgoing[i];
           const isLast = i === outgoing.length - 1;
           if (msg.imageUrl) {
-            await sendFacebookImageSmart(page.page_access_token || '', senderId, msg.imageUrl, pageId);
+            const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, msg.imageUrl, pageId);
+            if (imgRes.success) {
+              addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบให้ลูกค้าสำเร็จ (${i + 1}/${outgoing.length})`, 'SUCCESS');
+            } else {
+              addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบให้ลูกค้าไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+            }
             await sleep(Math.min(500, pageDelay));
           }
           if (isLast && shouldSendQuickReplies) {
@@ -6706,15 +6729,21 @@ ${String(rawText).slice(0, 12000)}
         [page.page_id]
       );
       for (const cv of convos as any[]) {
-        const st: any = (await dbService.getConversationState(page.page_id, cv.sender_id).catch(() => null)) || {};
+        const cvSender = cv?.sender_id;
+        if (!cvSender) { results.skipped++; results.details.push('ข้าม: ไม่มี sender_id'); continue; }
+        // บทสนทนาบางรายการอาจยังไม่มี row ใน conversation_state → ใช้ค่า safe จาก
+        // chat_history แทน (ห้าม .slice() กับ undefined — ต้นเหตุ follow-up ตายทั้งรอบ)
+        const st: any = (await dbService.getConversationState(page.page_id, cvSender).catch(() => null)) || {};
+        const senderId = st.sender_id || cvSender;
         results.checked++;
-        const skip = (reason: string) => { results.skipped++; results.details.push(`ข้าม ${st.sender_id.slice(-8)}: ${reason}`); };
+        const skip = (reason: string) => { results.skipped++; results.details.push(`ข้าม ${String(senderId).slice(-8)}: ${reason}`); };
+        try {
         if (Number(st.is_blocked) === 1 || Number(st.bot_paused) === 1) { skip('บล็อก/หยุดบอท'); continue; }
         const level = Number(st.followup_level) || 0;
         if (level >= ladder.length) { skip(`ครบ ${ladder.length} ระดับแล้ว`); continue; }
         const next = ladder[level];
 
-        const history = await dbService.getRecentChatHistory(page.page_id, st.sender_id, 10);
+        const history = await dbService.getRecentChatHistory(page.page_id, senderId, 10);
         if (history.length === 0) { skip('ไม่มีประวัติแชท'); continue; }
         const last = history[history.length - 1];
         // "ลูกค้าเงียบ" = ข้อความสุดท้ายต้องเป็นฝั่งเรา (แอดมิน/AI ตอบแล้ว ลูกค้ายังไม่มาตอบ)
@@ -6722,7 +6751,7 @@ ${String(rawText).slice(0, 12000)}
         // ลูกค้าสั่งซื้อแล้วหลังแชทล่าสุด → หยุดติดตาม
         const bought = await dbService.executeRaw(
           'SELECT COUNT(*) AS c FROM orders WHERE psid = ? AND created_at >= ?',
-          [st.sender_id, last.created_at]
+          [senderId, last.created_at]
         ).catch(() => [{ c: 1 }] as any[]);
         if (Number(bought[0]?.c) > 0) { skip('ซื้อไปแล้ว'); continue; }
 
@@ -6753,16 +6782,29 @@ ${convo}
           followText = `ตามที่คุยกันค่ะ ${prod.product_name || page.page_name} โปรอยู่ ฿${Number(prod.display_price) || 0} สนใจจัดให้ไหมคะ 🙏`;
         }
 
-        await sendFacebookMessage(page.page_access_token || '', st.sender_id, followText);
-        try { await dbService.addChatMessage(page.page_id, st.sender_id, 'admin', followText); } catch { /* non-critical */ }
-        await dbService.updateConversationState(page.page_id, st.sender_id, {
+        // ส่งจริงผ่าน Facebook — สำเร็จเท่านั้นจึงเลื่อน followup_level ถ้าส่งไม่สำเร็จ
+        // ให้ข้ามรอบนี้แล้วลองใหม่รอบถัดไป (ไม่ใช่จดว่า "ส่งแล้ว" ทั้งที่ลูกค้าไม่ได้รับ)
+        const sendRes = await sendFacebookMessage(page.page_access_token || '', senderId, followText);
+        if (!sendRes.success) {
+          skip(`ส่งข้อความติดตามไม่สำเร็จ: ${sendRes.error}`);
+          addLog('FOLLOW_UP', senderId, page.page_id, `❌ ส่ง Smart Follow-up L${next.level} ไม่สำเร็จ: ${sendRes.error} — ไม่เลื่อนระดับ จะลองอีกครั้งรอบถัดไป`, 'ERROR');
+          continue;
+        }
+        try { await dbService.addChatMessage(page.page_id, senderId, 'admin', followText); } catch { /* non-critical */ }
+        await dbService.updateConversationState(page.page_id, senderId, {
           followup_level: next.level,
           followup_at: new Date().toISOString()
         }).catch(() => {});
         results.sent++;
-        results.details.push(`L${next.level} → ${st.sender_id.slice(-6)}: ${followText.slice(0, 60)}`);
-        addLog('FOLLOW_UP', st.sender_id, page.page_id, `🤝 Smart Follow-up L${next.level}: "${followText.slice(0, 80)}"`, 'SUCCESS');
-        dbBridge.broadcastSSE('followup_sent', { page_id: page.page_id, sender_id: st.sender_id, level: next.level }, page.page_id);
+        results.details.push(`L${next.level} → ${String(senderId).slice(-6)}: ${followText.slice(0, 60)}`);
+        addLog('FOLLOW_UP', senderId, page.page_id, `🤝 Smart Follow-up L${next.level}: "${followText.slice(0, 80)}"`, 'SUCCESS');
+        dbBridge.broadcastSSE('followup_sent', { page_id: page.page_id, sender_id: senderId, level: next.level }, page.page_id);
+        } catch (err: any) {
+          // บทสนทนานี้ผิดพลาด → ข้ามเฉพาะตัวนี้ อย่างี tick ทั้งรอบตายเงียบ ๆ
+          results.skipped++;
+          results.details.push(`ข้าม ${String(senderId).slice(-8)}: ข้อผิดพลาด ${err?.message || err}`);
+          addLog('FOLLOW_UP', senderId, page.page_id, `⚠️ Follow-up ${String(senderId).slice(-8)} ผิดพลาด (ข้ามรอบนี้): ${err?.message || err}`, 'WARNING');
+        }
       }
     }
     return results;
