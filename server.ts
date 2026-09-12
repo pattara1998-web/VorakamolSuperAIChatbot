@@ -2742,6 +2742,36 @@ async function startServer() {
     }
   }
 
+  // ── Smart image sender: ส่งรูปให้ลูกค้าได้ทั้ง data URL (base64 จากไฟล์ที่
+  // อัปโหลดในระบบ) และ public URL ──
+  // Messenger API ไม่ยอมรับ data URL ใน /me/messages (ต้นเหตุที่ "ตั้งรูปไว้แต่
+  // AI ไม่ส่งรูป") — data URL ต้องถูกอัปโหลดเป็น reusable attachment ก่อนแล้วส่ง
+  // ด้วย attachment_id. Public URL ส่งตรงได้เหมือนเดิม.
+  const reusableAttachmentCache = new Map<string, string>(); // key: pageId|dataUrl-hash -> attachment_id
+  async function sendFacebookImageSmart(accessToken: string, recipientId: string, imageUrl: string, pageId?: string) {
+    if (!imageUrl) return { success: false, error: 'IMAGE_EMPTY' };
+    // Data URL (รูปอัปโหลดจากไฟล์เครื่อง) -> upload as reusable attachment
+    if (/^data:/i.test(imageUrl.trim()) || !/^https?:\/\//i.test(imageUrl.trim())) {
+      const decoded = decodeDataUrl(imageUrl);
+      if (!decoded) return { success: false, error: 'IMAGE_DECODE_FAILED' };
+      // Cache attachment_id ต่อเพจ+รูป เพื่อไม่ต้องอัปโหลดรูปเดิมซ้ำทุกข้อความ
+      const cacheKey = `${pageId || 'pg'}|${crypto.createHash('md5').update(imageUrl).digest('hex')}`;
+      let attachmentId = reusableAttachmentCache.get(cacheKey);
+      if (!attachmentId) {
+        const uploaded = await uploadReusableAttachment(accessToken, decoded.buffer, 'product-image.jpg', decoded.mimeType);
+        if (!uploaded.success || !uploaded.attachment_id) {
+          addLog('INFO', 'FACEBOOK_API', recipientId, `❌ อัปโหลดรูป (reusable attachment) ไม่สำเร็จ: ${uploaded.error}`, 'ERROR');
+          return { success: false, error: uploaded.error };
+        }
+        attachmentId = uploaded.attachment_id;
+        reusableAttachmentCache.set(cacheKey, attachmentId);
+      }
+      return sendFacebookAttachmentById(accessToken, recipientId, attachmentId);
+    }
+    // Public URL -> send directly (เหมือนเดิม)
+    return sendFacebookImage(accessToken, recipientId, imageUrl);
+  }
+
   // Send an already-uploaded reusable attachment (from /me/message_attachments).
   // This is the only way to deliver a locally-picked file: Messenger requires a
   // public URL or a reusable attachment_id, never raw bytes in /me/messages.
@@ -2856,7 +2886,7 @@ async function startServer() {
       await sendFacebookMessage(page.page_access_token || '', recipientId, step.text_content.trim());
     }
     if (step.type !== 'TEXT' && step.image_url?.trim()) {
-      await sendFacebookImage(page.page_access_token || '', recipientId, step.image_url.trim());
+      await sendFacebookImageSmart(page.page_access_token || '', recipientId, step.image_url.trim(), page.page_id);
     }
     return { sent: true };
   }
@@ -3967,7 +3997,7 @@ async function startServer() {
           // (previously they were only counted in the log but never sent).
           for (const imgUrl of replyImages) {
             await sleep(commentDelay);
-            const imgRes = await sendFacebookImage(page.page_access_token || '', senderId, imgUrl.trim());
+            const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl.trim(), pageId);
             if (!imgRes.success) {
               addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปคอมเมนต์เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
             }
@@ -4471,7 +4501,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           const msg = outgoing[i];
           const isLast = i === outgoing.length - 1;
           if (msg.imageUrl) {
-            await sendFacebookImage(page.page_access_token || '', senderId, msg.imageUrl);
+            await sendFacebookImageSmart(page.page_access_token || '', senderId, msg.imageUrl, pageId);
             await sleep(Math.min(500, pageDelay));
           }
           if (isLast && shouldSendQuickReplies) {
