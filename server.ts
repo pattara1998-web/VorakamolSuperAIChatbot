@@ -1213,7 +1213,7 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
 
   const info = AI_PROVIDERS[provider];
   const model = getProviderModel(provider);
-  const jsonInstruction = `${options.extraInstruction ? options.extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "sequenceStep": 1-6, "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}}`;
+  const jsonInstruction = `${options.extraInstruction ? options.extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "messages": [{"text": "ข้อความสั้นๆ", "image": "main|detail|promotion|review|closing|"}], "sequenceStep": 1-6, "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}} — ตอบเป็น messages array (1-3 ข้อความ) เหมือนแอดมินส่งไล่กัน และแนบรูป (image) เมื่อพรีเซนสินค้าหรือโปรโมชั่น: main=รูปสินค้า detail=รายละเอียด promotion=โปรโมชั่น review=รีวิว closing=ปิดการขาย`;
 
   const raw = await callOpenAiCompatible(provider, fullPrompt, model, maxOutputTokens, temperature, true)
     .catch(async (primaryErr: any) => {
@@ -1291,7 +1291,7 @@ const AI_REPLY_SCHEMA = {
         type: Type.OBJECT,
         properties: {
           text: { type: Type.STRING, description: 'ข้อความสั้นๆ จัดบรรทัดด้วย \n ใส่อิโมจิเหมือนแอดมินจริง ไม่เกิน 400 ตัวอักษร' },
-          image: { type: Type.STRING, description: 'รูปแนบ: main (รูปสินค้า), promotion (รูปโปรโมชั่น), review (รูปรีวิว) หรือเว้นว่างถ้าไม่ส่งรูป' }
+          image: { type: Type.STRING, description: 'รูปแนบ: main (รูปสินค้า), detail (รูปรายละเอียด), promotion (รูปโปรโมชั่น), review (รูปรีวิว), closing (รูปปิดการขาย) หรือเว้นว่างถ้าไม่ส่งรูป — ควรแนบรูปเมื่อพรีเซนสินค้า/โปรโมชั่น' }
         },
         required: ['text']
       }
@@ -1917,6 +1917,7 @@ async function startServer() {
 
     // Graph augment (best-effort): real customer names + threads that never hit our webhook
     const rawToken = decryptToken(page.page_access_token || '');
+    let graphError = '';
     if (rawToken?.startsWith('EAA')) {
       try {
         const controller = new AbortController();
@@ -1973,8 +1974,10 @@ async function startServer() {
               });
             }
           }
+        } else {
+          graphError = String(gd.error?.message || 'GRAPH_API_ERROR');
         }
-      } catch { /* Graph unreachable/slow -> local-only list is fine */ }
+      } catch { graphError = 'GRAPH_UNREACHABLE'; }
     }
 
     // Blocked conversations sink to the bottom, newest first otherwise
@@ -1988,7 +1991,10 @@ async function startServer() {
       page_id,
       page_name: page.page_name,
       auto_reply: Boolean(page.auto_reply),
-      is_active: Boolean(page.is_active)
+      is_active: Boolean(page.is_active),
+      // สถานะการเชื่อมต่อ Facebook จริง — ให้หน้า Inbox แจ้งเหตุผลแทน "ไม่มีแชท" เปล่า ๆ
+      page_connected: Boolean(rawToken?.startsWith('EAA')),
+      graph_error: graphError || undefined
     });
   });
 
@@ -4213,7 +4219,8 @@ ${usedRepliesText}
 8. ⛔ ความแม่นยำสำคัญที่สุด: ตอบเฉพาะข้อมูลที่มีอยู่ในระบบเท่านั้น — ห้ามเด็ดขาดที่จะแต่งราคา สเปก โปรโมชั่น โบนัส ระยะเวลา หรือนโยบายที่ไม่มีในข้อมูลด้านล่าง ถ้าลูกค้าถามสิ่งที่ไม่มีข้อมูล ให้ตอบสุภาพว่า "เรื่องนี้ขอตรวจสอบกับแอดมินก่อนนะคะ แอดมินจะตามกลับโดยเร็ว" แล้วชวนคุยเรื่องที่มีข้อมูลแทน
 9. 🏆 โหมดนักขายมืออาชีพ: เมื่อลูกค้าแสดงความสนใจ (ถามราคา/โปร/บอกสนใจ/ต่อรอง) ต้องพรีเซนเต็มรูปแบบในข้อความเดียว: จุดขายหลัก → ราคาปกติ vs ราคาโปร (โชว์ส่วนลด) → ของแถม/สิทธิพิเศษ → ปิดแบบให้ลูกค้าเลือกแพ็ก เขียนสั้น แบ่งบรรทัดแบบแชทจริง อ่านง่าย ไม่เกิน 4-5 บรรทัด
 10. 🎯 เทคนิคปิดการขาย: ใช้ Choice Close (ให้ลูกค้าเลือกระหว่างแพ็ก ไม่ใช่เลือกว่าจะซื้อไหม) เช่น "เอาแพ็กเดี่ยวหรือแพ็กคู่ดีคะ" + ใช้ความเร่งด่วนจากโปรจริงเท่านั้น (เช่น "โปรรอบนี้เท่านั้น") + ลูกค้าถามอะไรก็ตอบจากข้อมูลจริงแล้วดึงกลับสู่การปิดการขายเสมอ
-11. 🎨 จัดรูปแบบข้อความให้สวยงามอ่านง่ายเหมือนแอดมินมืออาชีพ: ใช้บรรทัดสั้น เว้นบรรทัด (\n) แยกหัวข้อชัดเจน ใช้อิโมจินำหน้าบรรทัด เช่น 🔥 ชื่อสินค้า / ✅ จุดเด่น / 💰 ราคาปกติ → ราคาโปร / 🎁 ของแถม / 🚚 ส่งของ / ⭐ การันตี — ห้ามยัดทุกอย่างในบรรทัดเดียวให้ดูรก และตอบเป็นหลายข้อความต่อเนื่อง (messages array) เหมือนแอดมินจริงที่ส่งไล่ ๆ กัน รูปที่แนบได้: main / promotion / review
+11. 🎨 จัดรูปแบบข้อความให้สวยงามอ่านง่ายเหมือนแอดมินมืออาชีพ: ใช้บรรทัดสั้น เว้นบรรทัด (\n) แยกหัวข้อชัดเจน ใช้อิโมจินำหน้าบรรทัด เช่น 🔥 ชื่อสินค้า / ✅ จุดเด่น / 💰 ราคาปกติ → ราคาโปร / 🎁 ของแถม / 🚚 ส่งของ / ⭐ การันตี — ห้ามยัดทุกอย่างในบรรทัดเดียวให้ดูรก และตอบเป็นหลายข้อความต่อเนื่อง (messages array) เหมือนแอดมินจริงที่ส่งไล่ ๆ กัน
+12. 📸 การแนบรูป (สำคัญ): รูปที่แนบได้ 5 แบบ — main (รูปสินค้า) / detail (รูปรายละเอียด) / promotion (รูปโปรโมชั่น) / review (รูปรีวิว) / closing (รูปปิดการขาย) เมื่อพรีเซนสินค้าหรือราคาให้แนบ main, เมื่อโชว์โปรโมชั่นให้แนบ promotion, เมื่อสร้างความเชื่อมั่นให้แนบ review, เมื่อกำลังปิดการขาย/รับออเดอร์ให้แนบ closing — เลือกใส่ field "image" ใน messages array ทุกครั้งที่เหมาะสม (อย่างน้อย 1 รูปต่อการพรีเซน)
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
@@ -4323,6 +4330,24 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           return out;
         };
         let outgoing = buildOutgoing(parsed);
+        // AUTO-ATTACH: ถ้า AI ไม่ระบุรูปเลย ให้แนบรูปสินค้าที่เพจตั้งไว้อัตโนมัติตามเจตนา
+        // เพื่อให้ "รูปที่ตั้งไว้" ถูกส่งให้ลูกค้าเสมอ ไม่ใช่แค่ข้อความล้วน
+        const intentImageKeys: Record<string, string[]> = {
+          PRICE: ['main'],
+          PROMOTION: ['promotion', 'main'],
+          TRUST: ['review', 'main'],
+          NEGOTIATION: ['promotion', 'main'],
+          SHIPPING: ['main'],
+          ORDER: ['closing', 'promotion', 'main'],
+          GREETING: ['main'],
+          QUESTION: ['main']
+        };
+        const autoKeys = intentImageKeys[intent] || ['main'];
+        const autoImg = autoKeys.map(k => (page.product?.images as any)?.[k]).find(Boolean) as string | undefined;
+        if (autoImg && !outgoing.some(o => o.imageUrl)) {
+          if (outgoing.length) outgoing[outgoing.length - 1].imageUrl = autoImg;
+          else outgoing.push({ text: replyText, imageUrl: autoImg });
+        }
         // ข้อความรวมสำหรับ log/anti-repeat
         const combinedText = outgoing.map(o => o.text).join('\n•\n') || replyText;
         replyText = combinedText;
@@ -5941,7 +5966,9 @@ ${JSON.stringify(categorySummary, null, 2)}
   app.get('/api/pages/:pageId/avatar', (req: Request, res: Response) => {
     const page = db.pages.find(p => p.page_id === req.params.pageId);
     const raw = page ? decryptToken(page.page_access_token || '') : '';
-    if (!raw || !raw.startsWith('EAA')) return res.status(404).json({ error: 'NO_PAGE_TOKEN' });
+    // No token / broken token -> redirect to the default avatar instead of 404
+    // so the UI never shows a broken image for pages that aren't connected yet.
+    if (!raw || !raw.startsWith('EAA')) return res.redirect(302, DEFAULT_PAGE_AVATAR);
     res.redirect(302, `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(page!.page_id)}/picture?type=normal&access_token=${encodeURIComponent(raw)}`);
   });
 

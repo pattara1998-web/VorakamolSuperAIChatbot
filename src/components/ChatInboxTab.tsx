@@ -66,6 +66,8 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [aiReplyOn, setAiReplyOn] = useState<boolean>(false);
   const [pageActive, setPageActive] = useState<boolean>(true);
+  const [pageConnected, setPageConnected] = useState<boolean | null>(null);
+  const [graphError, setGraphError] = useState<string>('');
   const [attachImage, setAttachImage] = useState<{ dataUrl: string; name: string; mime: string } | null>(null);
   const [messagesEndRef] = [useRef<HTMLDivElement>(null)];
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -87,6 +89,8 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
         setConversations(data.conversations || []);
         setAiReplyOn(Boolean(data.auto_reply));
         setPageActive(Boolean(data.is_active));
+        setPageConnected(Boolean(data.page_connected));
+        setGraphError(data.graph_error || '');
         setLastRefresh(new Date());
         setSelectedConvo(prev => {
           if (!prev) return (data.conversations || [])[0] || null;
@@ -464,7 +468,19 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
                 <p className={`text-sm ${dark ? 'text-zinc-500' : 'text-slate-400'}`}>
                   {filter === 'ALL' ? 'ยังไม่มีบทสนทนา' : 'ไม่มีรายการในหมวดนี้'}
                 </p>
-                <p className={`text-xs mt-1 ${dark ? 'text-zinc-600' : 'text-slate-300'}`}>ลูกค้าจะปรากฏที่นี่เมื่อทักเข้ามา</p>
+                {filter === 'ALL' && pageConnected === false && (
+                  <p className={`text-xs mt-2 text-amber-600 dark:text-amber-400 font-medium`}>
+                    ⚠️ เพจนี้ยังไม่ได้เชื่อมต่อ Facebook — เชื่อมเพจ (ใส่ Page Access Token) ก่อน แล้วแชทจะเข้าที่นี่ทันที
+                  </p>
+                )}
+                {filter === 'ALL' && pageConnected === true && graphError && (
+                  <p className={`text-xs mt-2 text-rose-500 font-medium`}>
+                    ❌ เชื่อมต่อ Facebook ไม่สำเร็จ: {graphError} (Token อาจหมดอายุ — ลองเชื่อมเพจใหม่)
+                  </p>
+                )}
+                {filter === 'ALL' && pageConnected !== false && !graphError && (
+                  <p className={`text-xs mt-1 ${dark ? 'text-zinc-600' : 'text-slate-300'}`}>ลูกค้าจะปรากฏที่นี่เมื่อทักเข้ามา</p>
+                )}
               </div>
             ) : visibleConversations.map((convo, idx) => {
               const isSelected = selectedConvo?.thread_id === convo.thread_id;

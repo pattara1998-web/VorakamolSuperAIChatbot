@@ -56,6 +56,7 @@ export const BroadcastTab: React.FC<BroadcastTabProps> = ({ pages, selectedPageI
   const [status, setStatus] = useState<JobStatus | null>(null);
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
+  const [pageSearch, setPageSearch] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -179,12 +180,23 @@ export const BroadcastTab: React.FC<BroadcastTabProps> = ({ pages, selectedPageI
           {/* Step 1: audience */}
           <div className={`rounded-xl border p-4 space-y-3 ${card}`}>
             <h3 className="text-sm font-bold flex items-center gap-2"><Users className="w-4 h-4 text-indigo-500" /> 1. เลือกกลุ่มลูกค้า</h3>
+            <div className="relative">
+              <Search className={`w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 ${dark ? 'text-zinc-500' : 'text-slate-400'}`} />
+              <input
+                type="text"
+                value={pageSearch}
+                onChange={e => setPageSearch(e.target.value)}
+                placeholder="🔍 พิมพ์ค้นหาชื่อเพจ..."
+                className={`w-full pl-8 ${inputCls}`}
+              />
+            </div>
             <select
               value={selectedPageId}
               onChange={e => setSelectedPageId?.(e.target.value)}
               className={`w-full ${inputCls}`}
             >
-              {pages.map(p => <option key={p.page_id} value={p.page_id}>{p.page_name}{p.is_active === false ? ' (ปิดใช้งาน)' : ''}</option>)}
+              {pages.filter(p => (p.page_name || '').toLowerCase().includes(pageSearch.trim().toLowerCase()))
+                .map(p => <option key={p.page_id} value={p.page_id}>{p.page_name}{p.is_active === false ? ' (ปิดใช้งาน)' : ''}</option>)}
             </select>
             <div className="grid grid-cols-2 gap-2">
               <div>
