@@ -28,6 +28,8 @@ import {
   ProductCategory
 } from '../types';
 import { ProductTemplateModal } from './ProductTemplateModal';
+import { normalizeShippingFields } from '../utils/shippingMatrix';
+import { resolvePromotionTiers, syncTierPricesToColumns } from '../utils/promotionTiers';
 
 interface DatabaseSheetTabProps {
   amulet: ProductAmulet[];
@@ -196,36 +198,44 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
 
   const currentSheetMeta = sheetsMeta.find(s => s.id === activeSheet)!;
 
-  // Feature 8: single source of truth for promotion tiers shared by Pages Hub & database editor.
-  // Prefer the real tiers already stored (custom names, free_shipping, gift_quantity); only fall
-  // back to plain price tiers derived from legacy price_1/2/3 columns — never invent gift/shipping claims.
-  const resolvePromotionTiers = (incoming: any, fallback: any, priceSource: any): any[] => {
-    // Propagate price_1/2/3 edits from the database sheet onto the matching tiers so both
-    // editors stay identical (the columns are derived from tier prices, so this is idempotent).
-    const applyPriceOverrides = (tiers: any[]) =>
-      tiers.map((t: any, i: number) => {
-        const edited = Number(priceSource?.[`price_${i + 1}`]);
-        return Number.isFinite(edited) && edited > 0 ? { ...t, price: edited } : t;
-      });
-    if (Array.isArray(incoming) && incoming.length) return applyPriceOverrides(incoming);
-    if (Array.isArray(fallback) && fallback.length) return applyPriceOverrides(fallback);
-    return [
-      { id: 'tier-1', name: '1 ชิ้น', quantity: 1, price: Number(priceSource?.price_1 ?? priceSource?.display_price ?? 0), description: '' },
-      { id: 'tier-2', name: '2 ชิ้น', quantity: 2, price: Number(priceSource?.price_2 ?? 0), description: String(priceSource?.promotion_detail || '') },
-      { id: 'tier-3', name: '3 ชิ้น', quantity: 3, price: Number(priceSource?.price_3 ?? 0), description: '' }
-    ];
-  };
+  // Promotion Packages: ใช้ helper กลาง (utils/promotionTiers) ร่วมกับ ProductTemplateModal
+  // และ server เพื่อให้ทุกหน้าจอแปลง tier <-> price_1/2/3 แบบเดียวกันเสมอ
 
   // Keep the real promotion tiers already saved on the catalog row when the template form
   // doesn't carry them, so editing the database never destroys Pages Hub promotion settings.
-  const mergeCatalogRow = (existing: any, incoming: any) => ({
-    ...existing,
-    ...incoming,
-    promotions:
-      Array.isArray(incoming?.promotions) && incoming.promotions.length
-        ? incoming.promotions
-        : existing?.promotions
-  });
+  // Shipping Matrix fields (courier_brand/delivery_days/shipping_duration) are normalized so
+  // an empty value from the form never wipes what the Page Settings TAB 5 already configured.
+  const mergeCatalogRow = (existing: any, incoming: any) => {
+    const shipping = normalizeShippingFields(
+      {
+        courier_brand: incoming?.courier_brand,
+        delivery_days: incoming?.delivery_days,
+        shipping_duration: incoming?.shipping_duration
+      },
+      {
+        courier_brand: existing?.courier_brand,
+        delivery_days: existing?.delivery_days,
+        shipping_duration: existing?.shipping_duration
+      }
+    );
+    // Promotion Packages: เก็บ tier จริงไว้เสมอ แล้ว derive price_1/2/3 + promotion_detail
+    // จาก tier เพื่อให้ตารางฐานข้อมูลกับหน้าตั้งค่าเพจแสดงราคาชุดเดียวกัน
+    const promotions = resolvePromotionTiers(incoming?.promotions, existing?.promotions, {
+      ...existing,
+      ...incoming
+    });
+    const tierColumns = syncTierPricesToColumns(promotions);
+    return {
+      ...existing,
+      ...incoming,
+      promotions,
+      price_1: tierColumns.price_1 || Number(incoming?.price_1 ?? existing?.price_1 ?? 0),
+      price_2: tierColumns.price_2 || Number(incoming?.price_2 ?? existing?.price_2 ?? 0),
+      price_3: tierColumns.price_3 || Number(incoming?.price_3 ?? existing?.price_3 ?? 0),
+      promotion_detail: incoming?.promotion_detail || existing?.promotion_detail || tierColumns.promotion_detail,
+      ...shipping
+    };
+  };
 
   const handleSyncVercelDB = () => {
     setSyncStatus('กำลังซิงค์และดึงข้อมูลล่าสุดจาก Vercel Cloud Database & KV Storage...');
@@ -250,6 +260,21 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
           // Update page with product data
           const updatedPages = pages.map(p => {
             if (p.page_id === page.page_id) {
+              // Shipping Matrix: รวมค่าจากแถวสินค้าในฐานข้อมูลกับค่าที่ตั้งไว้ในหน้าเพจ
+              // โดยไม่ยอมให้ค่าว่างจากฝั่งใดฝั่งหนึ่งทับค่าที่มีอยู่ (ต้นเหตุที่
+              // "Shipping Matrix ไม่ตรงกับเมนูฐานข้อมูลสินค้า")
+              const shipping = normalizeShippingFields(
+                {
+                  courier_brand: productData.courier_brand,
+                  delivery_days: productData.delivery_days,
+                  shipping_duration: productData.shipping_duration
+                },
+                {
+                  courier_brand: p.product?.specs?.courier_brand,
+                  delivery_days: p.product?.specs?.delivery_days,
+                  shipping_duration: p.product?.shipping_duration || p.product?.specs?.shipping_duration
+                }
+              );
               return {
                 ...p,
                 product: {
@@ -260,7 +285,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                   base_price: productData.display_price,
                   display_price: productData.display_price,
                   description: productData.description || productData.detail_text,
-                  shipping_duration: productData.shipping_duration,
+                  shipping_duration: shipping.shipping_duration,
+                  courier_brand: shipping.courier_brand,
+                  delivery_days: shipping.delivery_days,
                   images: {
                     main: productData.image_main || '',
                     detail: productData.image_detail || '',
@@ -269,7 +296,14 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                     closing: productData.image_closing || ''
                   },
                   promotions: resolvePromotionTiers(productData.promotions, p.product?.promotions, productData),
-                  specs: productData
+                  // MERGE (ไม่ใช่แทนที่ทั้งก้อน) เพื่อคง specs เดิมของหน้าเพจไว้
+                  specs: {
+                    ...p.product?.specs,
+                    ...productData,
+                    courier_brand: shipping.courier_brand,
+                    delivery_days: shipping.delivery_days,
+                    shipping_duration: shipping.shipping_duration
+                  }
                 },
                 sequence: {
                   ...p.sequence,
@@ -434,7 +468,26 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                 category: productData.category || cat,
                 display_price: Number(productData.display_price ?? productData.price_1 ?? p.product.display_price ?? 0),
                 base_price: Number(productData.display_price ?? p.product.base_price ?? 0),
-                shipping_duration: productData.shipping_duration || p.product.shipping_duration || '',
+                // Shipping Matrix: ใช้ค่าที่ normalize แล้วจากฟอร์มสินค้า และไม่ทับค่าเดิมด้วยค่าว่าง
+                ...(() => {
+                  const shipping = normalizeShippingFields(
+                    {
+                      courier_brand: productData.courier_brand,
+                      delivery_days: productData.delivery_days,
+                      shipping_duration: productData.shipping_duration
+                    },
+                    {
+                      courier_brand: p.product?.specs?.courier_brand,
+                      delivery_days: p.product?.specs?.delivery_days,
+                      shipping_duration: p.product?.shipping_duration
+                    }
+                  );
+                  return {
+                    shipping_duration: shipping.shipping_duration,
+                    courier_brand: shipping.courier_brand,
+                    delivery_days: shipping.delivery_days
+                  };
+                })(),
                 description: productData.description || productData.detail_text || productData.belief_info || '',
                 images: {
                   main: productData.image_main || p.product.images.main,
@@ -449,6 +502,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                 specs: {
                   ...p.product.specs,
                   ...productData,
+                  courier_brand: productData.courier_brand || p.product.specs?.courier_brand,
+                  delivery_days: productData.delivery_days || p.product.specs?.delivery_days,
+                  shipping_duration: productData.shipping_duration || p.product.specs?.shipping_duration,
                   material: productData.material || p.product.specs?.material,
                   dimensions: productData.size || p.product.specs?.dimensions,
                   weight: productData.weight || p.product.specs?.weight,
@@ -1072,9 +1128,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                 {(agriculture || [])
                   .filter(
                     p =>
-                      p.product_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                      p.product_id.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                      p.brand.toLowerCase().includes(searchTerm.toLowerCase())
+                      String(p.product_name || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
+                      String(p.product_id || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
+                      String(p.brand || '').toLowerCase().includes(searchTerm.toLowerCase())
                   )
                   .map((item, idx) => (
                     <tr key={item.product_id || idx} className="hover:bg-slate-50 dark:hover:bg-[#141418] transition-colors">
@@ -1250,9 +1306,9 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                 {customers
                   .filter(
                     c =>
-                      c.customer_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                      c.phone_number.includes(searchTerm) ||
-                      c.customer_id.toLowerCase().includes(searchTerm.toLowerCase())
+                      String(c.customer_name || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
+                      String(c.phone_number || '').includes(searchTerm) ||
+                      String(c.customer_id || '').toLowerCase().includes(searchTerm.toLowerCase())
                   )
                   .map((item, idx) => (
                     <tr key={item.customer_id || idx} className="hover:bg-slate-50 dark:hover:bg-[#141418] transition-colors">

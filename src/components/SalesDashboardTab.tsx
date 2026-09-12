@@ -223,6 +223,30 @@ export const SalesDashboardTab: React.FC<SalesDashboardTabProps> = ({
   };
   const grossProfitMargin = totalRevenue > 0 ? ((grossProfit / totalRevenue) * 100).toFixed(1) : '0.0';
 
+  // Real growth: ช่วงปัจจุบัน vs ช่วงก่อนหน้าที่ยาวเท่ากัน (คำนวณจากออเดอร์จริง)
+  // คืน null เมื่อไม่มีข้อมูลพอเปรียบเทียบ — UI จะแสดง "—" แทน % ปลอมที่เดิม hardcode +28.4%
+  const realGrowthPercent = (() => {
+    const now = new Date();
+    let curStart: Date;
+    if (timeFilter === 'today') curStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    else if (timeFilter === 'week') curStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    else if (timeFilter === 'month') curStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    else curStart = new Date(0);
+    const curRev = orders
+      .filter(o => o.created_at && new Date(o.created_at) >= curStart)
+      .reduce((s, o) => s + (o.total_amount || 0), 0);
+    if (curRev <= 0) return null;
+    const spanMs = now.getTime() - curStart.getTime();
+    if (spanMs <= 0) return null;
+    const prevRev = orders.filter(o => {
+      if (!o.created_at) return false;
+      const d = new Date(o.created_at).getTime();
+      return d < curStart.getTime() && d >= curStart.getTime() - spanMs;
+    }).reduce((s, o) => s + (o.total_amount || 0), 0);
+    if (prevRev <= 0) return null;
+    return Number((((curRev - prevRev) / prevRev) * 100).toFixed(1));
+  })();
+
   // Ad Spend & ROAS Metrics (Real Calculations)
   const roasMultiplier = adSpendInput > 0 ? (totalRevenue / adSpendInput).toFixed(2) : (totalRevenue > 0 ? '∞' : '0.00');
   const netProfitAfterAds = totalRevenue > 0 ? (grossProfit - adSpendInput) : (adSpendInput > 0 ? -adSpendInput : 0);
@@ -687,8 +711,17 @@ export const SalesDashboardTab: React.FC<SalesDashboardTabProps> = ({
             <span className="text-2xl font-black font-mono text-slate-900 dark:text-zinc-100">
               ฿{totalRevenue.toLocaleString()}
             </span>
-            <span className="text-xs font-bold text-emerald-600 dark:text-emerald-400 flex items-center">
-              <ArrowUpRight className="w-3.5 h-3.5" /> +28.4%
+            <span className={`text-xs font-bold flex items-center ${
+              realGrowthPercent !== null && realGrowthPercent < 0
+                ? 'text-rose-500'
+                : 'text-emerald-600 dark:text-emerald-400'
+            }`}>
+              {realGrowthPercent !== null && realGrowthPercent < 0
+                ? <ArrowDownRight className="w-3.5 h-3.5" />
+                : <ArrowUpRight className="w-3.5 h-3.5" />}
+              {realGrowthPercent !== null
+                ? `${realGrowthPercent > 0 ? '+' : ''}${realGrowthPercent}%`
+                : '—'}
             </span>
           </div>
           <div className="mt-3 pt-2.5 border-t border-slate-100 dark:border-zinc-800/80 flex items-center justify-between text-xs">

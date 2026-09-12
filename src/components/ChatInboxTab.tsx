@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageSquare, Send, RefreshCw, User, Clock, AlertCircle, Inbox,
-  Star, Ban, MailOpen, Bot, Power, Search
+  Star, Ban, MailOpen, Bot, Power, Search, Paperclip, X
 } from 'lucide-react';
 import type { PageConfig } from '../types';
 import { useSSE } from '../utils/useSSE';
@@ -39,6 +39,19 @@ interface ConversationSummary {
 
 type FilterKey = 'ALL' | 'UNREAD' | 'STARRED' | 'BLOCKED';
 
+// Pull renderable image URLs out of a Messenger attachment array.
+// Graph API shapes: { type:'image', payload:{ url } } or { type:'image', image_data:{ url, preview_url } }.
+function extractImageUrls(attachments: any[] | undefined): string[] {
+  if (!Array.isArray(attachments)) return [];
+  const urls: string[] = [];
+  for (const att of attachments) {
+    if (!att || typeof att !== 'object') continue;
+    const url = att.payload?.url || att.image_data?.url || att.image_data?.preview_url;
+    if (typeof url === 'string' && url.startsWith('http')) urls.push(url);
+  }
+  return urls;
+}
+
 export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageId, setSelectedPageId, theme }) => {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [selectedConvo, setSelectedConvo] = useState<ConversationSummary | null>(null);
@@ -53,7 +66,9 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [aiReplyOn, setAiReplyOn] = useState<boolean>(false);
   const [pageActive, setPageActive] = useState<boolean>(true);
+  const [attachImage, setAttachImage] = useState<{ dataUrl: string; name: string; mime: string } | null>(null);
   const [messagesEndRef] = [useRef<HTMLDivElement>(null)];
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   const currentPage = pages.find(p => p.page_id === selectedPageId);
   const dark = theme === 'dark';
@@ -188,10 +203,33 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
     } catch { /* non-critical */ }
   };
 
+  // Pick a local image file → base64 data URL (server uploads it to Facebook
+  // as a reusable attachment, then delivers it into the conversation).
+  const handlePickImage = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setError('แนบได้เฉพาะไฟล์รูปภาพเท่านั้น');
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      setError('รูปภาพใหญ่เกิน 8MB กรุณาเลือกรูปที่เล็กลง');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setAttachImage({ dataUrl: String(reader.result || ''), name: file.name, mime: file.type });
+    reader.onerror = () => setError('อ่านไฟล์รูปภาพไม่สำเร็จ');
+    reader.readAsDataURL(file);
+  };
+
   const handleSendMessage = async () => {
-    if (!replyText.trim() || !selectedConvo || !currentPage) return;
+    const text = replyText.trim();
+    if ((!text && !attachImage) || !selectedConvo || !currentPage) return;
     setIsSending(true);
     setError(null);
+    const sentText = text;
+    const sentImage = attachImage;
     try {
       const res = await fetch('/api/facebook/send-message', {
         method: 'POST',
@@ -199,21 +237,37 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
         body: JSON.stringify({
           page_id: selectedPageId,
           recipient_id: selectedConvo.thread_id,
-          message: replyText.trim()
+          message: sentText || undefined,
+          image_data: sentImage?.dataUrl || undefined,
+          image_mime: sentImage?.mime || undefined,
+          image_name: sentImage?.name || undefined
         })
       });
       const data = await res.json();
       if (data.success) {
         setReplyText('');
+        setAttachImage(null);
         // Optimistic append, then refresh list (preview + ordering)
-        setMessages(prev => [...prev, {
-          id: data.message_id || `local_${Date.now()}`,
-          from: { id: selectedPageId, name: currentPage.page_name },
-          message: replyText.trim(),
-          created_time: new Date().toISOString(),
-          is_from_page: true,
-          attachments: []
-        }]);
+        const now = new Date().toISOString();
+        setMessages(prev => [
+          ...prev,
+          ...(sentText ? [{
+            id: data.message_id || `local_${Date.now()}`,
+            from: { id: selectedPageId, name: currentPage.page_name },
+            message: sentText,
+            created_time: now,
+            is_from_page: true,
+            attachments: []
+          }] : []),
+          ...(sentImage ? [{
+            id: `local_img_${Date.now()}`,
+            from: { id: selectedPageId, name: currentPage.page_name },
+            message: '',
+            created_time: now,
+            is_from_page: true,
+            attachments: [{ type: 'image', payload: { url: sentImage.dataUrl } }]
+          }] : [])
+        ]);
         setTimeout(() => { fetchConversations(true); fetchMessages(selectedConvo, true); }, 800);
       } else {
         setError(`ส่งไม่สำเร็จ: ${data.message || data.error?.message || 'ไม่ทราบสาเหตุ'}`);
@@ -545,28 +599,94 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
                   <p className={`text-xs text-center ${subtle}`}>กำลังโหลดข้อความ...</p>
                 ) : messages.length === 0 ? (
                   <p className={`text-xs text-center ${subtle}`}>ยังไม่มีข้อความในบทสนทนานี้</p>
-                ) : messages.map((msg, idx) => (
+                ) : messages.map((msg, idx) => {
+                  const imageUrls = extractImageUrls(msg.attachments);
+                  const hasBody = Boolean(msg.message?.trim()) || imageUrls.length > 0;
+                  return (
                   <div key={msg.id || idx} className={`flex ${msg.is_from_page ? 'justify-end' : 'justify-start'}`}>
                     <div className={`max-w-[75%] ${msg.is_from_page ? 'order-2' : ''}`}>
+                      {imageUrls.length > 0 && (
+                        <div className={`space-y-1.5 mb-1 ${msg.is_from_page ? 'flex flex-col items-end' : ''}`}>
+                          {imageUrls.map((url, i) => (
+                            <a key={i} href={url} target="_blank" rel="noreferrer" className="block">
+                              <img
+                                src={url}
+                                alt="รูปแนบในแชท"
+                                loading="lazy"
+                                className="max-w-[220px] max-h-[220px] rounded-2xl object-cover border border-black/10 dark:border-zinc-700 shadow-sm"
+                              />
+                            </a>
+                          ))}
+                        </div>
+                      )}
+                      {msg.message?.trim() && (
                       <div className={`px-3.5 py-2.5 rounded-2xl ${
                         msg.is_from_page
                           ? 'bg-indigo-600 text-white rounded-br-md'
                           : dark ? 'bg-[#1a1a22] text-zinc-100 rounded-bl-md border border-zinc-800' : 'bg-slate-100 text-slate-900 rounded-bl-md'
                       }`}>
-                        <p className="text-sm whitespace-pre-wrap break-words">{msg.message || '(รูปภาพ/ไฟล์แนบ)'}</p>
+                        <p className="text-sm whitespace-pre-wrap break-words">{msg.message}</p>
                       </div>
+                      )}
+                      {!hasBody && (
+                      <div className={`px-3.5 py-2.5 rounded-2xl ${
+                        msg.is_from_page
+                          ? 'bg-indigo-600 text-white rounded-br-md'
+                          : dark ? 'bg-[#1a1a22] text-zinc-100 rounded-bl-md border border-zinc-800' : 'bg-slate-100 text-slate-900 rounded-bl-md'
+                      }`}>
+                        <p className="text-sm italic opacity-70">(ไฟล์แนบที่ไม่ใช่รูปภาพ)</p>
+                      </div>
+                      )}
                       <p className={`text-[10px] mt-1 ${msg.is_from_page ? 'text-right' : ''} ${dark ? 'text-zinc-600' : 'text-slate-400'}`}>
                         {formatFullTime(msg.created_time)}
                       </p>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
                 <div ref={messagesEndRef} />
               </div>
 
               {/* Reply input */}
               <div className={`px-4 py-3 border-t ${dark ? 'border-zinc-800 bg-[#121216]' : 'border-slate-200 bg-slate-50'}`}>
+                {attachImage && (
+                  <div className={`mb-2 flex items-center gap-2 p-2 rounded-xl border ${dark ? 'border-zinc-700 bg-[#0F0F12]' : 'border-slate-200 bg-white'}`}>
+                    <img src={attachImage.dataUrl} alt="รูปที่จะส่ง" className="w-12 h-12 rounded-lg object-cover border border-black/10 dark:border-zinc-700" />
+                    <div className="flex-1 min-w-0">
+                      <p className={`text-[11px] font-semibold truncate ${dark ? 'text-zinc-200' : 'text-slate-700'}`}>📎 {attachImage.name}</p>
+                      <p className={`text-[10px] ${subtle}`}>รูปภาพจะถูกอัปโหลดเป็น Reusable Attachment แล้วส่งเข้าแชทลูกค้า</p>
+                    </div>
+                    <button
+                      onClick={() => setAttachImage(null)}
+                      className={`p-1.5 rounded-lg transition-colors ${dark ? 'hover:bg-zinc-800 text-zinc-400' : 'hover:bg-slate-100 text-slate-500'}`}
+                      title="ลบรูปภาพ"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
                 <div className="flex items-end gap-2">
+                  <input
+                    ref={imageInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={handlePickImage}
+                  />
+                  <button
+                    onClick={() => imageInputRef.current?.click()}
+                    disabled={isSending}
+                    title="แนบรูปภาพ"
+                    className={`p-2.5 rounded-xl transition-all border ${
+                      isSending
+                        ? 'opacity-40 cursor-not-allowed bg-slate-200 dark:bg-zinc-800 border-transparent'
+                        : dark
+                          ? 'bg-[#0F0F12] border-zinc-700 text-zinc-300 hover:border-indigo-500 hover:text-indigo-400'
+                          : 'bg-white border-slate-300 text-slate-600 hover:border-indigo-500 hover:text-indigo-600'
+                    }`}
+                  >
+                    <Paperclip className="w-4 h-4" />
+                  </button>
                   <textarea
                     value={replyText}
                     onChange={e => setReplyText(e.target.value)}
@@ -584,9 +704,9 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
                   />
                   <button
                     onClick={handleSendMessage}
-                    disabled={!replyText.trim() || isSending}
+                    disabled={(!replyText.trim() && !attachImage) || isSending}
                     className={`p-2.5 rounded-xl transition-all ${
-                      !replyText.trim() || isSending
+                      (!replyText.trim() && !attachImage) || isSending
                         ? 'opacity-40 cursor-not-allowed bg-slate-200 dark:bg-zinc-800'
                         : 'bg-indigo-600 hover:bg-indigo-700 text-white shadow-lg shadow-indigo-500/25'
                     }`}
@@ -595,7 +715,7 @@ export const ChatInboxTab: React.FC<ChatInboxTabProps> = ({ pages, selectedPageI
                   </button>
                 </div>
                 <p className={`text-[10px] mt-1.5 ${subtle}`}>
-                  ตอบกลับผ่าน Messenger API — Facebook อนุญาตให้ตอบได้ภายใน 24 ชม. หลังลูกค้าทักมาครั้งล่าสุด
+                  ตอบกลับผ่าน Messenger API — Facebook อนุญาตให้ตอบได้ภายใน 24 ชม. หลังลูกค้าทักมาครั้งล่าสุด (แนบรูปได้สูงสุด 8MB)
                 </p>
               </div>
             </>

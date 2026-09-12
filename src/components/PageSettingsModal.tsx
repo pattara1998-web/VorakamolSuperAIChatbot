@@ -38,6 +38,15 @@ import {
 } from 'lucide-react';
 import { PageConfig, PromotionTier, ProductCategory, ProductDetailedSpecs, CustomSpecItem } from '../types';
 import { parseTextToSpecs } from '../utils/aiSpecParser';
+import { buildCodSummaryText } from '../utils/codSummary';
+import {
+  buildShippingDuration,
+  normalizeShippingFields,
+  COURIER_OPTIONS,
+  DELIVERY_DAYS_OPTIONS,
+  DEFAULT_COURIER_BRAND,
+  DEFAULT_DELIVERY_DAYS
+} from '../utils/shippingMatrix';
 import { chatWithLocalAi, isLocalAiModel } from '../utils/localAi';
 import { getStoredLocalAiModel } from './AiApiSettingsModal';
 import { CustomButtonsManager } from './CustomButtonsManager';
@@ -169,6 +178,21 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
     setIsAiParsing(false);
   };
 
+  // Shipping Matrix: ทำให้ค่าขนส่งของหน้าเพจตรงกับฐานข้อมูลสินค้าเสมอ
+  // (อ่านจาก product.shipping_duration / product.specs และค่าที่ซิงก์มาจากเทมเพลตสินค้า)
+  const initialShipping = normalizeShippingFields(
+    {
+      courier_brand: page?.product?.specs?.courier_brand,
+      delivery_days: page?.product?.specs?.delivery_days,
+      shipping_duration: page?.product?.shipping_duration || page?.product?.specs?.shipping_duration
+    },
+    {
+      courier_brand: (page?.product as any)?.courier_brand,
+      delivery_days: (page?.product as any)?.delivery_days,
+      shipping_duration: (page?.product as any)?.shipping_duration
+    }
+  );
+
   const [formData, setFormData] = useState<PageConfig>(() => ({
     ...(page || ({} as PageConfig)),
     sales_sequence_steps: page?.sales_sequence_steps?.length
@@ -193,6 +217,14 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
       'https://images.unsplash.com/photo-1579783902614-a3fb3927b675?auto=format&fit=crop&w=600&q=80',
       'https://images.unsplash.com/photo-1544717305-2782549b5136?auto=format&fit=crop&w=600&q=80'
     ],
+    followup_enabled: page?.followup_enabled === true,
+    followup_messages: page?.followup_messages?.length
+      ? page.followup_messages
+      : [
+          { interval: '15 นาที', message: 'สวัสดีค่ะคุณลูกค้า สนใจรับโปรโมชั่นชุดไหนดีคะ แจ้งแอดมินได้เลยนะคะ 🙏' },
+          { interval: '2 ชั่วโมง', message: 'โปรโมชั่นส่งฟรีเก็บเงินปลายทางวันนี้เหลือโควตาอีก 3 สิทธิ์สุดท้ายนะคะ 😊' },
+          { interval: '24 ชั่วโมง', message: 'สิทธิ์ส่วนลดพิเศษของคุณลูกค้ากำลังจะหมดอายุในอีก 2 ชั่วโมงค่ะ สั่งซื้อตอนนี้รับของแถมทันทีค่ะ' }
+        ],
     cod_summary_fields: page?.cod_summary_fields || {
       include_header: true,
       include_page_name: true,
@@ -212,10 +244,13 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
       `📦 สรุปยอดคำสั่งซื้อ (เก็บเงินปลายทาง):\nคุณ{customer_name}\n{shipping_address}\n{phone_number}\n***{items}\nยอดเรียกเก็บปลายทาง: ฿{total_amount} (จัดส่งฟรี ไม่บวกเพิ่ม)\n🚚 ระยะเวลาจัดส่ง: {shipping_duration}`,
     product: {
       ...page?.product,
-      shipping_duration: page?.product?.shipping_duration || 'จัดส่งโดย Flash Express ถึงภายใน 1-3 วันทำการ',
+      shipping_duration: initialShipping.shipping_duration,
+      courier_brand: initialShipping.courier_brand,
+      delivery_days: initialShipping.delivery_days,
       specs: {
-        courier_brand: page?.product?.specs?.courier_brand || 'Flash Express',
-        delivery_days: page?.product?.specs?.delivery_days || '1-3 วัน',
+        ...page?.product?.specs,
+        courier_brand: initialShipping.courier_brand,
+        delivery_days: initialShipping.delivery_days,
         material: page?.product?.specs?.material || 'วัสดุเกรดพรีเมียม / เนื้อมวลสารบริสุทธิ์แท้',
         dimensions: page?.product?.specs?.dimensions || 'ขนาดมาตรฐาน',
         weight: page?.product?.specs?.weight || 'น้ำหนักเบา พกพาสะดวก',
@@ -228,7 +263,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
         box_contents: page?.product?.specs?.box_contents || 'ตัวสินค้า + ของแถม + ใบรับประกัน',
         cod_note: page?.product?.specs?.cod_note || 'บริการเก็บเงินปลายทาง (COD) ไม่ต้องโอนก่อน',
         shipping_time: page?.product?.specs?.shipping_time || 'จัดส่ง 1-3 วันถึง',
-        shipping_duration: page?.product?.specs?.shipping_duration || 'จัดส่งโดย Flash Express ถึงภายใน 1-3 วันทำการ',
+        shipping_duration: initialShipping.shipping_duration,
         brand: page?.product?.specs?.brand || '',
         features: page?.product?.specs?.features || '',
         usage: page?.product?.specs?.usage || '',
@@ -318,54 +353,55 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
     }
   ];
 
-  // Courier Options
-  const courierOptions = [
-    { id: 'Flash Express', name: 'Flash Express', desc: 'ยอดนิยม รวดเร็ว ส่งถึงทุกพื้นที่' },
-    { id: 'J&T Express', name: 'J&T Express', desc: 'ครอบคลุมทุกตำบล ทำงานทุกวัน' },
-    { id: 'ไปรษณีย์ไทย (EMS)', name: 'ไปรษณีย์ไทย (EMS)', desc: 'ด่วนพิเศษ ถึงมือแน่นอน' },
-    { id: 'Kerry Express', name: 'Kerry Express', desc: 'บริการระดับพรีเมียม ปลอดภัย' }
-  ];
+  // Courier Options (ใช้ค่ากลางจาก utils/shippingMatrix เพื่อให้ตรงกับเมนูฐานข้อมูลสินค้า)
+  const courierOptions = COURIER_OPTIONS.map(c => ({
+    id: c.value,
+    name: c.label,
+    desc: c.hint || 'จัดส่งทั่วประเทศ มีบริการเก็บเงินปลายทาง'
+  }));
 
   // Delivery Duration Options
-  const deliveryDaysOptions = [
-    { id: '1-3 วัน', name: '1-3 วันทำการ', desc: 'มาตรฐานจัดส่งด่วน (ยอดนิยม)' },
-    { id: '2-4 วัน', name: '2-4 วันทำการ', desc: 'พื้นที่ห่างไกลหรือสินค้าสั่งทำ' },
-    { id: '3-5 วัน', name: '3-5 วันทำการ', desc: 'สินค้าชิ้นใหญ่หรือส่งข้ามภาค' }
-  ];
+  const deliveryDaysOptions = DELIVERY_DAYS_OPTIONS.map(d => ({
+    id: d.value,
+    name: d.label,
+    desc: d.value === DEFAULT_DELIVERY_DAYS
+      ? 'มาตรฐานจัดส่งด่วน (ยอดนิยม)'
+      : d.value === '2-4 วัน'
+        ? 'พื้นที่ห่างไกลหรือสินค้าสั่งทำ'
+        : 'สินค้าชิ้นใหญ่หรือส่งข้ามภาค'
+  }));
 
-  // Update courier & duration helper
-  const handleSelectCourier = (brand: string) => {
-    const days = formData.product.specs?.delivery_days || '1-3 วัน';
-    const durationText = `จัดส่งโดย ${brand} ถึงภายใน ${days} ทำการ (มีบริการเก็บเงินปลายทาง COD)`;
+  /**
+   * Update courier & duration helper
+   * เขียนค่าลง 3 ที่พร้อมกัน: product.shipping_duration, product.courier_brand/delivery_days
+   * และ product.specs.* เพื่อให้เมนูฐานข้อมูลสินค้า (ซึ่งอ่านจาก catalog row / specs)
+   * เห็นค่าเดียวกันกับ Shipping Matrix เสมอ
+   */
+  const applyShippingMatrix = (brand: string, days: string) => {
+    const durationText = buildShippingDuration(brand, days);
     setFormData(prev => ({
       ...prev,
       product: {
         ...prev.product,
         shipping_duration: durationText,
+        courier_brand: brand,
+        delivery_days: days,
         specs: {
           ...prev.product.specs,
           courier_brand: brand,
+          delivery_days: days,
           shipping_duration: durationText
         }
       }
     }));
   };
 
+  const handleSelectCourier = (brand: string) => {
+    applyShippingMatrix(brand, formData.product.specs?.delivery_days || DEFAULT_DELIVERY_DAYS);
+  };
+
   const handleSelectDeliveryDays = (days: string) => {
-    const brand = formData.product.specs?.courier_brand || 'Flash Express';
-    const durationText = `จัดส่งโดย ${brand} ถึงภายใน ${days} ทำการ (มีบริการเก็บเงินปลายทาง COD)`;
-    setFormData(prev => ({
-      ...prev,
-      product: {
-        ...prev.product,
-        shipping_duration: durationText,
-        specs: {
-          ...prev.product.specs,
-          delivery_days: days,
-          shipping_duration: durationText
-        }
-      }
-    }));
+    applyShippingMatrix(formData.product.specs?.courier_brand || DEFAULT_COURIER_BRAND, days);
   };
 
   // Image Upload helper
@@ -1180,32 +1216,85 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                   ระบบจะส่งข้อความสะกิดลูกค้าที่เงียบหายไปตามช่วงเวลาที่กำหนดโดยอัตโนมัติ และหยุดทันทีเมื่อปิดการขายสำเร็จ
                 </p>
 
+                {/* Master switch — the smart follow-up tick skips pages where this is off */}
+                <div className="flex items-center justify-between p-3.5 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg">
+                  <div>
+                    <p className="text-xs font-bold text-slate-900 dark:text-zinc-200">เปิดระบบติดตามอัตโนมัติ (Follow-Up Engine)</p>
+                    <p className="text-[11px] text-slate-500 dark:text-zinc-400 mt-0.5">
+                      ระบบจะตรวจทุก 10 นาที แล้วส่งข้อความตามสเต็ปด้านล่างให้ลูกค้าที่เงียบหายไป (หยุดเองเมื่อลูกค้าซื้อ/ถูกบล็อก)
+                    </p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                    <input
+                      type="checkbox"
+                      className="sr-only peer"
+                      checked={formData.followup_enabled === true}
+                      onChange={e => setFormData(prev => ({ ...prev, followup_enabled: e.target.checked }))}
+                    />
+                    <div className="w-11 h-6 bg-slate-300 dark:bg-zinc-700 peer-checked:bg-indigo-600 rounded-full transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-5"></div>
+                  </label>
+                </div>
+
                 <div className="space-y-4 pt-2">
-                  {[
-                    { stage: 1, time: '15 นาที', label: 'รอบที่ 1: ตรวจสอบความสนใจ & ถามข้อสงสัย' },
-                    { stage: 2, time: '2 ชั่วโมง', label: 'รอบที่ 2: มอบคูปองส่งฟรีพิเศษเฉพาะวันนี้' },
-                    { stage: 3, time: '24 ชั่วโมง', label: 'รอบที่ 3: แจ้งเตือนสิทธิ์โปรโมชั่นรอบสุดท้าย' }
-                  ].map(f => (
-                    <div key={f.stage} className="p-3.5 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-slate-900 dark:text-zinc-200">{f.label}</span>
-                        <span className="text-[11px] font-mono font-bold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/50 px-2 py-0.5 rounded border border-indigo-200 dark:border-indigo-800">
-                          หลังเงียบ {f.time}
-                        </span>
+                  {(formData.followup_messages || []).map((f, idx) => (
+                    <div key={idx} className="p-3.5 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-bold text-slate-900 dark:text-zinc-200">รอบที่ {idx + 1}</span>
+                        <div className="flex items-center gap-2">
+                          <label className="text-[11px] text-slate-500 dark:text-zinc-400">หลังเงียบ</label>
+                          <input
+                            type="text"
+                            value={f.interval}
+                            onChange={e => setFormData(prev => ({
+                              ...prev,
+                              followup_messages: (prev.followup_messages || []).map((m, i) => i === idx ? { ...m, interval: e.target.value } : m)
+                            }))}
+                            placeholder="เช่น 15 นาที / 2 ชั่วโมง / 21:00 น."
+                            className="w-40 bg-white dark:bg-[#111114] border border-slate-200 dark:border-zinc-800 rounded-lg px-2 py-1 text-[11px] font-mono font-bold text-indigo-600 dark:text-indigo-400 focus:border-indigo-500 outline-none"
+                          />
+                          {(formData.followup_messages || []).length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => setFormData(prev => ({
+                                ...prev,
+                                followup_messages: (prev.followup_messages || []).filter((_, i) => i !== idx)
+                              }))}
+                              className="p-1 rounded-lg text-rose-500 hover:bg-rose-500/10 transition-colors"
+                              title="ลบสเต็ปนี้"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
                       </div>
-                      <input
-                        type="text"
-                        defaultValue={
-                          f.stage === 1
-                            ? 'สวัสดีค่ะคุณลูกค้า สนใจรับโปรโมชั่นชุดไหนดีคะ แจ้งแอดมินได้เลยนะคะ 🙏'
-                            : f.stage === 2
-                            ? 'โปรโมชั่นส่งฟรีเก็บเงินปลายทางวันนี้เหลือโควตาอีก 3 สิทธิ์สุดท้ายนะคะ 😊'
-                            : 'สิทธิ์ส่วนลดพิเศษของคุณลูกค้ากำลังจะหมดอายุในอีก 2 ชั่วโมงค่ะ สั่งซื้อตอนนี้รับของแถมทันทีค่ะ'
-                        }
-                        className="w-full bg-white dark:bg-[#111114] border border-slate-200 dark:border-zinc-800 rounded-lg p-2 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none"
+                      <textarea
+                        rows={2}
+                        value={f.message}
+                        onChange={e => setFormData(prev => ({
+                          ...prev,
+                          followup_messages: (prev.followup_messages || []).map((m, i) => i === idx ? { ...m, message: e.target.value } : m)
+                        }))}
+                        placeholder="ข้อความติดตามลูกค้ารอบนี้..."
+                        className="w-full bg-white dark:bg-[#111114] border border-slate-200 dark:border-zinc-800 rounded-lg p-2 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none resize-none"
                       />
                     </div>
                   ))}
+                  <button
+                    type="button"
+                    onClick={() => setFormData(prev => ({
+                      ...prev,
+                      followup_messages: [
+                        ...(prev.followup_messages || []),
+                        { interval: `${(prev.followup_messages?.length || 0) + 1} ชั่วโมง`, message: '' }
+                      ]
+                    }))}
+                    className="w-full py-2.5 border-2 border-dashed border-slate-300 dark:border-zinc-700 rounded-lg text-xs font-bold text-slate-500 dark:text-zinc-400 hover:border-indigo-500 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
+                  >
+                    + เพิ่มสเต็ปติดตาม
+                  </button>
+                  <p className="text-[11px] text-slate-500 dark:text-zinc-400">
+                    💡 กด "บันทึกการตั้งค่าเพจนี้" ด้านล่างเพื่อให้มีผลจริง — ระบบจะส่งข้อความที่ตั้งไว้ตามเวลา (รองรับ "นาที", "ชั่วโมง", "วัน" และเวลาแบบ "21:00 น.")
+                  </p>
                 </div>
               </div>
             </div>
@@ -2193,6 +2282,22 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                     className="w-full bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg p-3 text-xs text-slate-900 dark:text-zinc-100 font-mono focus:border-indigo-500 outline-none leading-relaxed"
                   />
                 </div>
+
+                <div className="pt-2">
+                  <label className="text-xs text-slate-700 dark:text-zinc-300 font-medium block mb-1.5">
+                    ตัวอย่างข้อความที่จะส่งจริง (อัปเดตทันทีเมื่อติ๊กเลือก/เอาหัวข้อออก หรือแก้เทมเพลต):
+                  </label>
+                  <pre className="whitespace-pre-wrap bg-indigo-50 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-800/60 rounded-lg p-3 text-xs text-indigo-900 dark:text-indigo-200 font-mono leading-relaxed">
+                    {buildCodSummaryText(formData, {
+                      order_id: 'ORD-PREVIEW',
+                      customer_name: 'คุณวิชัย วันดี',
+                      phone_number: '092-xxx-xxxx',
+                      shipping_address: 'ที่อยู่ตัวอย่าง ถ.ลาดกระบัง กรุงเทพฯ 10520',
+                      items: `${formData.product?.product_name || 'สินค้า'} 1 ชุด`,
+                      total_amount: Number(formData.product?.display_price || 990)
+                    })}
+                  </pre>
+                </div>
               </div>
             </div>
           )}
@@ -2448,7 +2553,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                         min="0"
                         max="30000"
                         step="100"
-                        value={formData.reply_delay_ms ?? 1500}
+                        value={formData.reply_delay_ms ?? 0}
                         onChange={e => setFormData(prev => ({ ...prev, reply_delay_ms: Number(e.target.value) }))}
                         className="w-20 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none text-center font-mono"
                       />
@@ -2462,7 +2567,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                   </div>
                   <div className="p-3 bg-indigo-50 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-800/60 rounded-lg">
                     <span className="text-xs text-indigo-900 dark:text-indigo-200 font-medium">
-                      ⏱️ ปัจจุบัน: {(formData.reply_delay_ms ?? 1500) / 1000} วินาที
+                      ⏱️ ปัจจุบัน: {((formData.reply_delay_ms ?? 0) / 1000)} วินาที
                     </span>
                   </div>
                 </div>

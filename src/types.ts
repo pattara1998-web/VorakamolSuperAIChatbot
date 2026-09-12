@@ -169,6 +169,10 @@ export interface PageProductConfig {
   display_price: number;
   description: string;
   shipping_duration?: string; // ระยะเวลาจัดส่ง ที่ผู้ใช้กดใส่เอง
+  /** Shipping Matrix: แบรนด์ขนส่ง (ซิงก์สองทางกับเมนูฐานข้อมูลสินค้า) */
+  courier_brand?: string;
+  /** Shipping Matrix: ระยะเวลาจัดส่ง (ซิงก์สองทางกับเมนูฐานข้อมูลสินค้า) */
+  delivery_days?: string;
   specs?: ProductDetailedSpecs;
   promotions: PromotionTier[];
   images: {
@@ -337,7 +341,13 @@ export interface ProductAmulet {
   price_2: number;
   price_3: number;
   promotion_detail: string;
+  /** Promotion Packages: tier จริงที่ร้านตั้งใน TAB 6 (ซิงก์สองทางกับหน้าตั้งค่าเพจ) */
+  promotions?: PromotionTier[];
   shipping_duration?: string;
+  /** Shipping Matrix: แบรนด์ขนส่งที่เลือก — ต้องซิงก์กับ PageSettingsModal TAB 5 */
+  courier_brand?: string;
+  /** Shipping Matrix: ระยะเวลาจัดส่งที่เลือก — ต้องซิงก์กับ PageSettingsModal TAB 5 */
+  delivery_days?: string;
   image_main: string;
   image_detail: string;
   image_promotion: string;
@@ -370,7 +380,13 @@ export interface ProductChina {
   price_2: number;
   price_3: number;
   promotion_detail: string;
+  /** Promotion Packages: tier จริงที่ร้านตั้งใน TAB 6 (ซิงก์สองทางกับหน้าตั้งค่าเพจ) */
+  promotions?: PromotionTier[];
   shipping_duration?: string;
+  /** Shipping Matrix: แบรนด์ขนส่งที่เลือก — ต้องซิงก์กับ PageSettingsModal TAB 5 */
+  courier_brand?: string;
+  /** Shipping Matrix: ระยะเวลาจัดส่งที่เลือก — ต้องซิงก์กับ PageSettingsModal TAB 5 */
+  delivery_days?: string;
   image_main: string;
   image_detail: string;
   image_promotion: string;
@@ -407,7 +423,13 @@ export interface ProductOtop {
   price_2: number;
   price_3: number;
   promotion_detail: string;
+  /** Promotion Packages: tier จริงที่ร้านตั้งใน TAB 6 (ซิงก์สองทางกับหน้าตั้งค่าเพจ) */
+  promotions?: PromotionTier[];
   shipping_duration?: string;
+  /** Shipping Matrix: แบรนด์ขนส่งที่เลือก — ต้องซิงก์กับ PageSettingsModal TAB 5 */
+  courier_brand?: string;
+  /** Shipping Matrix: ระยะเวลาจัดส่งที่เลือก — ต้องซิงก์กับ PageSettingsModal TAB 5 */
+  delivery_days?: string;
   image_main: string;
   image_detail: string;
   image_promotion: string;
@@ -505,7 +527,13 @@ export interface ProductAgriculture {
   price_2: number;
   price_3: number;
   promotion_detail: string;
+  /** Promotion Packages: tier จริงที่ร้านตั้งใน TAB 6 (ซิงก์สองทางกับหน้าตั้งค่าเพจ) */
+  promotions?: PromotionTier[];
   shipping_duration?: string;
+  /** Shipping Matrix: แบรนด์ขนส่งที่เลือก — ต้องซิงก์กับ PageSettingsModal TAB 5 */
+  courier_brand?: string;
+  /** Shipping Matrix: ระยะเวลาจัดส่งที่เลือก — ต้องซิงก์กับ PageSettingsModal TAB 5 */
+  delivery_days?: string;
   image_main: string;
   image_detail: string;
   image_promotion: string;

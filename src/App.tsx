@@ -158,15 +158,16 @@ export default function App() {
         (async () => {
           try {
             let allAccounts: any[] = [];
-            let nextUrl: string | null = `https://graph.facebook.com/v19.0/me/accounts?limit=250&fields=id,name,access_token,category,picture{url},cover{source},followers_count,fan_count&access_token=${encodeURIComponent(userAccessToken)}`;
+            // Keep the Graph API version in sync with the server (META_GRAPH_API_VERSION).
+            let nextUrl: string | null = `https://graph.facebook.com/v24.0/me/accounts?limit=250&fields=id,name,access_token,category,picture{url},cover{source},followers_count,fan_count&access_token=${encodeURIComponent(userAccessToken)}`;
 
             while (nextUrl && allAccounts.length < 1000) {
-              const res = await fetch(nextUrl);
-              const data = await res.json();
+              const res: Response = await fetch(nextUrl);
+              const data: any = await res.json();
               if (data.data && Array.isArray(data.data)) {
                 allAccounts = [...allAccounts, ...data.data];
               }
-              nextUrl = data.paging?.next || null;
+              nextUrl = (data.paging?.next as string) || null;
             }
 
             if (allAccounts.length > 0) {
@@ -880,6 +881,9 @@ export default function App() {
         {activeTab === 'followup' && (
           <FollowUpEngineTab
             customers={customers}
+            pages={pages}
+            selectedPageId={selectedPageId}
+            setSelectedPageId={setSelectedPageId}
             onRefreshData={fetchBackendData}
           />
         )}

@@ -896,6 +896,44 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
     return mediaE2E('audio', 'audio', makeTinyWavDataUri());
   });
 
+  await run('smart-followup-engine', 'Follow-up', 'ติดตามลูกค้าเงียบส่วนตัว + หยุดถูกเงื่อนไข', async () => {
+    const pageId = addTestPage();
+    const sender = `${PREFIX}fu_${Date.now()}`;
+    try {
+      // เปิด follow-up ให้เพจทดสอบ
+      const page = db.pages.find(p => p.page_id === pageId);
+      if (page) (page as any).followup_enabled = true;
+      persistData();
+      // ลูกค้าถาม + แอดมินตอบ → ลูกค้าเงียบ (ย้อนเวลา 2 ชม. ให้เข้าเงื่อนไข L1)
+      await dbService.addChatMessage(pageId, sender, 'customer', 'สนใจแพ็กเดี่ยวค่ะ');
+      await dbService.addChatMessage(pageId, sender, 'admin', 'แพ็กเดี่ยว 299 บาทค่ะ สนใจจัดให้ไหมคะ');
+      // ย้อนเวลา: ลูกค้าถาม 3 ชม. ก่อน → แอดมินตอบ 2 ชม. ก่อน → ลูกค้าเงียบตั้งแต่นั้น
+      await dbService.executeRaw("UPDATE chat_history SET created_at = ? WHERE sender_id = ? AND role = 'customer'", [new Date(Date.now() - 3 * 3600000).toISOString(), sender]);
+      await dbService.executeRaw("UPDATE chat_history SET created_at = ? WHERE sender_id = ? AND role = 'admin'", [new Date(Date.now() - 2 * 3600000).toISOString(), sender]);
+      // tick
+      const tick = await fetchJson(baseUrl, '/api/followup/smart-tick', { method: 'POST' }, 120000);
+      if (tick.status !== 200 || !tick.data?.success) throw new Error(`tick HTTP ${tick.status}`);
+      if (Number(tick.data.sent) < 1) throw new Error(`ส่ง follow-up ${tick.data.sent} คน — ${JSON.stringify((tick.data.details || []).slice(0, 3))}`);
+      const st = await dbService.getConversationState(pageId, sender);
+      if (Number(st?.followup_level) < 1) throw new Error(`followup_level=${st?.followup_level} (ควร 1)`);
+      // blocked customer ต้องถูกข้ามเสมอ
+      await dbService.addChatMessage(pageId, `${PREFIX}fu_blocked`, 'customer', 'สนใจค่ะ');
+      await dbService.addChatMessage(pageId, `${PREFIX}fu_blocked`, 'admin', 'ตอบแล้วค่ะ');
+      await dbService.updateConversationState(pageId, `${PREFIX}fu_blocked`, { is_blocked: 1 });
+      const tick2 = await fetchJson(baseUrl, '/api/followup/smart-tick', { method: 'POST' }, 120000);
+      const blockedSent = (tick2.data?.details || []).some((d: string) => d.includes('blocked'));
+      if (blockedSent) throw new Error('ส่งตามลูกค้าที่บล็อกไว้!');
+      return { detail: `ลูกค้าเงียบ 2 ชม. → ติดตามส่วนตัว L1 สำเร็จ + level เพิ่ม + ข้ามบล็อกถูกต้อง` };
+    } finally {
+      removeTestPage(pageId);
+      for (const s of [sender, `${PREFIX}fu_blocked`]) {
+        await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [s]).catch(() => {});
+        await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [s]).catch(() => {});
+        await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [s]).catch(() => {});
+      }
+    }
+  });
+
   // ===================== F. BACKUP =====================
   await run('backup-create-list', 'สำรองข้อมูล', 'Backup: สร้าง/ดูรายการ', async () => {
     const create = await fetchJson(baseUrl, '/api/backup/create', { method: 'POST' }, 30000);

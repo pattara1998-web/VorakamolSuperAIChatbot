@@ -62,6 +62,9 @@ export async function loadFromDatabase(db: DatabaseStore): Promise<boolean> {
         (db as any)[key] = products.map(p => ({
           ...p,
           custom_specs: safeParseJson(p.custom_specs, []),
+          // Promotion Packages: แปลง JSON TEXT กลับเป็น array ของ tier จริง
+          // ถ้าไม่ทำขั้นนี้ AI จะเห็นแค่ price_1/2/3 แล้วบอกโปรโมชั่น/ของแถม/ส่งฟรีผิด
+          promotions: safeParseJson(p.promotions, []),
           specs_json: undefined
         }));
         console.log(`[DB Bridge] Loaded ${(db as any)[key].length} ${cat} products from PostgreSQL`);
@@ -140,6 +143,8 @@ export async function saveToDatabase(db: DatabaseStore): Promise<void> {
           ...product,
           category: cat,
           custom_specs: JSON.stringify(product.custom_specs || []),
+          // Promotion Packages: บันทึก tier จริง (ชื่อ/จำนวน/ราคา/ส่งฟรี/ของแถม) ไปด้วย
+          promotions: JSON.stringify((product as any).promotions || []),
           specs_json: '{}'
         });
       }
@@ -236,7 +241,7 @@ export function flattenPage(page: PageConfig): Record<string, any> {
     comment_auto_tag_customer: page.comment_auto_tag_customer !== false ? 1 : 0,
     followup_enabled: page.followup_enabled ? 1 : 0,
     followup_messages: JSON.stringify(page.followup_messages || []),
-    reply_delay_ms: page.reply_delay_ms ?? 1500,
+    reply_delay_ms: page.reply_delay_ms ?? 0,
     bot_stopped: page.bot_stopped ? 1 : 0,
     rate_limit_per_hour: page.rate_limit_per_hour ?? 30,
     quick_replies: JSON.stringify(page.quick_replies || []),

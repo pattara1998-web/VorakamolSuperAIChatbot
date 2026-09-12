@@ -119,7 +119,7 @@ async function initTables() {
       comment_auto_tag_customer INTEGER DEFAULT 1,
       followup_enabled INTEGER DEFAULT 0,
       followup_messages TEXT DEFAULT '[]',
-      reply_delay_ms INTEGER DEFAULT 1500,
+      reply_delay_ms INTEGER DEFAULT 0,
       bot_stopped INTEGER DEFAULT 0,
       rate_limit_per_hour INTEGER DEFAULT 30,
       quick_replies TEXT DEFAULT '[]',
@@ -146,6 +146,11 @@ async function initTables() {
       price_2 DOUBLE PRECISION DEFAULT 0,
       price_3 DOUBLE PRECISION DEFAULT 0,
       promotion_detail TEXT DEFAULT '',
+      -- Promotion Packages: tier จริง (ชื่อ/จำนวน/ราคา/ส่งฟรี/ของแถม) เก็บเป็น JSON array
+      promotions TEXT DEFAULT '[]',
+      -- Shipping Matrix: ต้องซิงก์สองทางกับ PageSettingsModal TAB 5
+      courier_brand TEXT DEFAULT '',
+      delivery_days TEXT DEFAULT '',
       shipping_duration TEXT DEFAULT '',
       image_main TEXT DEFAULT '',
       image_detail TEXT DEFAULT '',
@@ -312,9 +317,17 @@ async function initTables() {
     -- Migrations for databases created before these fields existed
     ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS participant_pic TEXT DEFAULT '';
     ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS bot_paused INTEGER DEFAULT 0;
+    ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS followup_level INTEGER DEFAULT 0;
+    ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS followup_at TEXT;
 
     ALTER TABLE products ADD COLUMN IF NOT EXISTS cost_price DOUBLE PRECISION DEFAULT 0;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS shipping_cost DOUBLE PRECISION DEFAULT 0;
+    -- Promotion Packages + Shipping Matrix: ฐานข้อมูลเก่าที่สร้างก่อนหน้ายังไม่มีคอลัมน์เหล่านี้
+    -- ถ้าไม่เพิ่ม upsertRow() จะ INSERT ไม่ผ่าน (column does not exist) ทำให้การบันทึกสินค้า
+    -- ลง Postgres ล้มเหลวทั้งก้อน และโปรโมชั่นที่ตั้งไว้หายไปทุกครั้งที่รีสตาร์ท
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS promotions TEXT DEFAULT '[]';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS courier_brand TEXT DEFAULT '';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS delivery_days TEXT DEFAULT '';
 
     CREATE TABLE IF NOT EXISTS page_daily_expenses (
       page_id TEXT NOT NULL,
@@ -484,6 +497,11 @@ export async function upsertProduct(product: Record<string, any>): Promise<void>
   }
   if (normalized.custom_specs && typeof normalized.custom_specs !== 'string') {
     normalized.custom_specs = JSON.stringify(normalized.custom_specs);
+  }
+  // Promotion Packages: เก็บ tier จริงเป็น JSON string
+  // (ถ้าข้ามขั้นนี้ ข้อมูลจะหายตอน reload จาก Postgres เหลือแค่ price_1/2/3)
+  if (normalized.promotions !== undefined && typeof normalized.promotions !== 'string') {
+    normalized.promotions = JSON.stringify(Array.isArray(normalized.promotions) ? normalized.promotions : []);
   }
   normalized.updated_at = new Date().toISOString();
   if (!normalized.created_at) {
@@ -785,6 +803,8 @@ export interface ConversationStateRow {
   participant_name: string;
   participant_pic: string;
   bot_paused: number;
+  followup_level: number;
+  followup_at: string | null;
   updated_at: string;
 }
 

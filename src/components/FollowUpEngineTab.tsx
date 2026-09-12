@@ -18,7 +18,7 @@ import {
   Check,
   MessageSquare
 } from 'lucide-react';
-import { Customer } from '../types';
+import { Customer, PageConfig } from '../types';
 
 interface FollowUpStepItem {
   id: string;
@@ -31,6 +31,9 @@ interface FollowUpStepItem {
 
 interface FollowUpEngineTabProps {
   customers: Customer[];
+  pages: PageConfig[];
+  selectedPageId: string;
+  setSelectedPageId?: (id: string) => void;
   onRefreshData: () => void;
 }
 
@@ -104,6 +107,9 @@ const FOLLOWUP_TEMPLATES = [
 
 export const FollowUpEngineTab: React.FC<FollowUpEngineTabProps> = ({
   customers,
+  pages,
+  selectedPageId,
+  setSelectedPageId,
   onRefreshData
 }) => {
   const [steps, setSteps] = useState<FollowUpStepItem[]>(() => {
@@ -126,13 +132,67 @@ export const FollowUpEngineTab: React.FC<FollowUpEngineTabProps> = ({
   const [isRunning, setIsRunning] = useState(false);
   const [runResult, setRunResult] = useState<any>(null);
   const [saveToast, setSaveToast] = useState<string | null>(null);
+  const [followupEnabled, setFollowupEnabled] = useState<boolean>(false);
+
+  const currentPage = pages.find(p => p.page_id === selectedPageId) || pages[0];
+  const activePageId = currentPage?.page_id || selectedPageId;
+
+  // Load the server-side follow-up config for the selected page so the steps
+  // shown here are the SAME ones the smart follow-up tick actually sends.
+  useEffect(() => {
+    if (!currentPage) return;
+    setFollowupEnabled(currentPage.followup_enabled === true);
+    const serverMessages = currentPage.followup_messages || [];
+    if (serverMessages.length > 0) {
+      setSteps(serverMessages.map((m, idx) => ({
+        id: `fu-srv-${idx}`,
+        name: `สเต็ปที่ ${idx + 1} (หลังเงียบ ${m.interval})`,
+        time: m.interval,
+        desc: 'ข้อความติดตามที่ตั้งค่าไว้บนเซิร์ฟเวอร์ (แก้ไขแล้วกดบันทึกจะซิงก์ทันที)',
+        message: m.message,
+        is_active: true
+      })));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePageId, currentPage?.followup_enabled, currentPage?.followup_messages?.length]);
+
+  // Persist steps to the server (page config) — localStorage alone never reached
+  // the follow-up engine, which is why the stages "didn't work".
+  const syncStepsToServer = async (newSteps: FollowUpStepItem[], enabled: boolean) => {
+    if (!activePageId) return;
+    try {
+      await fetch('/api/followup/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          page_id: activePageId,
+          enabled,
+          messages: newSteps
+            .filter(s => s.message.trim() && s.time.trim())
+            .map(s => ({ interval: s.time.trim(), message: s.message.trim() }))
+        })
+      });
+      onRefreshData();
+    } catch {
+      setSaveToast('⚠️ ซิงก์ขึ้นเซิร์ฟเวอร์ไม่สำเร็จ — ตรวจสอบการเชื่อมต่อ');
+      setTimeout(() => setSaveToast(null), 3000);
+    }
+  };
 
   const saveSteps = (newSteps: FollowUpStepItem[]) => {
     setSteps(newSteps);
     if (typeof window !== 'undefined') {
       localStorage.setItem('fb_chatbot_followup_steps', JSON.stringify(newSteps));
     }
-    setSaveToast('✅ บันทึกลำดับข้อความติดตามลูกค้าสำเร็จแล้ว');
+    syncStepsToServer(newSteps, followupEnabled);
+    setSaveToast('✅ บันทึกลำดับข้อความติดตามลูกค้าสำเร็จแล้ว (ซิงก์ขึ้นเซิร์ฟเวอร์แล้ว)');
+    setTimeout(() => setSaveToast(null), 3000);
+  };
+
+  const handleToggleEnabled = (next: boolean) => {
+    setFollowupEnabled(next);
+    syncStepsToServer(steps, next);
+    setSaveToast(next ? '✅ เปิดระบบติดตามอัตโนมัติแล้ว — ระบบจะตรวจทุก 10 นาที' : '⏸️ ปิดระบบติดตามอัตโนมัติแล้ว');
     setTimeout(() => setSaveToast(null), 3000);
   };
 
@@ -179,15 +239,19 @@ export const FollowUpEngineTab: React.FC<FollowUpEngineTabProps> = ({
     saveSteps(updated);
   };
 
-  const pendingCustomers = customers.filter(c => c.status !== 'ORDER_COMPLETED');
+  // Only show customers that belong to the selected page (or unassigned ones)
+  // so the queue matches the page whose follow-up config is being edited.
+  const pendingCustomers = customers.filter(
+    c => c.status !== 'ORDER_COMPLETED' && (!c.page_id || !activePageId || c.page_id === activePageId)
+  );
 
-  const handleRunFollowUp = async (intervalName: string) => {
+  const handleRunFollowUp = async (intervalName: string, message?: string, psid?: string) => {
     setIsRunning(true);
     try {
       const res = await fetch('/api/followup/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ intervalName })
+        body: JSON.stringify({ intervalName, message, psid, page_id: activePageId })
       });
       const data = await res.json();
       setRunResult(data);
@@ -221,7 +285,37 @@ export const FollowUpEngineTab: React.FC<FollowUpEngineTabProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-end">
+            {pages.length > 0 && (
+              <select
+                value={activePageId || ''}
+                onChange={e => setSelectedPageId?.(e.target.value)}
+                className="px-3 py-2 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-xl text-xs font-bold text-slate-700 dark:text-zinc-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 max-w-[200px]"
+                title="เลือกเพจที่จะใช้ระบบติดตาม"
+              >
+                {pages.map(p => (
+                  <option key={p.page_id} value={p.page_id}>
+                    {p.page_name}
+                  </option>
+                ))}
+              </select>
+            )}
+            <label
+              className="flex items-center gap-2 px-3 py-2 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-xl cursor-pointer"
+              title="เปิด/ปิดระบบติดตามอัตโนมัติของเพจนี้"
+            >
+              <span className="text-xs font-bold text-slate-700 dark:text-zinc-300">
+                ติดตามอัตโนมัติ
+              </span>
+              <span
+                onClick={() => handleToggleEnabled(!followupEnabled)}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${followupEnabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-zinc-700'}`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${followupEnabled ? 'translate-x-[18px]' : 'translate-x-[3px]'}`}
+                />
+              </span>
+            </label>
             <button
               onClick={handleAddNewStep}
               className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-slate-800 dark:text-zinc-200 text-xs font-bold rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-xs"
@@ -323,7 +417,7 @@ export const FollowUpEngineTab: React.FC<FollowUpEngineTabProps> = ({
             </div>
 
             <button
-              onClick={() => handleRunFollowUp(step.name)}
+              onClick={() => handleRunFollowUp(step.name, step.message)}
               disabled={isRunning || pendingCustomers.length === 0}
               className="w-full py-2.5 bg-slate-50 hover:bg-indigo-600 hover:text-white dark:bg-[#141418] dark:hover:bg-indigo-600 disabled:opacity-50 text-slate-700 dark:text-zinc-200 text-xs font-bold rounded-xl border border-slate-200 hover:border-indigo-600 dark:border-zinc-800 dark:hover:border-indigo-500 transition-all flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
             >
@@ -540,8 +634,9 @@ export const FollowUpEngineTab: React.FC<FollowUpEngineTabProps> = ({
                     </td>
                     <td className="p-3.5">
                       <button
-                        onClick={() => handleRunFollowUp('Follow-Up เฉพาะบุคคล')}
-                        className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-[11px] font-bold flex items-center gap-1 shadow-sm shadow-indigo-600/20 cursor-pointer"
+                        onClick={() => handleRunFollowUp('Follow-Up เฉพาะบุคคล', undefined, cust.psid)}
+                        disabled={isRunning}
+                        className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-xl text-[11px] font-bold flex items-center gap-1 shadow-sm shadow-indigo-600/20 cursor-pointer"
                       >
                         <Send className="w-3 h-3" /> ส่งทันที
                       </button>

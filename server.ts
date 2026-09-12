@@ -29,6 +29,7 @@ import * as dbBridge from './src/services/dbBridge.ts';
 import * as dbService from './src/services/database.ts';
 import * as auth from './src/services/auth.ts';
 import { runSelfTests, type SelfTestReport } from './src/services/selftest.ts';
+import { buildCodSummaryText } from './src/utils/codSummary.ts';
 
 dotenv.config();
 
@@ -191,6 +192,14 @@ const META_GRAPH_API_VERSION = process.env.META_GRAPH_API_VERSION || 'v24.0';
 // instant-fire like a bot (Meta anti-spam / BAN prevention). Configurable.
 const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 1500);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// Per-page reply delay: 0 = instant (admin explicitly asked for 0ms support).
+// Falls back to the global REPLY_DELAY_MS only when the page never configured
+// a value. Capped at 30s so a typo can never stall a conversation.
+function resolvePageDelay(page: { reply_delay_ms?: number } | undefined): number {
+  const raw = page?.reply_delay_ms;
+  if (raw === undefined || raw === null || Number.isNaN(Number(raw))) return Math.min(REPLY_DELAY_MS, 30000);
+  return Math.min(Math.max(0, Number(raw)), 30000);
+}
 // Hard cap on any single AI call so a hung Gemini request can never leave a
 // customer waiting for minutes — we race the call against a timer and, on
 // timeout, retry once on the lite model before falling back to a template.
@@ -385,6 +394,40 @@ const recentReplies: RecentReply[] = [];
 const MAX_RECENT_REPLIES = 50; // Keep last 50 replies
 const REPLY_MEMORY_WINDOW_MS = 5 * 60 * 1000; // 5 minute window
 
+// ---------------------------------------------------------------------------
+// Sales-sequence step dedupe. Without this the configured step (usually step 1)
+// was re-sent on EVERY incoming message, which is the other half of the
+// "ตอบแต่ซ้ำๆ" complaint. A step is delivered once per conversation; it resets
+// after 6 hours of silence so a returning customer still gets the pitch.
+// ---------------------------------------------------------------------------
+interface SentStepRecord {
+  steps: Set<number>;
+  timestamp: number;
+}
+const sentSequenceSteps = new Map<string, SentStepRecord>();
+const SEQUENCE_STEP_RESET_MS = 6 * 60 * 60 * 1000;
+
+function markSequenceStepSent(pageId: string, senderId: string, stepNumber: number): boolean {
+  const key = `${pageId}:${senderId}`;
+  const now = Date.now();
+  let record = sentSequenceSteps.get(key);
+  if (!record || now - record.timestamp > SEQUENCE_STEP_RESET_MS) {
+    record = { steps: new Set<number>(), timestamp: now };
+    sentSequenceSteps.set(key, record);
+  }
+  record.timestamp = now;
+  if (record.steps.has(stepNumber)) return false; // already delivered
+  record.steps.add(stepNumber);
+  return true;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of sentSequenceSteps.entries()) {
+    if (now - record.timestamp > SEQUENCE_STEP_RESET_MS * 2) sentSequenceSteps.delete(key);
+  }
+}, 30 * 60 * 1000).unref?.();
+
 // Clean old entries from recentReplies
 function cleanRecentReplies() {
   const now = Date.now();
@@ -576,9 +619,22 @@ function persistData(): void {
 
 const PRODUCT_CORE_FIELDS = new Set([
   'product_id', 'page_id', 'product_name', 'category', 'display_price', 'price_1', 'price_2', 'price_3',
-  'promotion_detail', 'shipping_duration', 'image_main', 'image_detail', 'image_promotion', 'image_review',
+  'promotion_detail', 'promotions', 'shipping_duration', 'image_main', 'image_detail', 'image_promotion', 'image_review',
   'image_closing', 'opening_text', 'detail_text', 'promotion_text', 'review_text', 'closing_text', 'custom_specs'
 ]);
+/** Promotion Packages: อ่าน tier จริงจากแถวสินค้า (รองรับทั้ง array และ JSON string จาก Postgres) */
+function parseCatalogPromotions(raw: any): any[] {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
 function syncPagesFromCatalog(collection: 'amulet' | 'china' | 'otop' | 'agriculture') {
   for (const record of db[collection] as any[]) {
     const page = db.pages.find(p => p.page_id === record.page_id);
@@ -593,17 +649,30 @@ function syncPagesFromCatalog(collection: 'amulet' | 'china' | 'otop' | 'agricul
       display_price: Number(record.display_price ?? page.product?.display_price ?? 0),
       description: record.description || record.detail_text || page.product?.description || '',
       shipping_duration: record.shipping_duration || page.product?.shipping_duration,
+      // Shipping Matrix: propagate courier/delivery to the page product top level too
+      // (specs already carry them via the filter above) so PageSettingsModal TAB 5 and
+      // the product database menu always agree.
+      courier_brand: record.courier_brand || page.product?.specs?.courier_brand || page.product?.courier_brand,
+      delivery_days: record.delivery_days || page.product?.specs?.delivery_days || page.product?.delivery_days,
       specs: { ...(page.product?.specs || {}), ...specs, custom_specs: record.custom_specs || page.product?.specs?.custom_specs },
       images: {
         main: record.image_main || page.product?.images?.main || '', detail: record.image_detail || page.product?.images?.detail || '',
         promotion: record.image_promotion || page.product?.images?.promotion || '', review: record.image_review || page.product?.images?.review || '',
         closing: record.image_closing || page.product?.images?.closing || ''
       },
-      promotions: page.product?.promotions?.length ? page.product.promotions : [
-        { id: 'tier-1', name: 'โปรโมชั่น 1 ชิ้น', quantity: 1, price: Number(record.price_1 || record.display_price || 0), description: '' },
-        { id: 'tier-2', name: 'โปรโมชั่น 2 ชิ้น', quantity: 2, price: Number(record.price_2 || 0), description: record.promotion_detail || '' },
-        { id: 'tier-3', name: 'โปรโมชั่น 3 ชิ้น', quantity: 3, price: Number(record.price_3 || 0), description: '' }
-      ]
+      // Promotion Packages: tier จริงจากเมนูฐานข้อมูลสินค้า (record.promotions) ชนะค่าเก่าของเพจ
+      // ถ้าไม่มีทั้งคู่จึงค่อยสร้าง tier เปล่าจาก price_1/2/3 — ต้นเหตุที่โปรโมชั่น
+      // (ชื่อแพ็ก/ส่งฟรี/ของแถม) ที่ตั้งไว้ใน TAB 6 หายไปหลังซิงก์หรือรีสตาร์ท
+      promotions: (() => {
+        const fromCatalog = parseCatalogPromotions(record.promotions);
+        if (fromCatalog.length) return fromCatalog;
+        if (page.product?.promotions?.length) return page.product.promotions;
+        return [
+          { id: 'tier-1', name: 'โปรโมชั่น 1 ชิ้น', quantity: 1, price: Number(record.price_1 || record.display_price || 0), description: '' },
+          { id: 'tier-2', name: 'โปรโมชั่น 2 ชิ้น', quantity: 2, price: Number(record.price_2 || 0), description: record.promotion_detail || '' },
+          { id: 'tier-3', name: 'โปรโมชั่น 3 ชิ้น', quantity: 3, price: Number(record.price_3 || 0), description: '' }
+        ];
+      })()
     };
   }
 }
@@ -631,6 +700,8 @@ function syncCatalogFromPages() {
       promotions: page.product.promotions?.length ? page.product.promotions : current.promotions,
       promotion_detail: page.product.promotions?.[1]?.description || current.promotion_detail || '',
       shipping_duration: page.product.shipping_duration || current.shipping_duration,
+      courier_brand: page.product.courier_brand || page.product.specs?.courier_brand || current.courier_brand,
+      delivery_days: page.product.delivery_days || page.product.specs?.delivery_days || current.delivery_days,
       image_main: page.product.images?.main || current.image_main || '', image_detail: page.product.images?.detail || current.image_detail || '',
       image_promotion: page.product.images?.promotion || current.image_promotion || '', image_review: page.product.images?.review || current.image_review || '', image_closing: page.product.images?.closing || current.image_closing || '',
       opening_text: page.sequence?.step1_opening_text || current.opening_text || '', detail_text: page.product.description || current.detail_text || '',
@@ -738,18 +809,10 @@ async function triggerCrisisAlert(alert: {
 async function dispatchOrderSummary(order: Order, page: PageConfig) {
   const channel = page.notification_channel || 'BOTH';
 
-  // Format using cod_summary_template if provided, else use standard format
-  let formattedSummary = '';
-  if (page.cod_summary_template) {
-    formattedSummary = page.cod_summary_template
-      .replace('{customer_name}', order.customer_name)
-      .replace('{shipping_address}', order.shipping_address)
-      .replace('{phone_number}', order.phone_number)
-      .replace('{items}', order.items)
-      .replace('{total_amount}', `${order.total_amount.toLocaleString()}`);
-  } else {
-    formattedSummary = `${order.customer_name}\n${order.shipping_address}\n${order.phone_number}\n***${order.items}`;
-  }
+  // ใช้ builder ตัวเดียวกับหน้าตั้งค่าเพจ (TAB 7) — รองรับเทมเพลต + ตัวแปรครบทุกตัว
+  // รวมถึง {shipping_duration} และ {order_id} ที่เดิมหายไป และตามหัวข้อที่ผู้ใช้
+  // ติ๊กเลือก/เอาออกจาก COD Form (cod_summary_fields) อย่างถูกต้อง
+  const formattedSummary = buildCodSummaryText(page, order);
 
   const dispatchContent = `📦 [คำสั่งซื้อใหม่ - เก็บเงินปลายทาง]\nเพจ: ${page.page_name}\n----------------------------------\n${formattedSummary}\n----------------------------------\nยอดเรียกเก็บ: ฿${order.total_amount.toLocaleString()}\nสถานะ: ส่งสรุปยอดเรียบร้อย ✅`;
 
@@ -987,6 +1050,57 @@ function parseLooseJson(raw: string): any {
 }
 
 /**
+ * Salvage a usable Thai reply from model output that is NOT valid JSON.
+ *
+ * Why this exists: when the model burns its token budget on reasoning the JSON
+ * comes back truncated. The old code returned `{}`, and the webhook then fell
+ * back to `page.sequence.step1_opening_text` — i.e. the customer received the
+ * SAME canned opening message for every question ("ตอบซ้ำๆ ทั้งที่ถามคำถามอื่น").
+ * Recovering the plain text keeps the conversation coherent instead.
+ */
+function salvagePlainText(raw: string): string {
+  let text = String(raw || '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
+    .replace(/^```(?:json)?/i, '')
+    .replace(/```$/i, '')
+    .trim();
+  if (!text) return '';
+
+  // Case A: the model wrote JSON-ish text and we can still pull "replyText".
+  const replyMatch = /"replyText"\s*:\s*"((?:[^"\\]|\\.)*)"/s.exec(text);
+  if (replyMatch) {
+    try {
+      const decoded = JSON.parse(`"${replyMatch[1]}"`);
+      if (decoded && decoded.trim().length >= 5) return decoded.trim().slice(0, 1200);
+    } catch { /* fall through to plain-text salvage */ }
+  }
+
+  // Case B: collect every "text" value from a (possibly truncated) messages array.
+  const msgTexts: string[] = [];
+  const textRe = /"text"\s*:\s*"((?:[^"\\]|\\.)*)"/gs;
+  let m: RegExpExecArray | null;
+  while ((m = textRe.exec(text)) !== null) {
+    try {
+      const decoded = JSON.parse(`"${m[1]}"`);
+      if (decoded && decoded.trim()) msgTexts.push(decoded.trim());
+    } catch { /* skip malformed fragment */ }
+  }
+  if (msgTexts.length) return msgTexts.join('\n').slice(0, 1200);
+
+  // Case C: it was never JSON — the model answered in natural language.
+  // Drop structural noise so only the human-readable reply remains.
+  const plain = text
+    .replace(/^\s*[{[]/, '')
+    .replace(/[}\]]\s*$/, '')
+    .replace(/"(intent|sequenceStep|isOrderDetected|orderData|messages|image|quantity|unit_price|total_amount|customer_name|phone_number|address|product_id)"\s*:\s*[^,}\n]*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  // Require a minimum of real Thai/Latin sentence content before trusting it.
+  if (plain.length >= 12 && /[\u0E00-\u0E7Fa-zA-Z]/.test(plain)) return plain.slice(0, 1200);
+  return '';
+}
+
+/**
  * Provider-aware AI call returning parsed JSON + metadata.
  * GEMINI uses the native SDK with a strict response schema and a fast-retry
  * on the lite model; every other provider uses the OpenAI-compatible caller.
@@ -1056,7 +1170,17 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
               continue;
             }
             if (rawText) {
-              // มีข้อความแต่กู้ JSON ไม่ได้ — คืนค่าว่างให้ระบบใช้ข้อความเปิดแทน template ดิบ
+              // มีข้อความแต่กู้ JSON ไม่ได้ — กู้ข้อความจริงออกมาใช้เป็นคำตอบ
+              // (เดิมคืน {} ทำให้ระบบส่ง "ข้อความเปิด" ซ้ำทุกครั้งที่ JSON พัง)
+              const salvaged = salvagePlainText(rawText);
+              if (salvaged) {
+                addLog('INFO', 'AI_ENGINE', model, `⚠️ กู้ JSON ไม่สำเร็จ — ใช้ข้อความที่กู้ได้จากโมเดลเป็นคำตอบ (${salvaged.length} ตัวอักษร)`, 'WARNING');
+                return {
+                  parsed: { intent: 'QUESTION', replyText: salvaged, isOrderDetected: false, __salvaged: true },
+                  model,
+                  latencyMs: Date.now() - started
+                };
+              }
               return { parsed: {}, model, latencyMs: Date.now() - started };
             }
             throw new Error('JSON_TRUNCATED');
@@ -1357,12 +1481,12 @@ async function startServer() {
         try {
           if ((ch === 'TELEGRAM' || ch === 'BOTH') && page.telegram_bot_token && page.telegram_chat_id && !seen.has('tg_' + page.telegram_chat_id)) {
             seen.add('tg_' + page.telegram_chat_id);
-            await deliverTelegram(page, text);
+            await deliverTelegram?.(page, text);
             sent++;
           }
           if ((ch === 'LINE' || ch === 'BOTH') && page.line_notify_token && !seen.has('ln_' + page.line_notify_token)) {
             seen.add('ln_' + page.line_notify_token);
-            await deliverLine(page, text);
+            await deliverLine?.(page, text);
             sent++;
           }
         } catch { /* skip */ }
@@ -2612,6 +2736,62 @@ async function startServer() {
     }
   }
 
+  // Send an already-uploaded reusable attachment (from /me/message_attachments).
+  // This is the only way to deliver a locally-picked file: Messenger requires a
+  // public URL or a reusable attachment_id, never raw bytes in /me/messages.
+  async function sendFacebookAttachmentById(accessToken: string, recipientId: string, attachmentId: string, type: 'image' | 'video' | 'audio' | 'file' = 'image') {
+    const rawToken = decryptToken(accessToken);
+    if (!rawToken?.startsWith('EAA') || !attachmentId) return { success: false, error: 'PAGE_ACCESS_TOKEN_OR_ATTACHMENT_NOT_CONFIGURED' };
+    try {
+      const response = await fetch(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: { id: recipientId }, message: { attachment: { type, payload: { attachment_id: attachmentId } } } })
+      });
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error?.message || 'Send attachment failed');
+      return { success: true, messageId: data.message_id };
+    } catch (error: any) {
+      addLog('INFO', 'FACEBOOK_API', recipientId, `❌ ส่งไฟล์แนบไม่สำเร็จ: ${error.message}`, 'ERROR');
+      return { success: false, error: error.message };
+    }
+  }
+
+  // Upload raw bytes to /me/message_attachments and get a reusable attachment_id.
+  // Used by the admin chat "attach image" button so a local file can be sent.
+  async function uploadReusableAttachment(accessToken: string, buffer: Buffer, filename: string, mimeType: string): Promise<{ success: boolean; attachment_id?: string; error?: string }> {
+    const rawToken = decryptToken(accessToken);
+    if (!rawToken?.startsWith('EAA')) return { success: false, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
+    if (!buffer || buffer.length === 0) return { success: false, error: 'EMPTY_FILE' };
+    try {
+      const form = new FormData();
+      form.append('is_reusable', 'true');
+      form.append('type', mimeType || 'image/jpeg');
+      form.append('source', new Blob([new Uint8Array(buffer)], { type: mimeType || 'image/jpeg' }), filename || 'upload.bin');
+      const response = await fetch(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/message_attachments?access_token=${encodeURIComponent(rawToken)}`, {
+        method: 'POST',
+        body: form
+      });
+      const data: any = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error?.message || 'Upload attachment failed');
+      if (!data.attachment_id) throw new Error('Graph API ไม่คืนค่า attachment_id');
+      return { success: true, attachment_id: data.attachment_id };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  // Decode a `data:<mime>;base64,<payload>` string (or plain base64) into bytes.
+  function decodeDataUrl(input: string): { buffer: Buffer; mimeType: string } | null {
+    if (!input || typeof input !== 'string') return null;
+    const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(input.trim());
+    if (match) {
+      const buffer = Buffer.from(match[3], 'base64');
+      return buffer.length ? { buffer, mimeType: match[1] || 'image/jpeg' } : null;
+    }
+    const buffer = Buffer.from(input, 'base64');
+    return buffer.length ? { buffer, mimeType: 'image/jpeg' } : null;
+  }
+
   // Send Facebook Messenger message with Quick Reply buttons.
   // Limits enforced by the Send API: max 13 buttons per message, 20-char
   // titles, 1000-char payloads. Empty/broken entries are filtered out so a
@@ -2658,9 +2838,14 @@ async function startServer() {
     }
   }
 
-  async function sendConfiguredSequenceStep(page: PageConfig, recipientId: string, stepNumber: number) {
+  async function sendConfiguredSequenceStep(page: PageConfig, recipientId: string, stepNumber: number, dedupe = false) {
     const step = page.sales_sequence_steps?.find(item => item.step_number === stepNumber);
     if (!step) return { sent: false };
+    // dedupe: send each configured step only once per conversation window so
+    // the customer does not receive the same step on every single message.
+    if (dedupe && !markSequenceStepSent(page.page_id, recipientId, stepNumber)) {
+      return { sent: false, deduped: true };
+    }
     if (step.type !== 'IMAGE' && step.text_content?.trim()) {
       await sendFacebookMessage(page.page_access_token || '', recipientId, step.text_content.trim());
     }
@@ -3748,7 +3933,8 @@ async function startServer() {
           const customerTag = page.comment_auto_tag_customer !== false ? `@ลูกค้า` : '';
           const replyTemplate = page.comment_reply_template || 'ขอบพระคุณที่สนใจค่ะคุณ @customer_name แอดมินทัก Inbox ส่งรายละเอียดให้เรียบร้อยแล้วนะคะ 🙏';
           const replyText = replyTemplate.replace('@customer_name', customerTag || 'ลูกค้า');
-          const replyImages = page.comment_reply_images || [];
+          const replyImages = (page.comment_reply_images || []).filter(u => typeof u === 'string' && u.trim());
+          const commentDelay = resolvePageDelay(page);
 
           addLog(
             'COMMENT',
@@ -3760,7 +3946,7 @@ async function startServer() {
           );
 
           if (commentId) {
-            await sleep(REPLY_DELAY_MS); // human-like pacing before replying publicly
+            await sleep(commentDelay); // human-like pacing before replying publicly
             await sendFacebookCommentReply(page.page_access_token || '', commentId, replyText);
           }
 
@@ -3768,8 +3954,30 @@ async function startServer() {
           const autoInboxMsg = `สวัสดีค่ะคุณลูกค้า สนใจ ${page.product?.product_name || 'สินค้า'} แอดมินส่งรายละเอียดและของแถมพิเศษให้ในแชทนี้แล้วนะคะ 🙏`;
           addLog('AI_REPLY', senderId, pageId, `📨 ส่งข้อความทัก Inbox: "${autoInboxMsg}"`, 'SUCCESS');
 
-          await sleep(REPLY_DELAY_MS);
+          await sleep(commentDelay);
           await sendFacebookMessage(page.page_access_token || '', senderId, autoInboxMsg);
+
+          // Deliver the configured comment reply images into the customer's inbox
+          // (previously they were only counted in the log but never sent).
+          for (const imgUrl of replyImages) {
+            await sleep(commentDelay);
+            const imgRes = await sendFacebookImage(page.page_access_token || '', senderId, imgUrl.trim());
+            if (!imgRes.success) {
+              addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปคอมเมนต์เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
+            }
+          }
+
+          // Sales Sequence Auto-Trigger also applies to comments: a commenter with
+          // purchase intent ("สนใจ" etc.) gets the full configured step sequence.
+          const sequenceSteps = (page.sales_sequence_steps || []).filter(s => s && (s.text_content?.trim() || s.image_url?.trim()));
+          if (hasPurchaseIntent && page.sales_sequence_auto_trigger && sequenceSteps.length > 0) {
+            addLog('COMMENT', senderId, pageId, `🚀 Sales Sequence Auto-Trigger (คอมเมนต์): ส่ง ${sequenceSteps.length} ขั้นตอนเข้า Inbox`, 'SUCCESS');
+            const ordered = [...sequenceSteps].sort((a, b) => a.step_number - b.step_number);
+            for (const step of ordered) {
+              await sleep(Math.max(step.delay_seconds ? step.delay_seconds * 1000 : 0, commentDelay));
+              await sendConfiguredSequenceStep(page, senderId, step.step_number);
+            }
+          }
         }
         return;
       }
@@ -4018,10 +4226,10 @@ ${usedRepliesText}
 📋 ข้อมูลสเปกสินค้าแบบละเอียด (Detailed Product Specifications):
 ${compactSpecText(specsText)}
 - โปรโมชั่นทั้งหมดที่มี (ชื่อแพ็กเกจคือชื่อที่ร้านกำหนดเอง ให้ใช้ชื่อนี้ตามนั้น):
-${JSON.stringify((page.product?.promotions || [
-  { name: 'โปรโมชั่น 1 ชิ้น', price: matchedProduct.price_1 || 0 },
-  { name: 'โปรโมชั่น 2 ชิ้น', price: matchedProduct.price_2 || 0 },
-  { name: 'โปรโมชั่น 3 ชิ้น', price: matchedProduct.price_3 || 0 }
+${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : parseCatalogPromotions(matchedProduct.promotions)) || [
+  { name: 'โปรโมชั่น 1 ชิ้น', quantity: 1, price: matchedProduct.price_1 || 0 },
+  { name: 'โปรโมชั่น 2 ชิ้น', quantity: 2, price: matchedProduct.price_2 || 0 },
+  { name: 'โปรโมชั่น 3 ชิ้น', quantity: 3, price: matchedProduct.price_3 || 0 }
 ]).map((p: any) => ({
   name: p.name,
   quantity: p.quantity,
@@ -4076,7 +4284,18 @@ ${JSON.stringify((page.product?.promotions || [
         const selectedModel = usedModel;
 
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
-        let replyText = parsed.replyText || page.sequence?.step1_opening_text || 'สวัสดีค่ะ สอบถามข้อมูลสินค้าหรือโปรโมชั่นแจ้งได้เลยนะคะ 🙏';
+        // If the model returned no usable text, do NOT re-send the canned opening
+        // message — that was the "same answer to every question" bug. Answer from
+        // real product data and acknowledge the customer's actual question.
+        let replyText = String(parsed.replyText || '').trim();
+        if (!replyText) {
+          const price = (page.product?.display_price || matchedProduct.display_price || 0).toLocaleString();
+          const productName = page.product?.product_name || matchedProduct.product_name || 'สินค้า';
+          replyText = historyEntries.length <= 1
+            ? (page.sequence?.step1_opening_text || `สวัสดีค่ะ ยินดีให้ข้อมูล ${productName} ค่ะ สอบถามราคาหรือโปรโมชั่นได้เลยนะคะ 🙏`)
+            : `${productName} ราคาโปรอยู่ที่ ฿${price} ค่ะ เรื่องที่ลูกค้าถามมา แอดมินขอตรวจสอบรายละเอียดที่ถูกต้องก่อนนะคะ ระหว่างนี้สนใจดูแพ็กโปรโมชั่นไปพลางๆ ก่อนได้เลยค่ะ 🙏`;
+          addLog('AI_REPLY', senderId, pageId, '⚠️ AI ไม่คืนข้อความตอบกลับ — ใช้ข้อความสำรองตามบริบทบทสนทนา (ไม่ส่งข้อความเปิดซ้ำ)', 'WARNING');
+        }
 
         // ── สร้างรายการข้อความที่จะส่ง: รองรับหลายข้อความ + รูปประกอบแบบแอดมินจริง ──
         const buildOutgoing = (p: any): Array<{ text: string; imageUrl?: string }> => {
@@ -4153,18 +4372,19 @@ ${JSON.stringify((page.product?.promotions || [
         // Check if AI generated a repeated reply - regenerate ONCE with
         // different wording (more retries would double the reply latency).
         let regenerationCount = 0;
-        const maxRegenerations = 1;
+        const maxRegenerations = 2;
         while (isRepeatedReply(pageId, senderId, replyText) && regenerationCount < maxRegenerations) {
           addLog('INFO', senderId, pageId, `⚠️ ตรวจพบ AI ตอบข้อความซ้ำ กำลังสร้างคำตอบใหม่... (ครั้งที่ ${regenerationCount + 1})`, 'INFO');
-          
-          // Re-run AI with instruction to not repeat
-          const freshPrompt = promptContext + `\n\n⚠️ สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม`;
+
+          // Re-run AI with the EXACT repeated text quoted back so the model can
+          // concretely avoid it, plus the customer's question to stay on topic.
+          const freshPrompt = promptContext + `\n\n⚠️ สำคัญมาก: คำตอบล่าสุดของคุณซ้ำกับที่เคยส่งไปแล้ว: "${replyText.slice(0, 300)}" — ห้ามใช้ประโยคนี้หรือโครงสร้างเดิมเด็ดขาด ให้ตอบคำถาม "${messageText.slice(0, 120)}" ด้วยมุมใหม่หรือข้อมูลอื่นที่มีจริงในระบบ`;
 
           try {
             const regenResult = await generateAiJson(freshPrompt, {
-              temperature: 0.5,
+              temperature: 0.7 + regenerationCount * 0.15,
               maxOutputTokens: 1024,
-              extraInstruction: 'สำคัญ: คุณเพิ่งตอบข้อความนี้ไปแล้ว กรุณาตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน อย่าใช้ประโยคเดิม'
+              extraInstruction: 'สำคัญ: ห้ามตอบซ้ำข้อความที่ระบุไว้ด้านบน ให้ตอบด้วยวิธีอื่นที่แตกต่างกันอย่างชัดเจน ตรงคำถามของลูกค้า'
             });
             const regenParsed: any = regenResult.parsed;
             const regenOut = buildOutgoing(regenParsed);
@@ -4196,21 +4416,23 @@ ${JSON.stringify((page.product?.promotions || [
           { fullReply: replyText, matchedProduct: page.product?.product_name || matchedProduct.product_name, model: selectedModel, regenerations: regenerationCount, aiLatencyMs, intentHint }
         );
 
-        // Per-page reply delay (configurable). 300ms default reads as "typing"
-        // to the customer without leaving them hanging; cap at 3000ms so a
-        // misconfigured huge delay can never stall a conversation.
-        const pageDelay = Math.min(Number(page.reply_delay_ms ?? 300), 3000);
+        // Per-page reply delay (configurable, 0 = instant reply).
+        const pageDelay = resolvePageDelay(page);
 
         // Purchase-intent keywords: when the customer shows buying interest the
-        // closing sales sequence fires immediately.
-        const purchaseIntentKeywords = ['สนใจ', 'อยากได้', 'อยากซื้อ', 'ต้องการ', 'ซื้อ', 'ราคา', 'เท่าไหร่', 'เท่าไร', 'สั่ง', 'จอง', 'เอา', 'โอน', 'cod'];
-        const hasPurchaseIntent = purchaseIntentKeywords.some(kw => messageText.toLowerCase().includes(kw));
+        // closing sales sequence fires immediately. Page-configured keywords
+        // (from the comment settings) take priority, with a sensible default.
+        const purchaseIntentKeywords = (page.purchase_keywords && page.purchase_keywords.length > 0)
+          ? page.purchase_keywords
+          : ['สนใจ', 'อยากได้', 'อยากซื้อ', 'ต้องการ', 'ซื้อ', 'ราคา', 'เท่าไหร่', 'เท่าไร', 'สั่ง', 'จอง', 'เอา', 'โอน', 'cod'];
+        const hasPurchaseIntent = purchaseIntentKeywords.some(kw => messageText.toLowerCase().includes(String(kw).toLowerCase()));
 
         // Quick Reply buttons go to every NEW customer (first contact) and on
         // any message when the customer hasn't tapped one yet — not only when
         // order_count is 0 AND last_interaction is empty (that condition was
         // always false here because last_interaction was just set above).
-        const shouldSendQuickReplies = page.quick_replies && page.quick_replies.length > 0;
+        const quickReplies = page.quick_replies || [];
+        const shouldSendQuickReplies = quickReplies.length > 0;
 
         // Purchase intent => fire the closing sales sequence immediately
         // (customer said สนใจ/ราคา/สั่ง etc.) or on first contact.
@@ -4228,8 +4450,8 @@ ${JSON.stringify((page.product?.promotions || [
             await sleep(Math.min(500, pageDelay));
           }
           if (isLast && shouldSendQuickReplies) {
-            await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, page.quick_replies);
-            addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${page.quick_replies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})`, 'SUCCESS');
+            await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
+            addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})`, 'SUCCESS');
           } else {
             await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
           }
@@ -4239,19 +4461,31 @@ ${JSON.stringify((page.product?.promotions || [
         // Remember what we answered for the conversation memory + anti-repeat.
         pushHistory(pageId, senderId, 'admin', replyText.replace(/\n•\n/g, ' | '));
 
-        // Send configured sales sequence step
-        const sequenceStep = shouldTriggerSalesSequence ? 1 : Math.min(6, Math.max(1, Number(parsed.sequenceStep) || 1));
-        await sendConfiguredSequenceStep(page, senderId, sequenceStep);
+        // Send configured sales sequence step.
+        // When auto-trigger fires, step 1 is sent here and the remaining steps
+        // follow in the loop below — so skip the single-step send to avoid a
+        // duplicate step 1.
+        const configuredSteps = (page.sales_sequence_steps || [])
+          .filter(s => s && (s.text_content?.trim() || s.image_url?.trim()))
+          .sort((a, b) => a.step_number - b.step_number);
+        if (!shouldTriggerSalesSequence) {
+          const sequenceStep = Math.min(6, Math.max(1, Number(parsed.sequenceStep) || 1));
+          // dedupe=true: ส่งสเต็ปเดิมซ้ำไม่ได้ภายใน 6 ชม. — กันลูกค้าได้รับ
+          // ข้อความสเต็ป 1 ซ้ำทุกครั้งที่ทักมา (ต้นเหตุ "ตอบแต่ซ้ำๆ")
+          await sendConfiguredSequenceStep(page, senderId, sequenceStep, true);
+        }
 
-        // If sales sequence auto-trigger is enabled, send full sequence (steps 1-6)
-        if (shouldTriggerSalesSequence && page.sales_sequence_steps && page.sales_sequence_steps.length > 0) {
-          addLog('INFO', senderId, pageId, `🚀 Sales Sequence Auto-Trigger: ส่งลำดับการขายทั้งหมด ${page.sales_sequence_steps.length} ขั้นตอน`, 'SUCCESS');
-          for (const step of page.sales_sequence_steps) {
-            if (step.step_number > 1) {
-              await sleep(pageDelay);
-              await sendConfiguredSequenceStep(page, senderId, step.step_number);
-            }
+        // If sales sequence auto-trigger is enabled, send the FULL configured
+        // sequence (every step in order, honoring each step's delay_seconds).
+        if (shouldTriggerSalesSequence && configuredSteps.length > 0) {
+          addLog('INFO', senderId, pageId, `🚀 Sales Sequence Auto-Trigger: ส่งลำดับการขายทั้งหมด ${configuredSteps.length} ขั้นตอน`, 'SUCCESS');
+          for (const step of configuredSteps) {
+            const stepDelayMs = Number(step.delay_seconds) > 0 ? Number(step.delay_seconds) * 1000 : pageDelay;
+            await sleep(stepDelayMs);
+            await sendConfiguredSequenceStep(page, senderId, step.step_number);
           }
+        } else if (shouldTriggerSalesSequence) {
+          addLog('INFO', senderId, pageId, '⚠️ Sales Sequence Auto-Trigger เปิดอยู่ แต่ยังไม่ได้ตั้งค่าสเต็ป (ข้อความ/รูปภาพ) ในแท็บ "ลำดับการขาย" — จึงไม่มีอะไรถูกส่ง', 'WARNING');
         }
 
         // If ORDER is detected
@@ -4341,9 +4575,9 @@ ${JSON.stringify((page.product?.promotions || [
         const smart = smartFallbacks[intentHint];
         const fallbackReply = smart ? smart() : `${productName} โปรอยู่ ฿${price} ค่ะ สอบถามเพิ่มเติมได้เลยนะคะ`;
         addLog('AI_REPLY', senderId, pageId, `🤖 ตอบกลับแบบสำรอง (AI Error: ${aiErr.message})`, 'INFO');
-        await sleep(Math.min(Number(page.reply_delay_ms ?? 300), 500));
+        await sleep(resolvePageDelay(page));
         await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply);
-        await sendConfiguredSequenceStep(page, senderId, 1);
+        await sendConfiguredSequenceStep(page, senderId, 1, true);
       }
 
       persistData();
@@ -4572,11 +4806,16 @@ ${JSON.stringify((page.product?.promotions || [
     }
   });
 
-  // Send Message API: Admin sends message to customer via page
+  // Send Message API: Admin sends message (text and/or image) to customer via page.
+  // Accepts: message (text), image_url (public URL), attachment_id (reusable),
+  // or image_data (base64/data-URL of a locally picked file — uploaded to
+  // /me/message_attachments first, then delivered by attachment_id).
   app.post('/api/facebook/send-message', async (req: Request, res: Response) => {
-    const { page_id, recipient_id, message } = req.body || {};
-    if (!page_id || !recipient_id || !message) {
-      return res.status(400).json({ success: false, message: 'ต้องระบุ page_id, recipient_id และ message' });
+    const { page_id, recipient_id, message, image_url, attachment_id, image_data, image_mime, image_name } = req.body || {};
+    const text = typeof message === 'string' ? message.trim() : '';
+    const hasImage = Boolean(image_url || attachment_id || image_data);
+    if (!page_id || !recipient_id || (!text && !hasImage)) {
+      return res.status(400).json({ success: false, message: 'ต้องระบุ page_id, recipient_id และ message หรือรูปภาพ' });
     }
     const page = db.pages.find(p => p.page_id === page_id);
     if (!page) {
@@ -4587,34 +4826,76 @@ ${JSON.stringify((page.product?.promotions || [
       return res.status(400).json({ success: false, message: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' });
     }
     try {
-      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`;
-      const fetchRes = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recipient: { id: recipient_id },
-          message: { text: message }
-        })
-      });
-      const data: any = await fetchRes.json();
-      if (data.error) {
-        const code = Number(data.error.code || 0);
-        const subcode = Number(data.error.error_subcode || 0);
+      const graphUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`;
+      const sendPayload = async (payload: any): Promise<any> => {
+        const fetchRes = await fetch(graphUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recipient: { id: recipient_id }, message: payload })
+        });
+        return fetchRes.json();
+      };
+      const describeError = (data: any): string => {
+        const code = Number(data.error?.code || 0);
+        const subcode = Number(data.error?.error_subcode || 0);
         // 10/551/2018108: Messenger 24-hour window closed or no open thread
-        const hint = (code === 10 || code === 551 || subcode === 2018108)
+        return (code === 10 || code === 551 || subcode === 2018108)
           ? ' Messenger เปิดให้ตอบกลับได้ภายใน 24 ชม. หลังลูกค้าทักเท่านั้น — รอลูกค้าทักก่อน หรือใช้ Message Tag ที่อนุญาต'
           : '';
-        addLog('INFO', 'SEND_MSG', page_id, `❌ ส่งข้อความไม่สำเร็จ: ${data.error.message}${hint}`, 'ERROR');
-        return res.status(502).json({ success: false, error: data.error, message: data.error.message + hint });
+      };
+
+      const sentIds: string[] = [];
+      let sentImage = false;
+
+      // 1) Text first (if any)
+      if (text) {
+        const data: any = await sendPayload({ text: text.slice(0, 2000) });
+        if (data.error) {
+          const hint = describeError(data);
+          addLog('INFO', 'SEND_MSG', page_id, `❌ ส่งข้อความไม่สำเร็จ: ${data.error.message}${hint}`, 'ERROR');
+          return res.status(502).json({ success: false, error: data.error, message: data.error.message + hint });
+        }
+        if (data.message_id) sentIds.push(data.message_id);
       }
-      addLog('INFO', 'SEND_MSG', page_id, `✅ ส่งข้อความถึง ${recipient_id} สำเร็จ`, 'SUCCESS');
+
+      // 2) Image (public URL / reusable attachment_id / base64 upload)
+      if (hasImage) {
+        let data: any;
+        if (attachment_id) {
+          data = await sendPayload({ attachment: { type: 'image', payload: { attachment_id } } });
+        } else if (image_url) {
+          data = await sendPayload({ attachment: { type: 'image', payload: { url: image_url, is_reusable: true } } });
+        } else {
+          const decoded = decodeDataUrl(String(image_data));
+          if (!decoded) {
+            return res.status(400).json({ success: false, message: 'ข้อมูลรูปภาพไม่ถูกต้อง (base64 ว่างหรือเสียหาย)' });
+          }
+          const uploaded = await uploadReusableAttachment(page.page_access_token || '', decoded.buffer, image_name || 'chat-image.jpg', image_mime || decoded.mimeType);
+          if (!uploaded.success || !uploaded.attachment_id) {
+            addLog('INFO', 'SEND_MSG', page_id, `❌ อัปโหลดรูปไม่สำเร็จ: ${uploaded.error}`, 'ERROR');
+            return res.status(502).json({ success: false, message: `อัปโหลดรูปไม่สำเร็จ: ${uploaded.error}` });
+          }
+          data = await sendPayload({ attachment: { type: 'image', payload: { attachment_id: uploaded.attachment_id } } });
+        }
+        if (data.error) {
+          const hint = describeError(data);
+          addLog('INFO', 'SEND_MSG', page_id, `❌ ส่งรูปภาพไม่สำเร็จ: ${data.error.message}${hint}`, 'ERROR');
+          return res.status(502).json({ success: false, error: data.error, message: data.error.message + hint });
+        }
+        if (data.message_id) sentIds.push(data.message_id);
+        sentImage = true;
+      }
+
+      const summary = text ? (sentImage ? `ข้อความ + รูปภาพ` : 'ข้อความ') : 'รูปภาพ';
+      addLog('INFO', 'SEND_MSG', page_id, `✅ ส่ง${summary}ถึง ${recipient_id} สำเร็จ`, 'SUCCESS');
       // Record in the local inbox (Postgres) so the conversation stays visible
       try {
-        await dbService.addChatMessage(page_id, recipient_id, 'admin', message);
-        await dbService.recordOutgoingMessage(page_id, recipient_id, message.slice(0, 200));
-        dbBridge.broadcastSSE('new_message', { page_id, sender_id: recipient_id, role: 'admin', text: message.slice(0, 200), timestamp: new Date().toISOString() }, page_id);
+        const recordText = text || (sentImage ? '📷 รูปภาพ' : '');
+        await dbService.addChatMessage(page_id, recipient_id, 'admin', recordText);
+        await dbService.recordOutgoingMessage(page_id, recipient_id, recordText.slice(0, 200));
+        dbBridge.broadcastSSE('new_message', { page_id, sender_id: recipient_id, role: 'admin', text: recordText.slice(0, 200), timestamp: new Date().toISOString() }, page_id);
       } catch { /* non-critical */ }
-      res.json({ success: true, message_id: data.message_id });
+      res.json({ success: true, message_id: sentIds[0] || undefined, message_ids: sentIds, sent_image: sentImage });
     } catch (err: any) {
       addLog('INFO', 'SEND_MSG', page_id, `❌ ส่งข้อความไม่สำเร็จ: ${err.message}`, 'ERROR');
       res.status(500).json({ success: false, error: err.message });
@@ -6301,9 +6582,167 @@ ${String(rawText).slice(0, 12000)}
   });
 
   // 7. Automated Follow-Up Runner with interval logic
+  // ================================================================
+  // 🤝 SMART FOLLOW-UP ENGINE — ติดตามลูกค้าเงียบแบบแอดมินมืออาชีพ
+  // AI เขียนข้อความส่วนตัวอ้างอิงสิ่งที่ลูกค้าถามค้างไว้ + ไล่ระดับมืออาชีพ
+  // L1 (1 ชม.) ทักไถ • L2 (24 ชม.) เพิ่มมูลค่า • L3 (3 วัน) urgency • L4 (7 วัน) ปิดเป็นมิตร
+  // หยุดเองเมื่อ: ลูกค้าซื้อแล้ว / บล็อก / หยุดบอท / ลูกค้ายังไม่ได้รับคำตอบ / ครบ 4 ระดับ
+  // ================================================================
+  const FOLLOWUP_LEVELS = [
+    { level: 1, hours: 1, style: 'ทักไถแบบเป็นกันเอง อ้างอิงสิ่งที่ลูกค้าถามค้างไว้ แล้วชวนกลับมาดูสินค้าอย่างเป็นธรรมชาติ' },
+    { level: 2, hours: 24, style: 'เพิ่มมูลค่า: ย้ำโปรโมชั่นเด่น/ของแถม/ส่วนลดที่มีจริง ให้ลูกค้าเห็นว่าซื้อวันนี้คุ้มกว่า' },
+    { level: 3, hours: 72, style: 'ความเร่งด่วน: แจ้งว่าโปรใกล้หมด/จำนวนจำกัด (ใช้ข้อมูลโปรจริงเท่านั้น ห้ามมั่ว) พร้อมปิดการขาย' },
+    { level: 4, hours: 168, style: 'ปิดแบบเป็นมิตร: ขอบคุณที่สนใจ เปิดประตูไว้ ถ้าสนใจอีกทักมาได้เลย ไม่กดดัน' }
+  ];
+
+  // Parse a Thai interval label ("5 นาที", "2 ชั่วโมง", "1 วัน", "21:00 น.")
+  // into hours so admin-configured Follow-Up Stages drive the smart tick.
+  const parseFollowupIntervalHours = (label: string): number | null => {
+    const text = String(label || '').trim();
+    if (!text) return null;
+    const clock = /(\d{1,2})[:.](\d{2})/.exec(text);
+    if (clock) {
+      // Clock time (Thai, UTC+7): hours until the next occurrence of HH:MM.
+      const nowThai = new Date(Date.now() + 7 * 3600 * 1000);
+      const target = new Date(nowThai);
+      target.setUTCHours(Number(clock[1]), Number(clock[2]), 0, 0);
+      let diffH = (target.getTime() - nowThai.getTime()) / 3600000;
+      if (diffH <= 0) diffH += 24;
+      return Math.round(diffH * 10) / 10;
+    }
+    const num = /(\d+(?:\.\d+)?)/.exec(text);
+    if (!num) return null;
+    const value = Number(num[1]);
+    if (/นาที|minute/i.test(text)) return value / 60;
+    if (/ชั่วโมง|ชม\.?|hour/i.test(text)) return value;
+    if (/วัน|day/i.test(text)) return value * 24;
+    return null;
+  };
+
+  // Build the effective follow-up ladder for a page: admin-configured
+  // followup_messages (interval + message) take priority; the built-in
+  // 4-level ladder is the fallback when nothing is configured.
+  const buildFollowupLadder = (page: PageConfig): Array<{ level: number; hours: number; style: string; message?: string }> => {
+    const configured = (page.followup_messages || [])
+      .map((f, idx) => ({ idx, hours: parseFollowupIntervalHours(f.interval), message: String(f.message || '').trim(), interval: f.interval }))
+      .filter(f => f.hours !== null && f.message)
+      .sort((a, b) => (a.hours as number) - (b.hours as number));
+    if (configured.length > 0) {
+      return configured.map((f, i) => ({
+        level: i + 1,
+        hours: f.hours as number,
+        style: `ข้อความติดตามที่แอดมินตั้งค่าไว้ (รอบ "${f.interval}") — ใช้ข้อความที่กำหนดไว้ส่งได้เลย`,
+        message: f.message
+      }));
+    }
+    return FOLLOWUP_LEVELS;
+  };
+
+  const runSmartFollowupTick = async (): Promise<{ checked: number; sent: number; skipped: number; details: string[] }> => {
+    const results = { checked: 0, sent: 0, skipped: 0, details: [] as string[] };
+    for (const page of db.pages) {
+      if (!page.followup_enabled || !page.is_active) continue;
+      const ladder = buildFollowupLadder(page);
+      // ไล่จาก chat_history GROUP BY — ครอบคลุมทุกบทสนทนา (ไม่พลาดแม้ไม่มี state row)
+      const convos = await dbService.executeRaw(
+        'SELECT ch.sender_id, MAX(ch.created_at) AS last_at FROM chat_history ch WHERE ch.page_id = ? GROUP BY ch.sender_id',
+        [page.page_id]
+      );
+      for (const cv of convos as any[]) {
+        const st: any = (await dbService.getConversationState(page.page_id, cv.sender_id).catch(() => null)) || {};
+        results.checked++;
+        const skip = (reason: string) => { results.skipped++; results.details.push(`ข้าม ${st.sender_id.slice(-8)}: ${reason}`); };
+        if (Number(st.is_blocked) === 1 || Number(st.bot_paused) === 1) { skip('บล็อก/หยุดบอท'); continue; }
+        const level = Number(st.followup_level) || 0;
+        if (level >= ladder.length) { skip(`ครบ ${ladder.length} ระดับแล้ว`); continue; }
+        const next = ladder[level];
+
+        const history = await dbService.getRecentChatHistory(page.page_id, st.sender_id, 10);
+        if (history.length === 0) { skip('ไม่มีประวัติแชท'); continue; }
+        const last = history[history.length - 1];
+        // "ลูกค้าเงียบ" = ข้อความสุดท้ายต้องเป็นฝั่งเรา (แอดมิน/AI ตอบแล้ว ลูกค้ายังไม่มาตอบ)
+        if (last.role !== 'admin') { skip('ลูกค้าพิมพ์ค้างไว้ รอตอบก่อน'); continue; }
+        // ลูกค้าสั่งซื้อแล้วหลังแชทล่าสุด → หยุดติดตาม
+        const bought = await dbService.executeRaw(
+          'SELECT COUNT(*) AS c FROM orders WHERE psid = ? AND created_at >= ?',
+          [st.sender_id, last.created_at]
+        ).catch(() => [{ c: 1 }] as any[]);
+        if (Number(bought[0]?.c) > 0) { skip('ซื้อไปแล้ว'); continue; }
+
+        const hoursSince = (Date.now() - (Date.parse(last.created_at) || Date.now())) / 3600000;
+        if (hoursSince < next.hours) { skip(`ยังไม่ถึงเวลา (${hoursSince.toFixed(1)}ชม. < ${next.hours}ชม.)`); continue; }
+
+        // ข้อความติดตาม: ถ้าแอดมินตั้งค่าข้อความไว้เอง (followup_messages) ใช้ตามนั้นทันที
+        // ถ้าไม่ได้ตั้ง → ให้ AI เขียนข้อความส่วนตัวอ้างอิงบทสนทนาจริง
+        const prod: any = page.product || {};
+        let followText = next.message || '';
+        if (!followText) {
+          const promoLines = ((prod.promotions || []) as any[]).map(pr => `"${pr.name}" ฿${Number(pr.price || 0).toLocaleString()}`).join(' / ');
+          const convo = history.map(h => (h.role === 'customer' ? 'ลูกค้า: ' : 'แอดมิน: ') + String(h.text).slice(0, 150)).join('\n');
+          const prompt = `คุณคือแอดมิน "${page.admin_name || 'แอดมิน'}" ของเพจ "${page.page_name}" กำลังจะติดตามลูกค้าที่หายเงียบไป
+(ครั้งที่ ${next.level}/${ladder.length} — ผ่านมาแล้ว ${Math.round(hoursSince)} ชั่วโมง)
+บทสนทนาล่าสุดกับลูกค้าคนนี้:
+${convo}
+สินค้าจริง: ${prod.product_name || page.page_name} ราคาโปร ฿${Number(prod.display_price) || 0}${promoLines ? ' | แพ็ก: ' + promoLines : ''}
+สไตล์ข้อความรอบนี้: ${next.style}
+เขียนข้อความติดตาม 1 ข้อความ: สั้น 1-3 บรรทัด เป็นมนุษย์แอดมินจริง อ้างอิงประเด็นที่ลูกค้าถามค้างไว้ ใช้ราคา/โปรจริงเท่านั้นห้ามมั่ว จบด้วยคำถามชวนตัดสินใจ
+ตอบ JSON เท่านั้น: {"followupText": "..."}`;
+          try {
+            const r = await generateAiJson(prompt, { temperature: 0.6, maxOutputTokens: 400 });
+            followText = String(r.parsed.followupText || '').trim();
+          } catch { /* AI ล้มเหลว → ใช้ข้อความจริงจากเพจแทน */ }
+        }
+        if (!followText) {
+          followText = `ตามที่คุยกันค่ะ ${prod.product_name || page.page_name} โปรอยู่ ฿${Number(prod.display_price) || 0} สนใจจัดให้ไหมคะ 🙏`;
+        }
+
+        await sendFacebookMessage(page.page_access_token || '', st.sender_id, followText);
+        try { await dbService.addChatMessage(page.page_id, st.sender_id, 'admin', followText); } catch { /* non-critical */ }
+        await dbService.updateConversationState(page.page_id, st.sender_id, {
+          followup_level: next.level,
+          followup_at: new Date().toISOString()
+        }).catch(() => {});
+        results.sent++;
+        results.details.push(`L${next.level} → ${st.sender_id.slice(-6)}: ${followText.slice(0, 60)}`);
+        addLog('FOLLOW_UP', st.sender_id, page.page_id, `🤝 Smart Follow-up L${next.level}: "${followText.slice(0, 80)}"`, 'SUCCESS');
+        dbBridge.broadcastSSE('followup_sent', { page_id: page.page_id, sender_id: st.sender_id, level: next.level }, page.page_id);
+      }
+    }
+    return results;
+  };
+
+  // Manual/auto tick endpoint (FollowUpEngineTab + scheduler + self-test)
+  app.post('/api/followup/smart-tick', async (req: Request, res: Response) => {
+    try {
+      const results = await runSmartFollowupTick();
+      res.json({ success: true, ...results });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: `Smart follow-up ผิดพลาด: ${err.message}` });
+    }
+  });
+
+  // Save Follow-Up Stages config (enable flag + interval/message list) for a page.
+  // Used by FollowUpEngineTab so the steps live on the server (not just localStorage)
+  // and the smart tick can actually fire them.
+  app.post('/api/followup/config', (req: Request, res: Response) => {
+    const { page_id, enabled, messages } = req.body || {};
+    const page = db.pages.find(p => p.page_id === page_id);
+    if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
+    if (typeof enabled === 'boolean') page.followup_enabled = enabled;
+    if (Array.isArray(messages)) {
+      page.followup_messages = messages
+        .filter((m: any) => m && String(m.interval || '').trim() && String(m.message || '').trim())
+        .map((m: any) => ({ interval: String(m.interval).trim(), message: String(m.message).trim() }));
+    }
+    persistData();
+    addLog('FOLLOW_UP', 'CONFIG', page.page_id, `⚙️ บันทึกการตั้งค่า Follow-Up: ${page.followup_enabled ? 'เปิด' : 'ปิด'} ระบบติดตาม, ${page.followup_messages?.length || 0} สเต็ป`, 'SUCCESS');
+    res.json({ success: true, followup_enabled: page.followup_enabled, followup_messages: page.followup_messages || [] });
+  });
+
   app.post('/api/followup/run', async (req: Request, res: Response) => {
-    const { psid, intervalName, page_id } = req.body;
+    const { psid, intervalName, message, page_id } = req.body;
     const page = db.pages.find(p => p.page_id === page_id) || db.pages[0];
+    if (!page) return res.status(404).json({ success: false, message: 'ไม่พบเพจในระบบ' });
 
     const targets = psid
       ? db.customers.filter(c => c.psid === psid)
@@ -6312,7 +6751,11 @@ ${String(rawText).slice(0, 12000)}
     const configuredFollowups = page.followup_messages || [];
     const matchedFollowup = configuredFollowups.find(f => f.interval === intervalName);
 
-    const followUpMessages = matchedFollowup
+    // Priority: explicit message from the caller (FollowUpEngineTab step) →
+    // matched configured interval → all configured messages → built-in defaults.
+    const followUpMessages = (typeof message === 'string' && message.trim())
+      ? [message.trim()]
+      : matchedFollowup
       ? [matchedFollowup.message]
       : configuredFollowups.length
       ? configuredFollowups.map(f => f.message)
@@ -6489,6 +6932,10 @@ ${String(rawText).slice(0, 12000)}
       console.log(`🔗 Webhook GET/POST endpoint: /api/webhook/facebook`);
       console.log(`=======================================================`);
     });
+
+    // 🤝 Smart Follow-up Engine: auto tick ทุก 10 นาที (+ ครั้งแรกหลังเปิด 90 วิ)
+    setTimeout(() => { runSmartFollowupTick().catch(() => {}); }, 90 * 1000);
+    setInterval(() => { runSmartFollowupTick().catch(() => {}); }, 10 * 60 * 1000);
   }
 }
 
@@ -6530,12 +6977,12 @@ startServer()
       try {
         if ((channel === 'TELEGRAM' || channel === 'BOTH') && page.telegram_bot_token && page.telegram_chat_id && !seenChats.has('tg_' + page.telegram_chat_id)) {
           seenChats.add('tg_' + page.telegram_chat_id);
-          await deliverTelegram(page, text);
+          await deliverTelegram?.(page, text);
           sent++;
         }
         if ((channel === 'LINE' || channel === 'BOTH') && page.line_notify_token && !seenChats.has('ln_' + page.line_notify_token)) {
           seenChats.add('ln_' + page.line_notify_token);
-          await deliverLine(page, text);
+          await deliverLine?.(page, text);
           sent++;
         }
       } catch (err: any) {
