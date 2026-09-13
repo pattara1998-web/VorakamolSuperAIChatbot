@@ -883,20 +883,35 @@ function getGemini(): GoogleGenAI {
 // a deprecated per-page model selection can never break chat replies.
 // ---------------------------------------------------------------------------
 const DEFAULT_GEMINI_MODEL = 'gemini-3.6-flash';
-const GEMINI_MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash'];
+// โมเดลฟรี "flash-lite" ที่คีย์ฟรีใช้ยิงได้จริง — ใช้เป็นตัวหลักได้ตามที่แอดมินขอ
+const FREE_GEMINI_LITE_MODEL = 'gemini-2.5-flash-lite';
+const GEMINI_MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-2.5-flash-lite', 'gemini-3.7-flash', 'gemini-2.5-flash'];
 const DEPRECATED_GEMINI_MODELS = new Set([
-  'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite',
-  'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'
+  'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'
 ]);
+// ผู้ใช้หลายคนพิมพ์ "gemini 3.1 flash lite" (โมเดลฟรี) — นายแมตช์ชื่อเล่น/ที่พิมพ์ผิด
+// ให้ไปใช้ flash-lite ฟรีที่ยิงได้จริง เพื่อกัน AI ตก fallback แล้วตอบได้แค่ข้อความเดียว
+const GEMINI_MODEL_ALIASES: Record<string, string> = {
+  'gemini-3.1-flash-lite': FREE_GEMINI_LITE_MODEL,
+  'gemini-3.1-flash': 'gemini-2.5-flash',
+  'gemini-2.5-flash-lite-001': FREE_GEMINI_LITE_MODEL,
+  'gemini-flash-lite': FREE_GEMINI_LITE_MODEL
+};
+function normalizeGeminiModelId(model?: string | null): string {
+  const raw = String(model || '').trim();
+  if (!raw) return '';
+  return GEMINI_MODEL_ALIASES[raw] || raw;
+}
 
 function resolveAiModel(preferred?: string): string {
   // Local AI models (ollama:*/lmstudio:*) run in the user's browser and are
   // unreachable from this cloud server — always fall back to Gemini here.
   if (preferred && (preferred.startsWith('ollama:') || preferred.startsWith('lmstudio:'))) {
-    return db.settings.geminiModel || DEFAULT_GEMINI_MODEL;
+    return normalizeGeminiModelId(db.settings.geminiModel) || DEFAULT_GEMINI_MODEL;
   }
-  if (preferred && !DEPRECATED_GEMINI_MODELS.has(preferred)) return preferred;
-  return db.settings.geminiModel || DEFAULT_GEMINI_MODEL;
+  const normalized = normalizeGeminiModelId(preferred);
+  if (normalized && !DEPRECATED_GEMINI_MODELS.has(normalized)) return normalized;
+  return normalizeGeminiModelId(db.settings.geminiModel) || DEFAULT_GEMINI_MODEL;
 }
 
 // ---------------------------------------------------------------------------
@@ -968,7 +983,8 @@ function getProviderApiKey(provider: AiProvider): string {
 function getProviderModel(provider: AiProvider): string {
   const info = AI_PROVIDERS[provider];
   const chosen = String((db.settings as any)[info.modelSetting] || '').trim();
-  return chosen || info.defaultModel;
+  const resolved = chosen || info.defaultModel;
+  return provider === 'GEMINI' ? normalizeGeminiModelId(resolved) : resolved;
 }
 
 function getLmStudioBaseUrl(): string {
@@ -1236,10 +1252,11 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
 // และจำโมเดลที่ใช้ได้ไว้ใน settings เพื่อไม่ต้องเสียเวลาลองใหม่ทุกข้อความ
 const GEMINI_GENERATION_FALLBACKS = [
   'gemini-3.6-flash',
+  'gemini-2.5-flash-lite',
   'gemini-2.5-flash',
-  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
   'gemini-flash-latest',
-  'gemini-2.0-flash-lite'
+  'gemini-2.0-flash'
 ];
 
 function isModelOrQuotaError(err: any): boolean {
@@ -1855,7 +1872,7 @@ async function startServer() {
       // Google deprecates model IDs over time (gemini-2.5-flash now returns
       // NOT_FOUND for new keys). Probe candidates newest-first and remember
       // the first model that actually works for this key.
-      const candidates = Array.from(new Set([db.settings.geminiModel, ...GEMINI_MODEL_CANDIDATES].filter(Boolean))) as string[];
+      const candidates = Array.from(new Set([normalizeGeminiModelId(db.settings.geminiModel), ...GEMINI_MODEL_CANDIDATES].filter(Boolean))) as string[];
       let workingModel = '';
       let quotaLimited = false;
       let lastError: any = null;
@@ -4443,9 +4460,10 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           return out;
         };
         let outgoing = buildOutgoing(parsed);
-        // AUTO-ATTACH: ถ้า AI ไม่ระบุรูปเลย ให้แนบรูปสินค้าที่เพจตั้งไว้อัตโนมัติตามเจตนา
-        // เพื่อให้ "รูปที่ตั้งไว้" ถูกส่งให้ลูกค้าเสมอ ไม่ใช่แค่ข้อความล้วน
-        // (ใช้ intentHint ที่ระบบวิเคราะห์จากข้อความจริง — ละเอียดกว่า intent คร่าวๆ)
+        // AUTO-ATTACH: ถ้า AI ไม่ระบุรูปเลย ให้กระจาย "รูปที่ตั้งไว้" ลงทุกข้อความอัตโนมัติ
+        // ตามเจตนา (เช่น PRICE: บรรทัด1=main, 2=promotion …) วนได้เรื่อย ๆ เพื่อให้ได้
+        // ชุด "ข้อความ→รูป→ข้อความ→รูป" ครบหลายใบ ไม่ใช่ส่งแค่รูปเดียวใบสุดท้าย
+        // (ต้นเหตุ "ส่งได้แค่รูปเดียว / รูปมาไม่ตรงลำดับ")
         const intentImageKeys: Record<string, string[]> = {
           GREETING: ['main'],
           PRICE: ['main', 'promotion'],
@@ -4461,11 +4479,21 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         const autoKeys = intent === 'ORDER'
           ? ORDER_KEYS
           : (intentImageKeys[intentHint] || intentImageKeys[String(parsed.intent || '').toUpperCase()] || ['main']);
-        const autoImg = autoKeys.map(k => imgMap[k]).find(Boolean) as string | undefined;
-        if (autoImg && !outgoing.some(o => o.imageUrl)) {
-          if (outgoing.length) outgoing[outgoing.length - 1].imageUrl = autoImg;
-          else outgoing.push({ text: replyText, imageUrl: autoImg });
-        }
+        // เฉพาะคีย์ที่มีรูปจริงในระบบ → วนกระจายลงข้อความที่ยังไม่มีรูป
+        const readyImageKeys = autoKeys.filter(k => imgMap[k]);
+        const autoAttachImages = (list: Array<{ text: string; imageUrl?: string }>): Array<{ text: string; imageUrl?: string }> => {
+          if (readyImageKeys.length === 0) return list;
+          // ถ้า AI ระบุรูปแล้ว (อย่างน้อย 1) → เคารพคำสั่ง AI ไม่ไปยัดรูปซ้ำ
+          if (list.length && list.some(o => o.imageUrl)) return list;
+          if (list.length === 0) {
+            return replyText.trim() ? [{ text: replyText.trim(), imageUrl: imgMap[readyImageKeys[0]] }] : [];
+          }
+          return list.map((o, idx) => (o.imageUrl ? o : {
+            ...o,
+            imageUrl: imgMap[readyImageKeys[idx % readyImageKeys.length]]
+          }));
+        };
+        outgoing = autoAttachImages(outgoing);
         // ข้อความรวมสำหรับ log/anti-repeat
         const combinedText = outgoing.map(o => o.text).join('\n•\n') || replyText;
         replyText = combinedText;
@@ -4591,55 +4619,70 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           (autoTrigger && hasStrongPurchaseIntent)
         );
 
+        // เตรียมชุดสเต็ปที่จะส่ง (เฉพาะสเต็ปที่มีข้อความ/รูป) + ตรวจว่า "sequence กำลังจะ fire"
+        // ถ้า fire จริง เราจะส่งเฉพาะชุด sequence แทนข้อความ AI เพื่อไม่ให้ส่งซ้ำ/ล่าช้า
+        const sequenceStepsToSend = (page.sales_sequence_steps || [])
+          .filter(s => s && (s.text_content?.trim() || s.image_url?.trim()))
+          .sort((a, b) => a.step_number - b.step_number);
+        const sequenceWillFire = shouldTriggerSalesSequence && sequenceStepsToSend.length > 0;
+
         // Send the AI answer with human-like pacing
         await sleep(pageDelay);
 
-        // ส่งแบบแอดมินจริง: หลายข้อความไล่กัน + รูปประกอบ (เว้นจังหวะสั้น ๆ)
-        for (let i = 0; i < outgoing.length; i++) {
-          const msg = outgoing[i];
-          const isLast = i === outgoing.length - 1;
-          if (msg.imageUrl) {
-            const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, msg.imageUrl, pageId);
-            if (imgRes.success) {
-              addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบให้ลูกค้าสำเร็จ (${i + 1}/${outgoing.length})`, 'SUCCESS');
-            } else {
-              addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบให้ลูกค้าไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+        // ── ส่งแบบแอดมินจริง ── 
+        // ส่งข้อความก่อน → ค่อยส่งรูปตาม (ลำดับเดียวกับที่ตั้งสเตป) และเมืี่ sequence
+        // จะ fire (ครั้งแรก/สนใจ) → ส่งเฉพาะชุด sequence แทน เพื่อไม่ให้ข้อความ AI
+        // ไปก่อนแล้วตามด้วยชุดใหญ่ซ้ำ — ต้นเหตุ "ตอบช้ามาก / ส่งต่อไม่ครบ / ลำดับผิด"
+        if (!sequenceWillFire) {
+          for (let i = 0; i < outgoing.length; i++) {
+            const msg = outgoing[i];
+            const isLast = i === outgoing.length - 1;
+            try {
+              if (isLast && shouldSendQuickReplies) {
+                await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
+                addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})`, 'SUCCESS');
+              } else {
+                await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
+              }
+              // รูปตามหลังข้อความเหมือนสเต็ปที่ตั้งไว้
+              if (msg.imageUrl) {
+                const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, msg.imageUrl, pageId);
+                if (imgRes.success) {
+                  addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} สำเร็จ`, 'SUCCESS');
+                } else {
+                  addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบ ${i + 1}/${outgoing.length} ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+                }
+              }
+            } catch (sendErr: any) {
+              addLog('AI_REPLY', senderId, pageId, `⚠️ ส่งข้อความ/รูป ${i + 1}/${outgoing.length} ผิดพลาด (ข้ามไปก่อน): ${sendErr?.message || sendErr}`, 'WARNING');
             }
-            await sleep(Math.min(500, pageDelay));
+            if (!isLast && pageDelay > 0) await sleep(Math.min(600, pageDelay));
+            try { dbService.addChatMessage(pageId, senderId, 'admin', msg.text); } catch { /* non-critical */ }
           }
-          if (isLast && shouldSendQuickReplies) {
-            await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
-            addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})`, 'SUCCESS');
-          } else {
-            await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
-          }
-          if (!isLast) await sleep(Math.min(600, pageDelay));
-          try { dbService.addChatMessage(pageId, senderId, 'admin', msg.text); } catch { /* non-critical */ }
+        } else {
+          // Sequence กำลังจะ fire — ข้อความ AI จะไม่ถูกส่งซ้ำ (ส่งชุด sequence แทนด้านล่าง)
+          addLog('INFO', senderId, pageId, `📋 ครั้งแรก/สนใจซื้อจริง → ส่งชุด Sales Sequence แทนข้อความ AI (${sequenceStepsToSend.length} สเต็ป)`, 'INFO');
         }
         // Remember what we answered for the conversation memory + anti-repeat.
         pushHistory(pageId, senderId, 'admin', replyText.replace(/\n•\n/g, ' | '));
 
-        // Send configured sales sequence step.
-        // When auto-trigger fires, step 1 is sent here and the remaining steps
-        // follow in the loop below — so skip the single-step send to avoid a
-        // duplicate step 1.
-        const configuredSteps = (page.sales_sequence_steps || [])
-          .filter(s => s && (s.text_content?.trim() || s.image_url?.trim()))
-          .sort((a, b) => a.step_number - b.step_number);
+        // ส่ง sequence เมื่อ fire จริง (ครั้งแรก/สนใจจริง): แต่ละ step ส่ง "ข้อความก่อน → รูปตาม"
+        // อยู่แล้วใน sendConfiguredSequenceStep — ไม่ส่งซ้ำกับข้อความ AI (ข้อความ AI ถูกข้ามไปแล้ว)
         if (!shouldTriggerSalesSequence && isNewCustomer) {
-          // เมื่อไม่ auto-trigger: อย่าพรีเซนสเต็ปขายทุกข้อความ (ต้นเหตุ "ตอบแบบสเต็ปซ้ำๆ")
-          // ส่งแค่สเต็ป 1 (ข้อความเปิด) ให้ลูกค้าใหม่ที่ทักครั้งแรกเท่านั้น (dedupe กันซ้ำ 6 ชม.)
+          // auto-trigger ปิด: ส่งสเต็ป 1 (ข้อความเปิด) เฉพาะลูกค้าใหม่ครั้งแรก (dedupe กันซ้ำ 6 ชม.)
           await sendConfiguredSequenceStep(page, senderId, 1, true);
         }
 
-        // If sales sequence auto-trigger is enabled, send the FULL configured
-        // sequence (every step in order, honoring each step's delay_seconds).
-        if (shouldTriggerSalesSequence && configuredSteps.length > 0) {
-          addLog('INFO', senderId, pageId, `🚀 Sales Sequence Auto-Trigger: ส่งลำดับการขายทั้งหมด ${configuredSteps.length} ขั้นตอน`, 'SUCCESS');
-          for (const step of configuredSteps) {
+        if (sequenceWillFire) {
+          addLog('INFO', senderId, pageId, `🚀 Sales Sequence Auto-Trigger: ส่งลำดับการขายทั้งหมด ${sequenceStepsToSend.length} ขั้นตอน`, 'SUCCESS');
+          for (const step of sequenceStepsToSend) {
             const stepDelayMs = Number(step.delay_seconds) > 0 ? Number(step.delay_seconds) * 1000 : pageDelay;
             await sleep(stepDelayMs);
-            await sendConfiguredSequenceStep(page, senderId, step.step_number);
+            try {
+              await sendConfiguredSequenceStep(page, senderId, step.step_number);
+            } catch (seqErr: any) {
+              addLog('INFO', senderId, pageId, `⚠️ ส่งสเต็ป ${step.step_number} ผิดพลาด (ข้ามไปก่อน): ${seqErr?.message || seqErr}`, 'WARNING');
+            }
           }
         } else if (shouldTriggerSalesSequence) {
           addLog('INFO', senderId, pageId, '⚠️ Sales Sequence Auto-Trigger เปิดอยู่ แต่ยังไม่ได้ตั้งค่าสเต็ป (ข้อความ/รูปภาพ) ในแท็บ "ลำดับการขาย" — จึงไม่มีอะไรถูกส่ง', 'WARNING');
