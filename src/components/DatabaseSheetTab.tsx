@@ -292,11 +292,11 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                   delivery_days: shipping.delivery_days,
                   shipping_fee: shipping.shipping_fee,
                   images: {
-                    main: productData.image_main || '',
-                    detail: productData.image_detail || '',
-                    promotion: productData.image_promotion || '',
-                    review: productData.image_review || '',
-                    closing: productData.image_closing || ''
+                    main: productData.image_main || p.product?.images?.main || '',
+                    detail: productData.image_detail || p.product?.images?.detail || '',
+                    promotion: productData.image_promotion || p.product?.images?.promotion || '',
+                    review: productData.image_review || p.product?.images?.review || '',
+                    closing: productData.image_closing || p.product?.images?.closing || ''
                   },
                   promotions: resolvePromotionTiers(productData.promotions, p.product?.promotions, productData),
                   // MERGE (ไม่ใช่แทนที่ทั้งก้อน) เพื่อคง specs เดิมของหน้าเพจไว้

@@ -121,7 +121,13 @@ function createDefaultPageTemplate(): PageConfig {
       display_price: 0,
       description: '',
       promotions: [],
-      images: { main: '', detail: '', promotion: '', review: '', closing: '' }
+      images: {
+        main: 'https://images.unsplash.com/photo-1607083206869-4c7672e72a8a?auto=format&fit=crop&w=800&q=80',
+        detail: '',
+        promotion: '',
+        review: '',
+        closing: ''
+      }
     },
     sequence: {
       step1_opening_text: '',
@@ -2964,21 +2970,31 @@ async function startServer() {
 
   async function sendConfiguredSequenceStep(page: PageConfig, recipientId: string, stepNumber: number, dedupe = false) {
     const step = page.sales_sequence_steps?.find(item => item.step_number === stepNumber);
-    if (!step) return { sent: false };
+    if (!step) {
+      addLog('INFO', recipientId, page.page_id, `⏭️ ข้ามสเต็ป ${stepNumber}: ยังไม่ได้ตั้งค่าสเต็ปนี้ใน "ลำดับการขาย"`, 'WARNING');
+      return { sent: false };
+    }
     // dedupe: send each configured step only once per conversation window so
     // the customer does not receive the same step on every single message.
     if (dedupe && !markSequenceStepSent(page.page_id, recipientId, stepNumber)) {
+      addLog('INFO', recipientId, page.page_id, `⏭️ ข้ามสเต็ป ${stepNumber}: เพิ่งส่งสเต็ปนี้ไปแล้วภายใน 6 ชม. (dedupe)`, 'INFO');
       return { sent: false, deduped: true };
     }
+    const sentParts: string[] = [];
     if (step.type !== 'IMAGE' && step.text_content?.trim()) {
       await sendFacebookMessage(page.page_access_token || '', recipientId, step.text_content.trim());
+      sentParts.push('ข้อความ✓');
     }
     if (step.type !== 'TEXT' && step.image_url?.trim()) {
       const imgRes = await sendFacebookImageSmart(page.page_access_token || '', recipientId, step.image_url.trim(), page.page_id);
-      if (!imgRes.success) {
+      if (imgRes.success) {
+        sentParts.push('รูป✓');
+      } else {
         addLog('INFO', recipientId, page.page_id, `❌ ส่งรูปสเต็ป ${stepNumber} ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+        sentParts.push('รูป✗');
       }
     }
+    addLog('INFO', recipientId, page.page_id, `📤 สเต็ป ${stepNumber}: ${sentParts.join(' + ') || '(สเต็ปว่าง — ไม่มีข้อความ/รูป)'}`, sentParts.length ? 'SUCCESS' : 'WARNING');
     return { sent: true };
   }
 
@@ -4448,6 +4464,12 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           closing: productImages.closing || (page.product as any)?.image_closing?.trim() || stepImgOf(5) || stepImgOf(6) || undefined,
           step6: productImages.closing || (page.product as any)?.image_closing?.trim() || stepImgOf(6) || stepImgOf(5) || undefined
         };
+        // ── ตัวตรวจฐานข้อมูลรูป: บอกทันทีว่า AI จะส่งรูปได้กี่ใบ ใบไหน ขาดช่องไหน ──
+        // (ต้นเหตุ "ส่งรูปได้แค่รูปเดียว" = ฐานข้อมูลมีรูปจริงแค่ 1 ใบ ช่องอื่นว่าง)
+        const ALL_IMAGE_KEYS = ['main', 'detail', 'promotion', 'review', 'closing'];
+        const readyAllKeys = ALL_IMAGE_KEYS.filter(k => imgMap[k]);
+        const missingImageKeys = ALL_IMAGE_KEYS.filter(k => !imgMap[k]);
+        addLog('INFO', senderId, pageId, `📸 รูปพร้อมส่ง ${readyAllKeys.length}/5: ${ALL_IMAGE_KEYS.map(k => (readyAllKeys.includes(k) ? `${k}✓` : `${k}✗`)).join(' ')}${missingImageKeys.length ? ` — ขาด: ${missingImageKeys.join(', ')} (อัปโหลดรูปในหน้าตั้งค่าเพื่อให้ AI ส่งครบ)` : ''}`, 'INFO');
         const buildOutgoing = (p: any): Array<{ text: string; imageUrl?: string }> => {
           const out: Array<{ text: string; imageUrl?: string }> = [];
           if (Array.isArray(p.messages)) {
@@ -4486,18 +4508,41 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           ? ORDER_KEYS
           : (intentImageKeys[intentHint] || intentImageKeys[String(parsed.intent || '').toUpperCase()] || ['main']);
         // เฉพาะคีย์ที่มีรูปจริงในระบบ → วนกระจายลงข้อความที่ยังไม่มีรูป
+        // ลำดับการแนบ: รูปตามเจตนาก่อน แล้วเติมช่องที่เหลือเรียงตามลำดับมาตรฐาน
+        // (main→detail→promotion→review→closing) — ห้ามข้าม/วนซ้ำก่อนครบรอบ
         const readyImageKeys = autoKeys.filter(k => imgMap[k]);
+        const imageQueue: string[] = [];
+        const intentFirstKey = readyImageKeys[0];
+        if (intentFirstKey) imageQueue.push(intentFirstKey);
+        for (const k of ALL_IMAGE_KEYS) {
+          if (imgMap[k] && !imageQueue.includes(k)) imageQueue.push(k);
+        }
         const autoAttachImages = (list: Array<{ text: string; imageUrl?: string }>): Array<{ text: string; imageUrl?: string }> => {
-          if (readyImageKeys.length === 0) return list;
+          if (imageQueue.length === 0) return list;
           // ถ้า AI ระบุรูปแล้ว (อย่างน้อย 1) → เคารพคำสั่ง AI ไม่ไปยัดรูปซ้ำ
           if (list.length && list.some(o => o.imageUrl)) return list;
           if (list.length === 0) {
-            return replyText.trim() ? [{ text: replyText.trim(), imageUrl: imgMap[readyImageKeys[0]] }] : [];
+            return replyText.trim() ? [{ text: replyText.trim(), imageUrl: imgMap[imageQueue[0]] }] : [];
           }
-          return list.map((o, idx) => (o.imageUrl ? o : {
-            ...o,
-            imageUrl: imgMap[readyImageKeys[idx % readyImageKeys.length]]
-          }));
+          let queueIdx = 0;
+          let reused = false;
+          const mapped = list.map((o) => {
+            if (o.imageUrl) return o;
+            let key: string;
+            if (queueIdx < imageQueue.length) {
+              key = imageQueue[queueIdx];
+            } else {
+              // ข้อความมีมากกว่าจำนวนรูปใน DB → วนใช้รูปซ้ำ (บอกเหตุผลใน log)
+              key = imageQueue[queueIdx % imageQueue.length];
+              reused = true;
+            }
+            queueIdx++;
+            return { ...o, imageUrl: imgMap[key] };
+          });
+          if (reused) {
+            addLog('INFO', senderId, pageId, `ℹ️ มีข้อความ ${list.length} ชุดแต่ฐานข้อมูลมีรูปจริง ${imageQueue.length} ใบ → ใช้รูปซ้ำในบางชุด (อัปโหลดรูปเพิ่มในหน้าตั้งค่าเพื่อให้ทุกชุดมีรูปต่างกัน)`, 'INFO');
+          }
+          return mapped;
         };
         outgoing = autoAttachImages(outgoing);
         // ข้อความรวมสำหรับ log/anti-repeat
