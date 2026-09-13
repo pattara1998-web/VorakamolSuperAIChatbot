@@ -428,6 +428,12 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000).unref?.();
 
+// Full-sequence presentation cooldown: พรีเซน "ชุดเต็ม" ให้ลูกค้าแต่ละคนได้แค่
+// 1 ครั้ง / 24 ชม. — ลูกค้าทักซ้ำ "สนใจ" รอบสอง จะได้แค่คำตอบ AI ตรงคำถาม
+// ไม่ถูกยัดชุดสเต็ปซ้ำจนท่วม (อัปเกรดจากพฤติกรรมเดิมที่ส่งชุดใหญ่ทุกครั้ง)
+const sequencePresentationLog = new Map<string, number>();
+const SEQUENCE_PRESENTATION_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
 // Clean old entries from recentReplies
 function cleanRecentReplies() {
   const now = Date.now();
@@ -4620,63 +4626,67 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         );
 
         // เตรียมชุดสเต็ปที่จะส่ง (เฉพาะสเต็ปที่มีข้อความ/รูป) + ตรวจว่า "sequence กำลังจะ fire"
-        // ถ้า fire จริง เราจะส่งเฉพาะชุด sequence แทนข้อความ AI เพื่อไม่ให้ส่งซ้ำ/ล่าช้า
         const sequenceStepsToSend = (page.sales_sequence_steps || [])
           .filter(s => s && (s.text_content?.trim() || s.image_url?.trim()))
           .sort((a, b) => a.step_number - b.step_number);
         const sequenceWillFire = shouldTriggerSalesSequence && sequenceStepsToSend.length > 0;
 
+        // Cooldown พรีเซนชุดเต็ม: 1 ครั้ง / 24 ชม. ต่อลูกค้า — รอบถัดไปได้แค่คำตอบ AI
+        const presentationKey = `${pageId}:${senderId}`;
+        const presentedRecently = (() => {
+          const t = sequencePresentationLog.get(presentationKey);
+          return typeof t === 'number' && Date.now() - t < SEQUENCE_PRESENTATION_COOLDOWN_MS;
+        })();
+        const shouldPresentFullSequence = sequenceWillFire && !presentedRecently;
+
         // Send the AI answer with human-like pacing
         await sleep(pageDelay);
 
-        // ── ส่งแบบแอดมินจริง ── 
-        // ส่งข้อความก่อน → ค่อยส่งรูปตาม (ลำดับเดียวกับที่ตั้งสเตป) และเมืี่ sequence
-        // จะ fire (ครั้งแรก/สนใจ) → ส่งเฉพาะชุด sequence แทน เพื่อไม่ให้ข้อความ AI
-        // ไปก่อนแล้วตามด้วยชุดใหญ่ซ้ำ — ต้นเหตุ "ตอบช้ามาก / ส่งต่อไม่ครบ / ลำดับผิด"
-        if (!sequenceWillFire) {
-          for (let i = 0; i < outgoing.length; i++) {
-            const msg = outgoing[i];
-            const isLast = i === outgoing.length - 1;
-            try {
-              if (isLast && shouldSendQuickReplies) {
-                await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
-                addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})`, 'SUCCESS');
-              } else {
-                await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
-              }
-              // รูปตามหลังข้อความเหมือนสเต็ปที่ตั้งไว้
-              if (msg.imageUrl) {
-                const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, msg.imageUrl, pageId);
-                if (imgRes.success) {
-                  addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} สำเร็จ`, 'SUCCESS');
-                } else {
-                  addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบ ${i + 1}/${outgoing.length} ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
-                }
-              }
-            } catch (sendErr: any) {
-              addLog('AI_REPLY', senderId, pageId, `⚠️ ส่งข้อความ/รูป ${i + 1}/${outgoing.length} ผิดพลาด (ข้ามไปก่อน): ${sendErr?.message || sendErr}`, 'WARNING');
+        // ── ส่งแบบแอดมินจริง (แบบเดิม + อัปเกรด) ──
+        // AI ตอบ "ทุกครั้ง" — ไม่ข้ามข้อความ AI อีกต่อไป (ต้นเหตุ "ตอบแค่ข้อความเดียวแล้วเงียบ")
+        // ทุกข้อความส่ง "ข้อความก่อน → รูปตาม" พร้อมรูปที่ตั้งไว้กระจายครบหลายใบ
+        for (let i = 0; i < outgoing.length; i++) {
+          const msg = outgoing[i];
+          const isLast = i === outgoing.length - 1;
+          try {
+            if (isLast && shouldSendQuickReplies) {
+              await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
+              addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})`, 'SUCCESS');
+            } else {
+              await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
             }
-            if (!isLast && pageDelay > 0) await sleep(Math.min(600, pageDelay));
-            try { dbService.addChatMessage(pageId, senderId, 'admin', msg.text); } catch { /* non-critical */ }
+            // รูปตามหลังข้อความเหมือนสเต็ปที่ตั้งไว้
+            if (msg.imageUrl) {
+              const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, msg.imageUrl, pageId);
+              if (imgRes.success) {
+                addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} สำเร็จ`, 'SUCCESS');
+              } else {
+                addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบ ${i + 1}/${outgoing.length} ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+              }
+            }
+          } catch (sendErr: any) {
+            addLog('AI_REPLY', senderId, pageId, `⚠️ ส่งข้อความ/รูป ${i + 1}/${outgoing.length} ผิดพลาด (ข้ามไปก่อน): ${sendErr?.message || sendErr}`, 'WARNING');
           }
-        } else {
-          // Sequence กำลังจะ fire — ข้อความ AI จะไม่ถูกส่งซ้ำ (ส่งชุด sequence แทนด้านล่าง)
-          addLog('INFO', senderId, pageId, `📋 ครั้งแรก/สนใจซื้อจริง → ส่งชุด Sales Sequence แทนข้อความ AI (${sequenceStepsToSend.length} สเต็ป)`, 'INFO');
+          if (!isLast && pageDelay > 0) await sleep(Math.min(600, pageDelay));
+          try { dbService.addChatMessage(pageId, senderId, 'admin', msg.text); } catch { /* non-critical */ }
         }
         // Remember what we answered for the conversation memory + anti-repeat.
         pushHistory(pageId, senderId, 'admin', replyText.replace(/\n•\n/g, ' | '));
 
-        // ส่ง sequence เมื่อ fire จริง (ครั้งแรก/สนใจจริง): แต่ละ step ส่ง "ข้อความก่อน → รูปตาม"
-        // อยู่แล้วใน sendConfiguredSequenceStep — ไม่ส่งซ้ำกับข้อความ AI (ข้อความ AI ถูกข้ามไปแล้ว)
+        // ส่งชุดพรีเซนเมื่อ fire จริง (ทักครั้งแรก/พูด "สนใจ" จริง): แต่ละ step ส่ง
+        // "ข้อความก่อน → รูปตาม" อยู่แล้วใน sendConfiguredSequenceStep
+        // ⏱️ delay ต่อสเต็ปถูกจำกัดไม่เกิน 5 วิ — กันช่องเงียบยาว (ต้นเหตุ "ส่งแล้วเงียบ")
         if (!shouldTriggerSalesSequence && isNewCustomer) {
           // auto-trigger ปิด: ส่งสเต็ป 1 (ข้อความเปิด) เฉพาะลูกค้าใหม่ครั้งแรก (dedupe กันซ้ำ 6 ชม.)
           await sendConfiguredSequenceStep(page, senderId, 1, true);
         }
 
-        if (sequenceWillFire) {
-          addLog('INFO', senderId, pageId, `🚀 Sales Sequence Auto-Trigger: ส่งลำดับการขายทั้งหมด ${sequenceStepsToSend.length} ขั้นตอน`, 'SUCCESS');
+        if (shouldPresentFullSequence) {
+          sequencePresentationLog.set(presentationKey, Date.now()); // mark พรีเซนแล้ว (24 ชม.)
+          addLog('INFO', senderId, pageId, `🚀 Sales Sequence Auto-Trigger: พรีเซนลำดับการขายทั้งหมด ${sequenceStepsToSend.length} ขั้นตอน (ครั้งแรก/สนใจซื้อจริง)`, 'SUCCESS');
           for (const step of sequenceStepsToSend) {
-            const stepDelayMs = Number(step.delay_seconds) > 0 ? Number(step.delay_seconds) * 1000 : pageDelay;
+            const rawStepDelayMs = Number(step.delay_seconds) > 0 ? Number(step.delay_seconds) * 1000 : pageDelay;
+            const stepDelayMs = Math.min(rawStepDelayMs, 5000);
             await sleep(stepDelayMs);
             try {
               await sendConfiguredSequenceStep(page, senderId, step.step_number);
@@ -4684,6 +4694,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
               addLog('INFO', senderId, pageId, `⚠️ ส่งสเต็ป ${step.step_number} ผิดพลาด (ข้ามไปก่อน): ${seqErr?.message || seqErr}`, 'WARNING');
             }
           }
+        } else if (sequenceWillFire && presentedRecently) {
+          addLog('INFO', senderId, pageId, 'ℹ️ ลูกค้าเพิ่งได้รับชุดพรีเซนภายใน 24 ชม. — ส่งเฉพาะคำตอบ AI ตรงคำถาม ไม่ยัดชุดสเต็ปซ้ำ', 'INFO');
         } else if (shouldTriggerSalesSequence) {
           addLog('INFO', senderId, pageId, '⚠️ Sales Sequence Auto-Trigger เปิดอยู่ แต่ยังไม่ได้ตั้งค่าสเต็ป (ข้อความ/รูปภาพ) ในแท็บ "ลำดับการขาย" — จึงไม่มีอะไรถูกส่ง', 'WARNING');
         }
@@ -4777,6 +4789,22 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         addLog('AI_REPLY', senderId, pageId, `🤖 ตอบกลับแบบสำรอง (AI Error: ${aiErr.message})`, 'INFO');
         await sleep(resolvePageDelay(page));
         await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply);
+        // แนบรูปสินค้า main กำกับคำตอบสำรองเสมอ — ลูกค้าต้องได้ "ข้อความ + รูป" แม้ AI ล้ม
+        try {
+          const fbSeqSteps = (page.sales_sequence_steps || []) as any[];
+          const fbStepImg = (n: number): string | undefined =>
+            fbSeqSteps.find(x => Number(x?.step_number) === n)?.image_url?.trim() || undefined;
+          const fbProdImgs = (page.product?.images as any) || {};
+          const mainImage = fbProdImgs.main || (page.product as any)?.image_main?.trim() || fbStepImg(1);
+          if (mainImage) {
+            const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, mainImage, pageId);
+            if (imgRes.success) {
+              addLog('AI_REPLY', senderId, pageId, '🖼️ แนบรูปสินค้ากำกับคำตอบสำรองสำเร็จ', 'SUCCESS');
+            } else {
+              addLog('AI_REPLY', senderId, pageId, `❌ แนบรูปสินค้ากำกับคำตอบสำรองไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+            }
+          }
+        } catch { /* รูปไม่สำคัญพอจะทำให้ fallback ล้ม */ }
         await sendConfiguredSequenceStep(page, senderId, 1, true);
       }
 
