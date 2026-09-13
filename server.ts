@@ -4365,8 +4365,8 @@ ${usedRepliesText}
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
 - ชื่อสินค้า: ${page.product?.product_name || matchedProduct.product_name}
-- ราคาปกติ: ฿${(page.product?.base_price || matchedProduct.price_1 || 0).toLocaleString()}
-- ราคาโปรโมชั่นขาย: ฿${(page.product?.display_price || matchedProduct.display_price || 0).toLocaleString()}
+- ราคาปกติ: ฿${(matchedProduct.price_1 || page.product?.base_price || 0).toLocaleString()} (ใช้ price_1 เป็นหลัก)
+- ราคาโปรโมชั่นขาย: ฿${(matchedProduct.price_1 || matchedProduct.display_price || page.product?.display_price || 0).toLocaleString()} (ใช้ price_1 จากแพ็กเกจโปรโมชั่นเป็นราคาขายจริง)
 - รายละเอียด: ${page.product?.description || matchedProduct.detail_text || ''}
 - รายการของแถมในกล่อง: ${combinedSpecs.box_contents || 'ของแถมพิเศษ'}
 - 🚚 การจัดส่ง: ${page.product?.specs?.courier_brand || page.product?.courier_brand || 'Flash Express'} | ถึงภายใน ${page.product?.delivery_days || page.product?.specs?.delivery_days || '1-3 วัน'}
@@ -4400,6 +4400,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
 4. หากลูกค้าส่งข้อมูลสั่งซื้อหรือส่งชื่อ/ที่อยู่/เบอร์โทร หรือจำนวน: ให้ตรวจจับเป็น ORDER และดึงข้อมูลลูกค้าออกมาให้ครบถ้วน
 5. เรื่องการจัดส่ง: บอกว่า "ส่งฟรี" ได้เฉพาะแพ็กเกจที่ free_shipping = true เท่านั้น แพ็กเกจที่ free_shipping = false ห้ามบอกส่งฟรีเด็ดขาด
 6. เรื่องของแถม: บอกของแถมเฉพาะแพ็กเกจที่ gift_quantity > 0 หรือมี free_gifts ระบุเท่านั้น
+6.1. ⭐ ลำดับความสำคัญของราคา (รีเซ็ตให้ AI ใช้ราคาที่ถูกต้องเท่านั้น): ใช้ราคาจากแพ็กเกจโปรโมชั่น (price_1/price_2/price_3 หรือ promotions[].price) เป็นหลัก → หากไม่มี ใช้ display_price → หากไม่มี ใช้ base_price — ห้ามใช้ display_price=0 หรือว่างถ้ามี price_1 อยู่ในระบบแล้ว — นี่คือเหตุผลที่ทำให้ AI ตอบผิดราคา
 7. ทุกคำตอบต้องต่างจากคำตอบก่อนหน้า (ดูรายการ 🚫 ด้านบน) — ปรับคำพูดใหม่เสมอ
 
 ข้อความล่าสุดของลูกค้าที่ต้องตอบ:
@@ -4437,13 +4438,16 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // message — that was the "same answer to every question" bug. Answer from
         // real product data and acknowledge the customer's actual question.
         let replyText = String(parsed.replyText || '').trim();
-        if (!replyText) {
-          const price = (page.product?.display_price || matchedProduct.display_price || 0).toLocaleString();
+                if (!replyText) {
+          // ใช้ราคาตามลำดับความสำคัญ: promotions price_1 (แพ็กเกจโปรโมชั่นชิ้นแรก) → display_price → base_price
+          // เพื่อไม่ตอบ "฿0" หรือ "ไม่มีราคา" เมื่อมี price_1 อยู่ในระบบแล้ว
+          const resolvedPrice = Number(matchedProduct.price_1) || Number(page.product?.display_price) || Number(matchedProduct.display_price) || Number(page.product?.base_price) || Number(matchedProduct.base_price) || 0;
+          const price = resolvedPrice.toLocaleString();
           const productName = page.product?.product_name || matchedProduct.product_name || 'สินค้า';
           replyText = historyEntries.length <= 1
             ? (page.sequence?.step1_opening_text || `สวัสดีค่ะ ยินดีให้ข้อมูล ${productName} ค่ะ สอบถามราคาหรือโปรโมชั่นได้เลยนะคะ 🙏`)
             : `${productName} ราคาโปรอยู่ที่ ฿${price} ค่ะ เรื่องที่ลูกค้าถามมา แอดมินขอตรวจสอบรายละเอียดที่ถูกต้องก่อนนะคะ ระหว่างนี้สนใจดูแพ็กโปรโมชั่นไปพลางๆ ก่อนได้เลยค่ะ 🙏`;
-          addLog('AI_REPLY', senderId, pageId, '⚠️ AI ไม่คืนข้อความตอบกลับ — ใช้ข้อความสำรองตามบริบทบทสนทนา (ไม่ส่งข้อความเปิดซ้ำ)', 'WARNING');
+          addLog('AI_REPLY', senderId, pageId, `⚠️ AI ไม่คืนข้อความตอบกลับ — ใช้ข้อความสำรองตามบริบทบทสนทนา (ไม่ส่งข้อความเปิดซ้ำ) | resolvedPrice=${resolvedPrice}`, 'WARNING');
         }
 
         // ── สร้างรายการข้อความที่จะส่ง รูปหาได้จาก 3 แหล่ง เรียงลำดับ: ──
@@ -4517,17 +4521,20 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         for (const k of ALL_IMAGE_KEYS) {
           if (imgMap[k] && !imageQueue.includes(k)) imageQueue.push(k);
         }
-        const autoAttachImages = (list: Array<{ text: string; imageUrl?: string }>): Array<{ text: string; imageUrl?: string }> => {
+                const autoAttachImages = (list: Array<{ text: string; imageUrl?: string }>): Array<{ text: string; imageUrl?: string }> => {
           if (imageQueue.length === 0) return list;
-          // ถ้า AI ระบุรูปแล้ว (อย่างน้อย 1) → เคารพคำสั่ง AI ไม่ไปยัดรูปซ้ำ
-          if (list.length && list.some(o => o.imageUrl)) return list;
+          // นับเท่านับจริง ๆ: imageUrl ต้องเป็น string ที่ชี้ไปยังรูปจริงใน imgMap (ไม่ใช่ undefined/empty)
+          const aiAttachedCount = list.filter(o => typeof o.imageUrl === 'string' && o.imageUrl.trim()).length;
+          // เคารพคำสั่ง AI เฉพาะเมื่อ AI ให้รูปครบตามจำนวนใน queue อยู่แล้ว → ไม่ต้องแนบซ้ำ
+          if (aiAttachedCount >= imageQueue.length) return list;
           if (list.length === 0) {
             return replyText.trim() ? [{ text: replyText.trim(), imageUrl: imgMap[imageQueue[0]] }] : [];
           }
-          let queueIdx = 0;
+          // ข้ามรูปที่ AI ให้แล้ว แล้วกระจาย queue ที่เหลือให้ข้อความที่ยังไม่มีรูป
+          let queueIdx = aiAttachedCount;
           let reused = false;
           const mapped = list.map((o) => {
-            if (o.imageUrl) return o;
+            if (typeof o.imageUrl === 'string' && o.imageUrl.trim()) return o;
             let key: string;
             if (queueIdx < imageQueue.length) {
               key = imageQueue[queueIdx];
@@ -4551,13 +4558,13 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
 
 
         // ── PRICE GUARD: กันราคามั่ว — ตัวเลขหน้า ฿ ในคำตอบต้องเป็นราคาจริงของเพจ ──
-        const allowedPrices = [
-          Number(page.product?.display_price) || 0,
-          Number(page.product?.base_price) || 0,
-          Number(matchedProduct.display_price) || 0,
+                const allowedPrices = [
           Number(matchedProduct.price_1) || 0,
           Number(matchedProduct.price_2) || 0,
           Number(matchedProduct.price_3) || 0,
+          Number(page.product?.display_price) || 0,
+          Number(page.product?.base_price) || 0,
+          Number(matchedProduct.display_price) || 0,
           ...((page.product?.promotions || []) as any[]).flatMap(pr => [Number(pr.price) || 0, Number(pr.original_price) || 0])
         ].filter(n => n > 0);
         const priceNumbers = (replyText.match(/฿\s?([\d,]+)/g) || []).map(s => Number(s.replace(/[฿,\s]/g, '')));
@@ -4578,7 +4585,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           const stillBad = (replyText.match(/฿\s?([\d,]+)/g) || []).map(s => Number(s.replace(/[฿,\s]/g, ''))).some(n => !allowedPrices.includes(n));
           if (stillBad) {
             addLog('ERROR', senderId, pageId, '⛔ PRICE GUARD: ยังตอบราคามั่วหลังแก้ — ตัดประโยคราคาออกจากคำตอบ', 'ERROR');
-            replyText = replyText.replace(/[^\s]*฿\s?[\d,]+[^\n]*/g, '').replace(/\s{2,}/g, ' ').trim() || `ตอบนะคะ ${page.product?.product_name || 'สินค้า'} ราคา ฿${(page.product?.display_price || 0).toLocaleString()} สนใจแพ็กไหนคะ`;
+            replyText = replyText.replace(/[^\s]*฿\s?[\d,]+[^\n]*/g, '').replace(/\s{2,}/g, ' ').trim() || `ตอบนะคะ ${page.product?.product_name || 'สินค้า'} ราคา ฿${(Number(matchedProduct.price_1) || Number(page.product?.display_price) || Number(matchedProduct.display_price) || 0).toLocaleString()} สนใจแพ็กไหนคะ`;
           }
         }
 
@@ -4812,7 +4819,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         console.error('Gemini AI execution error:', aiErr);
         // ลูกค้าต้องได้คำตอบที่ "ขายต่อ" เสมอ — ใช้ intent ที่จับได้ + ข้อมูลราคาจริง
         // จากเพจ ไม่มีคำว่า "ระบบมีปัญหา" ให้ลูกค้าเสียมู้ดซื้อ
-        const price = (page.product?.display_price || matchedProduct.display_price || 0).toLocaleString();
+        const price = (Number(matchedProduct.price_1) || Number(page.product?.display_price) || Number(matchedProduct.display_price) || Number(page.product?.base_price) || 0).toLocaleString();
         const productName = page.product?.product_name || 'สินค้าของเรา';
         const promos = (page.product?.promotions || []) as any[];
         const promoLines = promos.filter(pr => pr && pr.name).map(pr => `"${pr.name}" ฿${Number(pr.price || 0).toLocaleString()}`).join(' / ');
