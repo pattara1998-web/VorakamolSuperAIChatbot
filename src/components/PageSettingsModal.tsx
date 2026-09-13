@@ -184,12 +184,14 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
     {
       courier_brand: page?.product?.specs?.courier_brand,
       delivery_days: page?.product?.specs?.delivery_days,
-      shipping_duration: page?.product?.shipping_duration || page?.product?.specs?.shipping_duration
+      shipping_duration: page?.product?.shipping_duration || page?.product?.specs?.shipping_duration,
+      shipping_fee: page?.product?.specs?.shipping_fee || (page?.product as any)?.shipping_fee || ''
     },
     {
       courier_brand: (page?.product as any)?.courier_brand,
       delivery_days: (page?.product as any)?.delivery_days,
-      shipping_duration: (page?.product as any)?.shipping_duration
+      shipping_duration: (page?.product as any)?.shipping_duration,
+      shipping_fee: (page?.product as any)?.shipping_fee
     }
   );
 
@@ -247,6 +249,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
       shipping_duration: initialShipping.shipping_duration,
       courier_brand: initialShipping.courier_brand,
       delivery_days: initialShipping.delivery_days,
+      shipping_fee: initialShipping.shipping_fee,
       specs: {
         ...page?.product?.specs,
         courier_brand: initialShipping.courier_brand,
@@ -264,6 +267,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
         cod_note: page?.product?.specs?.cod_note || 'บริการเก็บเงินปลายทาง (COD) ไม่ต้องโอนก่อน',
         shipping_time: page?.product?.specs?.shipping_time || 'จัดส่ง 1-3 วันถึง',
         shipping_duration: initialShipping.shipping_duration,
+        shipping_fee: initialShipping.shipping_fee,
         brand: page?.product?.specs?.brand || '',
         features: page?.product?.specs?.features || '',
         usage: page?.product?.specs?.usage || '',
@@ -402,6 +406,17 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
 
   const handleSelectDeliveryDays = (days: string) => {
     applyShippingMatrix(formData.product.specs?.courier_brand || DEFAULT_COURIER_BRAND, days);
+  };
+
+  const handleShippingFeeChange = (fee: string) => {
+    setFormData(prev => ({
+      ...prev,
+      product: {
+        ...prev.product,
+        shipping_fee: fee,
+        specs: { ...prev.product.specs, shipping_fee: fee }
+      }
+    }));
   };
 
   // Image Upload helper
@@ -1375,6 +1390,23 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                       );
                     })}
                   </div>
+                </div>
+
+                {/* 3. Shipping Fee (ค่าส่งที่เรียกเก็บจากลูกค้า) */}
+                <div className="space-y-2 pt-2 border-t border-slate-200 dark:border-zinc-800/80">
+                  <label className="text-xs text-slate-700 dark:text-zinc-300 font-bold block">
+                    3. ค่าส่งที่เรียกเก็บจากลูกค้า (Shipping Fee):
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.product.shipping_fee || ''}
+                    onChange={e => handleShippingFeeChange(e.target.value)}
+                    placeholder="เช่น ฟรี / 90 บาท / 90-150 บาท ตามพื้นที่ (ถ้าเว้นว่าง AI จะบอกให้ตรวจสอบกับแอดมินก่อน)"
+                    className="w-full bg-white dark:bg-[#0A0A0C] border border-slate-200 dark:border-zinc-800 rounded-xl px-3 py-2.5 text-sm focus:border-indigo-500 outline-none"
+                  />
+                  <p className="text-[11px] text-slate-500 dark:text-zinc-400">
+                    AI จะใช้ค่านี้ตอบลูกค้าตรงๆ เมื่อถาม "ค่าส่ง / ส่งฟรีไหม / ระยะเวลาจัดส่ง"
+                  </p>
                 </div>
 
                 {/* Current Standard Shipping Text Preview */}

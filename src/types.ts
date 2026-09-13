@@ -52,6 +52,7 @@ export interface ProductDetailedSpecs {
   cod_note?: string; // เงื่อนไขเก็บเงินปลายทาง
   shipping_time?: string; // ระยะเวลาจัดส่งด่วน (1-2 วัน)
   shipping_duration?: string; // ระยะเวลาการจัดส่ง (เช่น 1-2 วันถึง, จัดส่งด่วน Flash/Kerry 1-3 วัน)
+  shipping_fee?: string; // ค่าส่งที่เรียกเก็บจากลูกค้า (เช่น "ฟรี" "90 บาท" — AI ใช้ตอบคำถามค่าส่ง)
   care_instruction?: string; // วิธีการเก็บรักษา
   warning?: string; // ข้อควรระวัง
 
@@ -173,6 +174,8 @@ export interface PageProductConfig {
   courier_brand?: string;
   /** Shipping Matrix: ระยะเวลาจัดส่ง (ซิงก์สองทางกับเมนูฐานข้อมูลสินค้า) */
   delivery_days?: string;
+  /** Shipping Matrix: ค่าส่งที่เรียกเก็บจากลูกค้า (เช่น "ฟรี" "90 บาท" "90-150 บาทตามพื้นที่") — AI ใช้ตอบคำถามค่าส่ง */
+  shipping_fee?: string;
   specs?: ProductDetailedSpecs;
   promotions: PromotionTier[];
   images: {

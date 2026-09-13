@@ -619,7 +619,7 @@ function persistData(): void {
 
 const PRODUCT_CORE_FIELDS = new Set([
   'product_id', 'page_id', 'product_name', 'category', 'display_price', 'price_1', 'price_2', 'price_3',
-  'promotion_detail', 'promotions', 'shipping_duration', 'image_main', 'image_detail', 'image_promotion', 'image_review',
+  'promotion_detail', 'promotions', 'shipping_duration', 'shipping_fee', 'image_main', 'image_detail', 'image_promotion', 'image_review',
   'image_closing', 'opening_text', 'detail_text', 'promotion_text', 'review_text', 'closing_text', 'custom_specs'
 ]);
 /** Promotion Packages: อ่าน tier จริงจากแถวสินค้า (รองรับทั้ง array และ JSON string จาก Postgres) */
@@ -654,6 +654,7 @@ function syncPagesFromCatalog(collection: 'amulet' | 'china' | 'otop' | 'agricul
       // the product database menu always agree.
       courier_brand: record.courier_brand || page.product?.specs?.courier_brand || page.product?.courier_brand,
       delivery_days: record.delivery_days || page.product?.specs?.delivery_days || page.product?.delivery_days,
+      shipping_fee: record.shipping_fee || page.product?.specs?.shipping_fee || page.product?.shipping_fee,
       specs: { ...(page.product?.specs || {}), ...specs, custom_specs: record.custom_specs || page.product?.specs?.custom_specs },
       images: {
         main: record.image_main || page.product?.images?.main || '', detail: record.image_detail || page.product?.images?.detail || '',
@@ -702,6 +703,7 @@ function syncCatalogFromPages() {
       shipping_duration: page.product.shipping_duration || current.shipping_duration,
       courier_brand: page.product.courier_brand || page.product.specs?.courier_brand || current.courier_brand,
       delivery_days: page.product.delivery_days || page.product.specs?.delivery_days || current.delivery_days,
+      shipping_fee: page.product.shipping_fee || page.product.specs?.shipping_fee || current.shipping_fee,
       image_main: page.product.images?.main || current.image_main || '', image_detail: page.product.images?.detail || current.image_detail || '',
       image_promotion: page.product.images?.promotion || current.image_promotion || '', image_review: page.product.images?.review || current.image_review || '', image_closing: page.product.images?.closing || current.image_closing || '',
       opening_text: page.sequence?.step1_opening_text || current.opening_text || '', detail_text: page.product.description || current.detail_text || '',
@@ -1371,6 +1373,52 @@ async function startServer() {
     }
     next();
   });
+
+  // Capture request host to build public media URLs (Messenger fetches our own
+  // /api/media/... to deliver images — no extra token permission needed like the
+  // reusable-attachment upload path).
+  let latestRequestHost = '';
+  let latestRequestProto = 'https';
+  app.use((req, _res, next) => {
+    const host = req.get('host') || '';
+    if (host) latestRequestHost = host;
+    const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
+    if (proto === 'http' || proto === 'https') latestRequestProto = proto;
+    next();
+  });
+  const getPublicBaseUrl = (): string => {
+    if (process.env.PUBLIC_BASE_URL) return String(process.env.PUBLIC_BASE_URL).replace(/\/+$/, '');
+    if (process.env.RENDER_EXTERNAL_URL) return String(process.env.RENDER_EXTERNAL_URL).replace(/\/+$/, '');
+    if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`.replace(/\/+$/, '');
+    if (latestRequestHost && /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(latestRequestHost)) return '';
+    return latestRequestHost ? `${latestRequestProto}://${latestRequestHost}` : '';
+  };
+
+  // ── Media registry: hash ของรูปที่เคยส่ง -> data URL (สำหรับ /api/media proxy) ──
+  // ใช้เพื่อให้ Messenger ดึงรูปจาก URL สาธารณะของเราได้ (รูปในระบบเป็น data URL)
+  const mediaImageCache = new Map<string, string>();
+  function findMediaDataUrlByHash(hash: string): string | undefined {
+    if (mediaImageCache.has(hash)) return mediaImageCache.get(hash);
+    const collect = (value: unknown): void => {
+      if (typeof value === 'string' && /^data:/i.test(value)) {
+        if (crypto.createHash('md5').update(value).digest('hex') === hash) mediaImageCache.set(hash, value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach(collect);
+        return;
+      }
+      if (value && typeof value === 'object') {
+        Object.values(value as Record<string, unknown>).forEach(collect);
+      }
+    };
+    for (const page of db.pages) {
+      collect(page.product);
+      collect(page.sales_sequence_steps);
+      collect(page.comment_reply_images);
+    }
+    return mediaImageCache.get(hash);
+  };
 
   // ================================================================
   // AUTHENTICATION & SECURITY ENDPOINTS
@@ -2745,31 +2793,48 @@ async function startServer() {
   // ── Smart image sender: ส่งรูปให้ลูกค้าได้ทั้ง data URL (base64 จากไฟล์ที่
   // อัปโหลดในระบบ) และ public URL ──
   // Messenger API ไม่ยอมรับ data URL ใน /me/messages (ต้นเหตุที่ "ตั้งรูปไว้แต่
-  // AI ไม่ส่งรูป") — data URL ต้องถูกอัปโหลดเป็น reusable attachment ก่อนแล้วส่ง
-  // ด้วย attachment_id. Public URL ส่งตรงได้เหมือนเดิม.
+  // AI ไม่ส่งรูป"). ส่งได้ 2 วิธี:
+  //   1) ส่งผ่าน public URL /api/media/:hash ที่ระบบเราจัดหาให้ (วิธีมาตรฐานของ
+  //      Messenger ใช้ token แค่สิทธิ์ส่งข้อความปกติ) — ใช้เมื่อ server เปิดสาธารณะ
+  //   2) fallback อัปโหลดเป็น reusable attachment (/me/message_attachments) แล้ว
+  //      ส่งด้วย attachment_id — ใช้ได้แม้ localhost ที่ Messenger เข้า URL เราไม่ได้
   const reusableAttachmentCache = new Map<string, string>(); // key: pageId|dataUrl-hash -> attachment_id
   async function sendFacebookImageSmart(accessToken: string, recipientId: string, imageUrl: string, pageId?: string) {
     if (!imageUrl) return { success: false, error: 'IMAGE_EMPTY' };
-    // Data URL (รูปอัปโหลดจากไฟล์เครื่อง) -> upload as reusable attachment
-    if (/^data:/i.test(imageUrl.trim()) || !/^https?:\/\//i.test(imageUrl.trim())) {
-      const decoded = decodeDataUrl(imageUrl);
-      if (!decoded) return { success: false, error: 'IMAGE_DECODE_FAILED' };
-      // Cache attachment_id ต่อเพจ+รูป เพื่อไม่ต้องอัปโหลดรูปเดิมซ้ำทุกข้อความ
-      const cacheKey = `${pageId || 'pg'}|${crypto.createHash('md5').update(imageUrl).digest('hex')}`;
-      let attachmentId = reusableAttachmentCache.get(cacheKey);
-      if (!attachmentId) {
-        const uploaded = await uploadReusableAttachment(accessToken, decoded.buffer, 'product-image.jpg', decoded.mimeType);
-        if (!uploaded.success || !uploaded.attachment_id) {
-          addLog('INFO', 'FACEBOOK_API', recipientId, `❌ อัปโหลดรูป (reusable attachment) ไม่สำเร็จ: ${uploaded.error}`, 'ERROR');
-          return { success: false, error: uploaded.error };
-        }
-        attachmentId = uploaded.attachment_id;
-        reusableAttachmentCache.set(cacheKey, attachmentId);
-      }
-      return sendFacebookAttachmentById(accessToken, recipientId, attachmentId);
-    }
     // Public URL -> send directly (เหมือนเดิม)
-    return sendFacebookImage(accessToken, recipientId, imageUrl);
+    if (/^https?:\/\//i.test(imageUrl.trim())) {
+      return sendFacebookImage(accessToken, recipientId, imageUrl);
+    }
+    // Data URL (รูปอัปโหลดจากไฟล์เครื่อง) หรือ path -> ต้องแปลงเป็น public URL / attachment
+    const decoded = decodeDataUrl(imageUrl);
+    if (!decoded) return { success: false, error: 'IMAGE_DECODE_FAILED' };
+    const hash = crypto.createHash('md5').update(imageUrl).digest('hex');
+
+    // วิธี 1: ส่งผ่าน public URL /api/media/:hash ที่ Messenger ดึงได้เอง
+    mediaImageCache.set(hash, imageUrl);
+    const base = getPublicBaseUrl();
+    if (base) {
+      const mimeMatch = /^data:image\/([\w.+-]+)/i.exec(imageUrl.trim());
+      const ext = (mimeMatch?.[1] || 'jpeg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+      const publicUrl = `${base}/api/media/${hash}.${ext}`;
+      const viaUrl = await sendFacebookImage(accessToken, recipientId, publicUrl);
+      if (viaUrl.success) return viaUrl;
+      addLog('INFO', 'FACEBOOK_API', recipientId, `⚠️ ส่งรูปผ่าน public URL ยังไม่สำเร็จ (${viaUrl.error}) — ลองวิธีอัปโหลด attachment แทน`, 'WARNING');
+    }
+
+    // วิธี 2: reusable attachment (ยิงจาก server ไปหา Messenger — ใช้ได้แม้ localhost)
+    const cacheKey = `${pageId || 'pg'}|${hash}`;
+    let attachmentId = reusableAttachmentCache.get(cacheKey);
+    if (!attachmentId) {
+      const uploaded = await uploadReusableAttachment(accessToken, decoded.buffer, 'product-image.jpg', decoded.mimeType);
+      if (!uploaded.success || !uploaded.attachment_id) {
+        addLog('INFO', 'FACEBOOK_API', recipientId, `❌ ส่งรูปไม่สำเร็จทั้ง 2 วิธี (URL + attachment): ${uploaded.error}`, 'ERROR');
+        return { success: false, error: uploaded.error };
+      }
+      attachmentId = uploaded.attachment_id;
+      reusableAttachmentCache.set(cacheKey, attachmentId);
+    }
+    return sendFacebookAttachmentById(accessToken, recipientId, attachmentId);
   }
 
   // Send an already-uploaded reusable attachment (from /me/message_attachments).
@@ -4254,6 +4319,9 @@ ${usedRepliesText}
 10. 🎯 เทคนิคปิดการขาย: ใช้ Choice Close (ให้ลูกค้าเลือกระหว่างแพ็ก ไม่ใช่เลือกว่าจะซื้อไหม) เช่น "เอาแพ็กเดี่ยวหรือแพ็กคู่ดีคะ" + ใช้ความเร่งด่วนจากโปรจริงเท่านั้น (เช่น "โปรรอบนี้เท่านั้น") + ลูกค้าถามอะไรก็ตอบจากข้อมูลจริงแล้วดึงกลับสู่การปิดการขายเสมอ
 11. 🎨 จัดรูปแบบข้อความให้สวยงามอ่านง่ายเหมือนแอดมินมืออาชีพ: ใช้บรรทัดสั้น เว้นบรรทัด (\n) แยกหัวข้อชัดเจน ใช้อิโมจินำหน้าบรรทัด เช่น 🔥 ชื่อสินค้า / ✅ จุดเด่น / 💰 ราคาปกติ → ราคาโปร / 🎁 ของแถม / 🚚 ส่งของ / ⭐ การันตี — ห้ามยัดทุกอย่างในบรรทัดเดียวให้ดูรก และตอบเป็นหลายข้อความต่อเนื่อง (messages array) เหมือนแอดมินจริงที่ส่งไล่ ๆ กัน
 12. 📸 การแนบรูป (สำคัญ): รูปที่แนบได้ 5 แบบ — main (รูปสินค้า) / detail (รูปรายละเอียด) / promotion (รูปโปรโมชั่น) / review (รูปรีวิว) / closing (รูปปิดการขาย) เมื่อพรีเซนสินค้าหรือราคาให้แนบ main, เมื่อโชว์โปรโมชั่นให้แนบ promotion, เมื่อสร้างความเชื่อมั่นให้แนบ review, เมื่อกำลังปิดการขาย/รับออเดอร์ให้แนบ closing — เลือกใส่ field "image" ใน messages array ทุกครั้งที่เหมาะสม (อย่างน้อย 1 รูปต่อการพรีเซน)
+13. 💰 ค่าส่ง (สำคัญ): เมื่อลูกค้าถาม "ค่าส่ง / ส่งฟรีไหม / เก็บเงินปลายทาง" ให้ตอบจากข้อมูล 🚚 การจัดส่ง ด้านล่างเท่านั้น ถ้า "ค่าส่ง (shipping_fee)" ยังไม่ได้ตั้งค่าไว้ → ตอบว่า "ค่าขนส่งคิดตามพื้นที่/น้ำหนักค่ะ ขอตรวจสอบกับแอดมินให้ก่อนนะคะ" แล้วชวนคุยเรื่องอื่น — ห้ามเดาตัวเลขค่าส่ง ห้ามบอกว่า "ส่งฟรี" เว้นแต่ shipping_fee = ฟรีหรือแพ็กเกจที่ free_shipping = true
+14. 👑 ลูกค้าเก่าที่เคยสั่งซื้อแล้ว (สถานะ ⭐ ลูกค้าเก่า): ต้องใช้โทนอบอุ่นแบบรู้จักกัน (เช่น "ขอบคุณที่กลับมาอุดหนุนอีกนะคะ") แล้วตอบตรงคำถามที่ถามเท่านั้น ห้ามพรีเซนสเต็ปขาย/ยัดโปรโมชั่นซ้ำ เว้นแต่ลูกค้าแสดงความสนใจสั่งซื้อเพิ่มเอง จึงเสนอโปรสั้น ๆ ได้
+15. 🛑 ห้ามตอบแบบสเต็ปสคริปต์: ทุกคำตอบต้องเจาะจงกับคำถามล่าสุดของลูกค้า ด้วยถ้อยคำใหม่ — ห้ามยัดสเต็ป 1-6 เรียงเป็นชุด ห้ามลอกข้อความเปิดสเต็ป 1 ซ้ำ เมื่อลูกค้าถามเรื่องใดก็ตอบเรื่องนั้นก่อนเสมอ
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
@@ -4262,6 +4330,8 @@ ${usedRepliesText}
 - ราคาโปรโมชั่นขาย: ฿${(page.product?.display_price || matchedProduct.display_price || 0).toLocaleString()}
 - รายละเอียด: ${page.product?.description || matchedProduct.detail_text || ''}
 - รายการของแถมในกล่อง: ${combinedSpecs.box_contents || 'ของแถมพิเศษ'}
+- 🚚 การจัดส่ง: ${page.product?.specs?.courier_brand || page.product?.courier_brand || 'Flash Express'} | ถึงภายใน ${page.product?.delivery_days || page.product?.specs?.delivery_days || '1-3 วัน'}
+- 💰 ค่าส่งที่เรียกเก็บจากลูกค้า (shipping_fee): ${page.product?.shipping_fee || page.product?.specs?.shipping_fee || '(ยังไม่ได้ตั้งค่า — ห้ามเดา ต้องตอบว่าขอตรวจสอบกับแอดมินก่อน)'}
 
 📋 ข้อมูลสเปกสินค้าแบบละเอียด (Detailed Product Specifications):
 ${compactSpecText(specsText)}
@@ -4497,8 +4567,11 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // (from the comment settings) take priority, with a sensible default.
         const purchaseIntentKeywords = (page.purchase_keywords && page.purchase_keywords.length > 0)
           ? page.purchase_keywords
-          : ['สนใจ', 'อยากได้', 'อยากซื้อ', 'ต้องการ', 'ซื้อ', 'ราคา', 'เท่าไหร่', 'เท่าไร', 'สั่ง', 'จอง', 'เอา', 'โอน', 'cod'];
-        const hasPurchaseIntent = purchaseIntentKeywords.some(kw => messageText.toLowerCase().includes(String(kw).toLowerCase()));
+          : ['สนใจ', 'อยากได้', 'อยากซื้อ', 'ต้องการ', 'ซื้อ', 'สั่ง', 'จอง', 'เอา', 'โอน', 'cod'];
+        // "สนใจซื้อจริง" เท่านั้น (ไม่รวมคำถามเฉย ๆ เช่น ราคา/ค่าส่ง/เท่าไหร่) ถึงจะ
+        // อนุญาตให้พรีเซนสเต็ปขาย — การถามราคา/ค่าส่งคือสอบถามข้อมูล ไม่ใช่สัญญาณสั่งซื้อ
+        const hasStrongPurchaseIntent = purchaseIntentKeywords.some(kw => messageText.toLowerCase().includes(String(kw).toLowerCase()))
+          || ['ORDER', 'NEGOTIATION'].includes(intentHint);
 
         // Quick Reply buttons go to every NEW customer (first contact) and on
         // any message when the customer hasn't tapped one yet — not only when
@@ -4507,9 +4580,16 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         const quickReplies = page.quick_replies || [];
         const shouldSendQuickReplies = quickReplies.length > 0;
 
-        // Purchase intent => fire the closing sales sequence immediately
-        // (customer said สนใจ/ราคา/สั่ง etc.) or on first contact.
-        const shouldTriggerSalesSequence = (page.sales_sequence_auto_trigger && (isNewCustomer || hasPurchaseIntent)) || false;
+        // ── Sales Sequence trigger ──
+        // พรีเซนสเต็ปขาย เฉพาะลูกค้าที่ยังไม่เคยสั่งซื้อ (!isReturningCustomer):
+        //   - ทักครั้งแรก (isNewCustomer) + เปิด auto-trigger → พรีเซนเต็มชุด
+        //   - แสดงความสนใจซื้อจริง + เปิด auto-trigger → พรีเซนเต็มชุด
+        // ลูกค้าเก่าที่เคยสั่งซื้อแล้ว → ไม่พรีเซน ตอบตรงคำถามเท่านั้น
+        const autoTrigger = page.sales_sequence_auto_trigger === true;
+        const shouldTriggerSalesSequence = !isReturningCustomer && (
+          (isNewCustomer && autoTrigger) ||
+          (autoTrigger && hasStrongPurchaseIntent)
+        );
 
         // Send the AI answer with human-like pacing
         await sleep(pageDelay);
@@ -4546,11 +4626,10 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         const configuredSteps = (page.sales_sequence_steps || [])
           .filter(s => s && (s.text_content?.trim() || s.image_url?.trim()))
           .sort((a, b) => a.step_number - b.step_number);
-        if (!shouldTriggerSalesSequence) {
-          const sequenceStep = Math.min(6, Math.max(1, Number(parsed.sequenceStep) || 1));
-          // dedupe=true: ส่งสเต็ปเดิมซ้ำไม่ได้ภายใน 6 ชม. — กันลูกค้าได้รับ
-          // ข้อความสเต็ป 1 ซ้ำทุกครั้งที่ทักมา (ต้นเหตุ "ตอบแต่ซ้ำๆ")
-          await sendConfiguredSequenceStep(page, senderId, sequenceStep, true);
+        if (!shouldTriggerSalesSequence && isNewCustomer) {
+          // เมื่อไม่ auto-trigger: อย่าพรีเซนสเต็ปขายทุกข้อความ (ต้นเหตุ "ตอบแบบสเต็ปซ้ำๆ")
+          // ส่งแค่สเต็ป 1 (ข้อความเปิด) ให้ลูกค้าใหม่ที่ทักครั้งแรกเท่านั้น (dedupe กันซ้ำ 6 ชม.)
+          await sendConfiguredSequenceStep(page, senderId, 1, true);
         }
 
         // If sales sequence auto-trigger is enabled, send the FULL configured
@@ -6023,6 +6102,26 @@ ${JSON.stringify(categorySummary, null, 2)}
     // so the UI never shows a broken image for pages that aren't connected yet.
     if (!raw || !raw.startsWith('EAA')) return res.redirect(302, DEFAULT_PAGE_AVATAR);
     res.redirect(302, `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(page!.page_id)}/picture?type=normal&access_token=${encodeURIComponent(raw)}`);
+  });
+
+  // ── Media proxy: เปลี่ยน data URL ในระบบเป็น public URL ให้ Messenger ดึงรูปไปส่ง
+  // ให้ลูกค้าได้ (Messenger ไม่อนุญาต box ตรงๆ ต้องเป็น URL ที่ดึงจากอินเทอร์เน็ตได้) ──
+  app.get('/api/media/:file', (req: Request, res: Response) => {
+    const name = String(req.params.file || '');
+    const hash = name.replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+    if (!/^[a-f0-9]{32}$/.test(hash)) return res.status(400).json({ error: 'bad hash' });
+    const dataUrl = findMediaDataUrlByHash(hash);
+    if (!dataUrl) return res.status(404).json({ error: 'media not found' });
+    const decoded = decodeDataUrl(dataUrl);
+    if (!decoded) return res.status(404).json({ error: 'bad media payload' });
+    const ext = name.split('.').pop()?.toLowerCase();
+    const mime = decoded.mimeType && decoded.mimeType.startsWith('image/')
+      ? decoded.mimeType
+      : (ext ? `image/${ext}` : 'image/jpeg');
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Cache-Control', `public, max-age=${60 * 60 * 24}`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.send(decoded.buffer);
   });
 
   app.post('/api/pages/set-connected', (req: Request, res: Response) => {

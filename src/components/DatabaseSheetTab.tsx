@@ -267,12 +267,14 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                 {
                   courier_brand: productData.courier_brand,
                   delivery_days: productData.delivery_days,
-                  shipping_duration: productData.shipping_duration
+                  shipping_duration: productData.shipping_duration,
+                  shipping_fee: productData.shipping_fee
                 },
                 {
                   courier_brand: p.product?.specs?.courier_brand,
                   delivery_days: p.product?.specs?.delivery_days,
-                  shipping_duration: p.product?.shipping_duration || p.product?.specs?.shipping_duration
+                  shipping_duration: p.product?.shipping_duration || p.product?.specs?.shipping_duration,
+                  shipping_fee: p.product?.shipping_fee || p.product?.specs?.shipping_fee
                 }
               );
               return {
@@ -288,6 +290,7 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                   shipping_duration: shipping.shipping_duration,
                   courier_brand: shipping.courier_brand,
                   delivery_days: shipping.delivery_days,
+                  shipping_fee: shipping.shipping_fee,
                   images: {
                     main: productData.image_main || '',
                     detail: productData.image_detail || '',
@@ -302,7 +305,8 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                     ...productData,
                     courier_brand: shipping.courier_brand,
                     delivery_days: shipping.delivery_days,
-                    shipping_duration: shipping.shipping_duration
+                    shipping_duration: shipping.shipping_duration,
+                    shipping_fee: shipping.shipping_fee
                   }
                 },
                 sequence: {
@@ -474,18 +478,21 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                     {
                       courier_brand: productData.courier_brand,
                       delivery_days: productData.delivery_days,
-                      shipping_duration: productData.shipping_duration
+                      shipping_duration: productData.shipping_duration,
+                      shipping_fee: productData.shipping_fee
                     },
                     {
                       courier_brand: p.product?.specs?.courier_brand,
                       delivery_days: p.product?.specs?.delivery_days,
-                      shipping_duration: p.product?.shipping_duration
+                      shipping_duration: p.product?.shipping_duration,
+                      shipping_fee: p.product?.shipping_fee
                     }
                   );
                   return {
                     shipping_duration: shipping.shipping_duration,
                     courier_brand: shipping.courier_brand,
-                    delivery_days: shipping.delivery_days
+                    delivery_days: shipping.delivery_days,
+                    shipping_fee: shipping.shipping_fee
                   };
                 })(),
                 description: productData.description || productData.detail_text || productData.belief_info || '',
@@ -505,6 +512,7 @@ export const DatabaseSheetTab: React.FC<DatabaseSheetTabProps> = ({
                   courier_brand: productData.courier_brand || p.product.specs?.courier_brand,
                   delivery_days: productData.delivery_days || p.product.specs?.delivery_days,
                   shipping_duration: productData.shipping_duration || p.product.specs?.shipping_duration,
+                  shipping_fee: productData.shipping_fee || p.product.specs?.shipping_fee,
                   material: productData.material || p.product.specs?.material,
                   dimensions: productData.size || p.product.specs?.dimensions,
                   weight: productData.weight || p.product.specs?.weight,

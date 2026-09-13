@@ -82,6 +82,7 @@ export const ProductTemplateModal: React.FC<ProductTemplateModalProps> = ({
     // Shipping Matrix — ต้องตรงกับ PageSettingsModal TAB 5 (utils/shippingMatrix)
     courier_brand: DEFAULT_COURIER_BRAND,
     delivery_days: DEFAULT_DELIVERY_DAYS,
+    shipping_fee: '',
     image_main: '',
     image_detail: '',
     image_promotion: '',
@@ -253,14 +254,21 @@ export const ProductTemplateModal: React.FC<ProductTemplateModalProps> = ({
               courier_brand: productObj.courier_brand || specsObj.courier_brand || initialData.courier_brand,
               delivery_days: productObj.delivery_days || specsObj.delivery_days || initialData.delivery_days,
               shipping_duration:
-                productObj.shipping_duration || specsObj.shipping_duration || initialData.shipping_duration
+                productObj.shipping_duration || specsObj.shipping_duration || initialData.shipping_duration,
+              shipping_fee: productObj.shipping_fee || specsObj.shipping_fee || initialData.shipping_fee
             },
-            { courier_brand: prev.courier_brand, delivery_days: prev.delivery_days, shipping_duration: prev.shipping_duration }
+            {
+              courier_brand: prev.courier_brand,
+              delivery_days: prev.delivery_days,
+              shipping_duration: prev.shipping_duration,
+              shipping_fee: prev.shipping_fee
+            }
           );
           return {
             courier_brand: shipping.courier_brand,
             delivery_days: shipping.delivery_days,
-            shipping_duration: shipping.shipping_duration
+            shipping_duration: shipping.shipping_duration,
+            shipping_fee: shipping.shipping_fee
           };
         })()
       }));
@@ -357,7 +365,8 @@ export const ProductTemplateModal: React.FC<ProductTemplateModalProps> = ({
       promotion_detail: formData.promotion_detail || tierColumns.promotion_detail,
       courier_brand: shipping.courier_brand,
       delivery_days: shipping.delivery_days,
-      shipping_duration: shipping.shipping_duration
+      shipping_duration: shipping.shipping_duration,
+      shipping_fee: shipping.shipping_fee || formData.shipping_fee || ''
     });
     onClose();
   };
@@ -2016,6 +2025,20 @@ export const ProductTemplateModal: React.FC<ProductTemplateModalProps> = ({
                           );
                         })}
                       </div>
+                    </div>
+
+                    <div>
+                      <p className="text-[11px] font-bold text-slate-500 dark:text-zinc-400 mb-1.5">ค่าส่งที่เรียกเก็บลูกค้า (Shipping Fee)</p>
+                      <input
+                        type="text"
+                        value={formData.shipping_fee || ''}
+                        onChange={e => setFormData({ ...formData, shipping_fee: e.target.value })}
+                        placeholder="เช่น ฟรี / 90 บาท / 90-150 บาท ตามพื้นที่"
+                        className="w-full bg-white dark:bg-[#0A0A0C] border border-slate-200 dark:border-zinc-800 rounded-lg p-2 text-xs focus:border-emerald-500 outline-none"
+                      />
+                      <p className="text-[10px] text-slate-400 dark:text-zinc-500 mt-1">
+                        AI จะใช้ค่านี้ตอบลูกค้าเมื่อถามค่าส่ง — ถ้าเว้นว่าง AI จะบอกว่าให้ตรวจสอบกับแอดมินก่อน
+                      </p>
                     </div>
                   </div>
 

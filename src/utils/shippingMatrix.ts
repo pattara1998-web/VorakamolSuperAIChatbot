@@ -67,17 +67,23 @@ export function parseShippingDuration(text: string | undefined | null): {
  * ลำดับความสำคัญ: ค่าจากหน้าเพจ (ใหม่สุด) → ค่าจากฐานข้อมูลสินค้า → ค่าเดิม
  */
 export function mergeShippingFields(
-  primary: { courier_brand?: string; delivery_days?: string; shipping_duration?: string } | undefined | null,
-  fallback: { courier_brand?: string; delivery_days?: string; shipping_duration?: string } | undefined | null
-): { courier_brand: string; delivery_days: string; shipping_duration: string } {
+  primary: { courier_brand?: string; delivery_days?: string; shipping_duration?: string; shipping_fee?: string } | undefined | null,
+  fallback: { courier_brand?: string; delivery_days?: string; shipping_duration?: string; shipping_fee?: string } | undefined | null
+): { courier_brand: string; delivery_days: string; shipping_duration: string; shipping_fee: string } {
   const pick = (a?: string, b?: string) => (String(a || '').trim() ? String(a).trim() : String(b || '').trim());
 
   const courierBrand = pick(primary?.courier_brand, fallback?.courier_brand) || DEFAULT_COURIER_BRAND;
   const deliveryDays = pick(primary?.delivery_days, fallback?.delivery_days) || DEFAULT_DELIVERY_DAYS;
   const shippingDuration = pick(primary?.shipping_duration, fallback?.shipping_duration)
     || buildShippingDuration(courierBrand, deliveryDays);
+  const shippingFee = pick(primary?.shipping_fee, fallback?.shipping_fee);
 
-  return { courier_brand: courierBrand, delivery_days: deliveryDays, shipping_duration: shippingDuration };
+  return {
+    courier_brand: courierBrand,
+    delivery_days: deliveryDays,
+    shipping_duration: shippingDuration,
+    shipping_fee: shippingFee
+  };
 }
 
 /**
@@ -89,9 +95,9 @@ export function mergeShippingFields(
  *   เพื่อแสดงตัวเลือกให้ตรง (ไม่ทำลายข้อมูลเดิม)
  */
 export function normalizeShippingFields(
-  primary: { courier_brand?: string; delivery_days?: string; shipping_duration?: string } | undefined | null,
-  fallback: { courier_brand?: string; delivery_days?: string; shipping_duration?: string } | undefined | null
-): { courier_brand: string; delivery_days: string; shipping_duration: string } {
+  primary: { courier_brand?: string; delivery_days?: string; shipping_duration?: string; shipping_fee?: string } | undefined | null,
+  fallback: { courier_brand?: string; delivery_days?: string; shipping_duration?: string; shipping_fee?: string } | undefined | null
+): { courier_brand: string; delivery_days: string; shipping_duration: string; shipping_fee: string } {
   const merged = mergeShippingFields(primary, fallback);
   const parsed = parseShippingDuration(merged.shipping_duration);
 
@@ -109,6 +115,7 @@ export function normalizeShippingFields(
     delivery_days: deliveryDays,
     shipping_duration: isSystemGenerated
       ? buildShippingDuration(courierBrand, deliveryDays)
-      : merged.shipping_duration
+      : merged.shipping_duration,
+    shipping_fee: merged.shipping_fee
   };
 }
