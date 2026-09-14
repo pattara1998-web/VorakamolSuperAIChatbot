@@ -4796,7 +4796,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // (from the comment settings) take priority, with a sensible default.
         const purchaseIntentKeywords = (page.purchase_keywords && page.purchase_keywords.length > 0)
           ? page.purchase_keywords
-          : ['สนใจ', 'อยากได้', 'อยากซื้อ', 'ต้องการ', 'ซื้อ', 'สั่ง', 'จอง', 'เอา', 'โอน', 'cod'];
+          : ['สนใจ', 'อยากได้', 'อยากซื้อ', 'ต้องการ'];
         // "สนใจซื้อจริง" เท่านั้น (ไม่รวมคำถามเฉย ๆ เช่น ราคา/ค่าส่ง/เท่าไหร่) ถึงจะ
         // อนุญาตให้พรีเซนสเต็ปขาย — การถามราคา/ค่าส่งคือสอบถามข้อมูล ไม่ใช่สัญญาณสั่งซื้อ
         const hasStrongPurchaseIntent = purchaseIntentKeywords.some(kw => messageText.toLowerCase().includes(String(kw).toLowerCase()))
