@@ -4357,7 +4357,7 @@ ${usedRepliesText}
 9. 🏆 โหมดนักขายมืออาชีพ: เมื่อลูกค้าแสดงความสนใจ (ถามราคา/โปร/บอกสนใจ/ต่อรอง) ต้องพรีเซนเต็มรูปแบบในข้อความเดียว: จุดขายหลัก → ราคาปกติ vs ราคาโปร (โชว์ส่วนลด) → ของแถม/สิทธิพิเศษ → ปิดแบบให้ลูกค้าเลือกแพ็ก เขียนสั้น แบ่งบรรทัดแบบแชทจริง อ่านง่าย ไม่เกิน 4-5 บรรทัด
 10. 🎯 เทคนิคปิดการขาย: ใช้ Choice Close (ให้ลูกค้าเลือกระหว่างแพ็ก ไม่ใช่เลือกว่าจะซื้อไหม) เช่น "เอาแพ็กเดี่ยวหรือแพ็กคู่ดีคะ" + ใช้ความเร่งด่วนจากโปรจริงเท่านั้น (เช่น "โปรรอบนี้เท่านั้น") + ลูกค้าถามอะไรก็ตอบจากข้อมูลจริงแล้วดึงกลับสู่การปิดการขายเสมอ
 11. 🎨 จัดรูปแบบข้อความให้สวยงามอ่านง่ายเหมือนแอดมินมืออาชีพ: ใช้บรรทัดสั้น เว้นบรรทัด (\n) แยกหัวข้อชัดเจน ใช้อิโมจินำหน้าบรรทัด เช่น 🔥 ชื่อสินค้า / ✅ จุดเด่น / 💰 ราคาปกติ → ราคาโปร / 🎁 ของแถม / 🚚 ส่งของ / ⭐ การันตี — ห้ามยัดทุกอย่างในบรรทัดเดียวให้ดูรก และตอบเป็นหลายข้อความต่อเนื่อง (messages array) เหมือนแอดมินจริงที่ส่งไล่ ๆ กัน
-12. 📸 การแนบรูป (สำคัญ): รูปที่แนบได้ 5 แบบ — main (รูปสินค้า) / detail (รูปรายละเอียด) / promotion (รูปโปรโมชั่น) / review (รูปรีวิว) / closing (รูปปิดการขาย) เมื่อพรีเซนสินค้าหรือราคาให้แนบ main, เมื่อโชว์โปรโมชั่นให้แนบ promotion, เมื่อสร้างความเชื่อมั่นให้แนบ review, เมื่อกำลังปิดการขาย/รับออเดอร์ให้แนบ closing — เลือกใส่ field "image" ใน messages array ทุกครั้งที่เหมาะสม (อย่างน้อย 1 รูปต่อการพรีเซน)
+12. 📸 การแนบรูป (สำคัญ): ระบบจะแนบรูปให้อัตโนมัติตามเจตนาและรูปที่ตั้งไว้ในหน้าแก้ไขเพจ — ไม่จำเป็นต้องใส่ field "image" ใน messages array (ระบบใช้เป็นข้อมูลอ้างอิงเท่านั้น ไม่ใช่คำสั่งสุดท้าย) รูปที่แนบได้ 5 แบบ: main (รูปสินค้า) / detail (รูปรายละเอียด) / promotion (รูปโปรโมชั่น) / review (รูปรีวิว) / closing (รูปปิดการขาย)
 13. 💰 ค่าส่ง (สำคัญ): เมื่อลูกค้าถาม "ค่าส่ง / ส่งฟรีไหม / เก็บเงินปลายทาง" ให้ตอบจากข้อมูล 🚚 การจัดส่ง ด้านล่างเท่านั้น ถ้า "ค่าส่ง (shipping_fee)" ยังไม่ได้ตั้งค่าไว้ → ตอบว่า "ค่าขนส่งคิดตามพื้นที่/น้ำหนักค่ะ ขอตรวจสอบกับแอดมินให้ก่อนนะคะ" แล้วชวนคุยเรื่องอื่น — ห้ามเดาตัวเลขค่าส่ง ห้ามบอกว่า "ส่งฟรี" เว้นแต่ shipping_fee = ฟรีหรือแพ็กเกจที่ free_shipping = true
 14. 👑 ลูกค้าเก่าที่เคยสั่งซื้อแล้ว (สถานะ ⭐ ลูกค้าเก่า): ต้องใช้โทนอบอุ่นแบบรู้จักกัน (เช่น "ขอบคุณที่กลับมาอุดหนุนอีกนะคะ") แล้วตอบตรงคำถามที่ถามเท่านั้น ห้ามพรีเซนสเต็ปขาย/ยัดโปรโมชั่นซ้ำ เว้นแต่ลูกค้าแสดงความสนใจสั่งซื้อเพิ่มเอง จึงเสนอโปรสั้น ๆ ได้
 15. 🛑 ห้ามตอบแบบสเต็ปสคริปต์: ทุกคำตอบต้องเจาะจงกับคำถามล่าสุดของลูกค้า ด้วยถ้อยคำใหม่ — ห้ามยัดสเต็ป 1-6 เรียงเป็นชุด ห้ามลอกข้อความเปิดสเต็ป 1 ซ้ำ เมื่อลูกค้าถามเรื่องใดก็ตอบเรื่องนั้นก่อนเสมอ
@@ -4475,15 +4475,13 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         const missingImageKeys = ALL_IMAGE_KEYS.filter(k => !imgMap[k]);
         addLog('INFO', senderId, pageId, `📸 รูปพร้อมส่ง ${readyAllKeys.length}/5: ${ALL_IMAGE_KEYS.map(k => (readyAllKeys.includes(k) ? `${k}✓` : `${k}✗`)).join(' ')}${missingImageKeys.length ? ` — ขาด: ${missingImageKeys.join(', ')} (อัปโหลดรูปในหน้าตั้งค่าเพื่อให้ AI ส่งครบ)` : ''}`, 'INFO');
         const buildOutgoing = (p: any): Array<{ text: string; imageUrl?: string }> => {
-          const out: Array<{ text: string; imageUrl?: string }> = [];
+                    const out: Array<{ text: string; imageUrl?: string }> = [];
           if (Array.isArray(p.messages)) {
             for (const m of p.messages.slice(0, 4)) {
               if (!m?.text?.trim()) continue;
-              let imageUrl: string | undefined;
-              if (m.image && imgMap[String(m.image).trim().toLowerCase()]) {
-                imageUrl = imgMap[String(m.image).trim().toLowerCase()];
-              }
-              out.push({ text: String(m.text).trim().slice(0, 1200), imageUrl });
+              // ✅ ไม่ตั้ง imageUrl จาก m.image — ปล่อย autoAttachImages จัดสรรรูป
+              // เหตุผล: AI มักให้ image ซ้ำกัน → ทำให้รูปซ้ำกัน → ต้องให้ระบบควบคุม
+              out.push({ text: String(m.text).trim().slice(0, 1200) });
             }
           }
           if (out.length === 0 && p.replyText?.trim()) {
@@ -4521,20 +4519,18 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         for (const k of ALL_IMAGE_KEYS) {
           if (imgMap[k] && !imageQueue.includes(k)) imageQueue.push(k);
         }
-                const autoAttachImages = (list: Array<{ text: string; imageUrl?: string }>): Array<{ text: string; imageUrl?: string }> => {
+                                const autoAttachImages = (list: Array<{ text: string; imageUrl?: string }>): Array<{ text: string; imageUrl?: string }> => {
           if (imageQueue.length === 0) return list;
-          // นับเท่านับจริง ๆ: imageUrl ต้องเป็น string ที่ชี้ไปยังรูปจริงใน imgMap (ไม่ใช่ undefined/empty)
-          const aiAttachedCount = list.filter(o => typeof o.imageUrl === 'string' && o.imageUrl.trim()).length;
-          // เคารพคำสั่ง AI เฉพาะเมื่อ AI ให้รูปครบตามจำนวนใน queue อยู่แล้ว → ไม่ต้องแนบซ้ำ
-          if (aiAttachedCount >= imageQueue.length) return list;
           if (list.length === 0) {
             return replyText.trim() ? [{ text: replyText.trim(), imageUrl: imgMap[imageQueue[0]] }] : [];
           }
-          // ข้ามรูปที่ AI ให้แล้ว แล้วกระจาย queue ที่เหลือให้ข้อความที่ยังไม่มีรูป
-          let queueIdx = aiAttachedCount;
+          // ✅ ใหม่: เสมอใช้ imageQueue จัดสรรใหม่ทุกครั้ง ไม่เคารพ imageUrl ที่ buildOutgoing ตั้ง
+          // เหตุผล: AI มักให้ image ซ้ำกัน (เช่น "main" ให้ทุกข้อความ) ทำให้รูปซ้ำ → ต้องให้
+          // ระบบควบคุมการกระจายเองตามลำดับ intent-first → main → detail → promotion → review → closing
+          // เพื่อให้ได้ชุด "ข้อความ→รูป→ข้อความ→รูป" ครบ ไม่ซ้ำ ไม่ข้าม
+          let queueIdx = 0;
           let reused = false;
           const mapped = list.map((o) => {
-            if (typeof o.imageUrl === 'string' && o.imageUrl.trim()) return o;
             let key: string;
             if (queueIdx < imageQueue.length) {
               key = imageQueue[queueIdx];
@@ -4551,7 +4547,24 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           }
           return mapped;
         };
-        outgoing = autoAttachImages(outgoing);
+                outgoing = autoAttachImages(outgoing);
+
+        // ✅ เติมข้อความสั้นให้ครอบคลุมรูปที่เหลือ: AI มักคืน 1-3 ข้อความ แต่มีรูปครบ 5 ใบ
+        // → ใช้ข้อความจาก sales_sequence_steps เติมให้ครอบคลุม imageQueue.length
+        if (imageQueue.length > outgoing.length) {
+          const seqStepsArr = (page.sales_sequence_steps || []) as any[];
+          for (let pad = outgoing.length; pad < imageQueue.length; pad++) {
+            const key = imageQueue[pad];
+            const stepNum = ALL_IMAGE_KEYS.indexOf(key) + 1;
+            const step = seqStepsArr.find(s => Number(s?.step_number) === stepNum);
+            const padText = (step?.text_content?.trim() || step?.image_url?.trim())
+              ? (step?.text_content?.trim() || 'รายละเอียดเพิ่มเติมค่ะ 👇')
+              : 'รายละเอียดเพิ่มเติมค่ะ 👇';
+            outgoing.push({ text: padText.slice(0, 1200) });
+          }
+          addLog('INFO', senderId, pageId, `📎 เติมข้อความสั้นให้ครอบคลุมรูปทั้งหมด → ส่ง ${imageQueue.length} ชุด (ข้อความ+รูป)`, 'INFO');
+        }
+
         // ข้อความรวมสำหรับ log/anti-repeat
         const combinedText = outgoing.map(o => o.text).join('\n•\n') || replyText;
         replyText = combinedText;
