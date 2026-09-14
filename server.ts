@@ -1243,7 +1243,7 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
 
   const info = AI_PROVIDERS[provider];
   const model = getProviderModel(provider);
-  const jsonInstruction = `${options.extraInstruction ? options.extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "messages": [{"text": "ข้อความสั้นๆ", "image": "main|detail|promotion|review|closing|"}], "sequenceStep": 1-6, "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}} — ตอบเป็น messages array (1-3 ข้อความ) เหมือนแอดมินส่งไล่กัน และแนบรูป (image) เมื่อพรีเซนสินค้าหรือโปรโมชั่น: main=รูปสินค้า detail=รายละเอียด promotion=โปรโมชั่น review=รีวิว closing=ปิดการขาย`;
+  const jsonInstruction = `${options.extraInstruction ? options.extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "messages": [{"text": "ข้อความสั้นๆ", "image": "main|detail|promotion|review|closing|"}], "sequenceStep": 1-6, "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}} — ตอบเป็น messages array เหมือนแอดมินส่งไล่กัน (บังคับ: 3-5 ข้อความสำหรับเจตนา PRICE/PROMOTION/NEGOTIATION/ORDER/TRUST — แต่ละข้อความพูดเรื่องละจุด เช่น ข้อ1 ตอบคำถาม ข้อ2 จุดขาย/ราคาโปร ข้อ3 ของแถม ข้อ4 รีวิว/การันตี ข้อ5 ปิดการขาย; 2-3 ข้อความสำหรับ GREETING/QUESTION/SHIPPING — และแนบรูป (image) เมื่อพรีเซนสินค้าหรือโปรโมชั่น: main=รูปสินค้า detail=รายละเอียด promotion=โปรโมชั่น review=รีวิว closing=ปิดการขาย`;
 
   const raw = await callOpenAiCompatible(provider, fullPrompt, model, maxOutputTokens, temperature, true)
     .catch(async (primaryErr: any) => {
@@ -2968,6 +2968,21 @@ async function startServer() {
     }
   }
 
+  // Upgraded step-image resolver: step ที่ตั้งรูปไว้ใช้รูปตัวเอง; step ที่รูปว่างจะ
+  // fallback ไปยังรูปสินค้าในช่องที่ตรง step_number (1=main,2=detail,3=promotion,
+  // 4=review,5=closing,6=step6) → ทุกสเต็ปมีรูปส่งจริง ไม่มี step แห้ง ๆ ("ส่งรูปไม่ครบ")
+  function resolveConfiguredStepImage(page: PageConfig, step: { image_url?: string; step_number?: number }): string {
+    const clear = (u: any) => (typeof u === 'string' ? u.trim() : '');
+    const own = clear(step?.image_url);
+    if (own) return own;
+    const slotMap: Record<number, string> = { 1: 'main', 2: 'detail', 3: 'promotion', 4: 'review', 5: 'closing', 6: 'step6' };
+    const slot = slotMap[Number(step?.step_number)];
+    if (!slot) return '';
+    const images = (page?.product?.images as any) || {};
+    const legacy = page?.product as any;
+    return clear(images?.[slot]) || clear(legacy?.[`image_${slot}`]) || '';
+  }
+
   async function sendConfiguredSequenceStep(page: PageConfig, recipientId: string, stepNumber: number, dedupe = false) {
     const step = page.sales_sequence_steps?.find(item => item.step_number === stepNumber);
     if (!step) {
@@ -2980,13 +2995,15 @@ async function startServer() {
       addLog('INFO', recipientId, page.page_id, `⏭️ ข้ามสเต็ป ${stepNumber}: เพิ่งส่งสเต็ปนี้ไปแล้วภายใน 6 ชม. (dedupe)`, 'INFO');
       return { sent: false, deduped: true };
     }
+    const effectiveImage = resolveConfiguredStepImage(page, step);
     const sentParts: string[] = [];
     if (step.type !== 'IMAGE' && step.text_content?.trim()) {
       await sendFacebookMessage(page.page_access_token || '', recipientId, step.text_content.trim());
       sentParts.push('ข้อความ✓');
+      if (effectiveImage) await sleep(300); // รักษาลำดับ ข้อความ→รูป ไม่ให้รูปแซง
     }
-    if (step.type !== 'TEXT' && step.image_url?.trim()) {
-      const imgRes = await sendFacebookImageSmart(page.page_access_token || '', recipientId, step.image_url.trim(), page.page_id);
+    if (step.type !== 'TEXT' && effectiveImage) {
+      const imgRes = await sendFacebookImageSmart(page.page_access_token || '', recipientId, effectiveImage, page.page_id);
       if (imgRes.success) {
         sentParts.push('รูป✓');
       } else {
@@ -2995,7 +3012,7 @@ async function startServer() {
       }
     }
     addLog('INFO', recipientId, page.page_id, `📤 สเต็ป ${stepNumber}: ${sentParts.join(' + ') || '(สเต็ปว่าง — ไม่มีข้อความ/รูป)'}`, sentParts.length ? 'SUCCESS' : 'WARNING');
-    return { sent: true };
+    return { sent: sentParts.length > 0 };
   }
 
   // Helper to reply to a Facebook Comment using Graph API
@@ -3060,11 +3077,44 @@ async function startServer() {
     }
   }
 
-  async function sendTelegramNotification(page: PageConfig, text: string) {
+  async function sendTelegramNotification(page: PageConfig, text: string, imageUrl?: string) {
     const token = decryptToken(page.telegram_bot_token || '');
     const chatId = page.telegram_chat_id || '';
     if (!token || !chatId) return { success: false, skipped: true, error: 'TELEGRAM_NOT_CONFIGURED' };
     try {
+      if (imageUrl && imageUrl.trim()) {
+        // Send photo with caption
+        const formData = new FormData();
+        if (/^https?:\/\//i.test(imageUrl.trim())) {
+          // Send via URL
+          const res = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/sendPhoto`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, photo: imageUrl.trim(), caption: text.slice(0, 1024) })
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.description || 'Telegram photo send failed');
+          return { success: true };
+        } else {
+          // Data URL - convert to buffer and send as file
+          const decoded = decodeDataUrl(imageUrl.trim());
+          if (decoded) {
+            const buffer = decoded.buffer;
+            const blob = new Blob([buffer], { type: decoded.mimeType });
+            formData.append('photo', blob, 'product.jpg');
+            formData.append('chat_id', chatId);
+            formData.append('caption', text.slice(0, 1024));
+            const res = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/sendPhoto`, {
+              method: 'POST',
+              body: formData
+            });
+            const data = await res.json();
+            if (!res.ok || !data.ok) throw new Error(data.description || 'Telegram photo send failed');
+            return { success: true };
+          }
+        }
+      }
+      // Fallback to text message
       const response = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text })
       });
@@ -3077,11 +3127,38 @@ async function startServer() {
     }
   }
 
-  async function sendLineNotification(page: PageConfig, text: string) {
+  async function sendLineNotification(page: PageConfig, text: string, imageUrl?: string) {
     const channelAccessToken = decryptToken(page.line_notify_token || '');
     const target = page.line_group_id || '';
     if (!channelAccessToken || !target) return { success: false, skipped: true, error: 'LINE_NOT_CONFIGURED' };
     try {
+      if (imageUrl && imageUrl.trim()) {
+        // LINE Notify supports image messages with originalContentUrl and previewImageUrl
+        const res = await fetch('https://api.line.me/v2/bot/message/push', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${channelAccessToken}` },
+          body: JSON.stringify({
+            to: target,
+            messages: [
+              {
+                type: 'image',
+                originalContentUrl: imageUrl.trim(),
+                previewImageUrl: imageUrl.trim()
+              },
+              {
+                type: 'text',
+                text: text.slice(0, 5000)
+              }
+            ]
+          })
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.message || `LINE API HTTP ${res.status}`);
+        }
+        return { success: true };
+      }
+      // Fallback to text-only message
       const response = await fetch('https://api.line.me/v2/bot/message/push', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${channelAccessToken}` },
@@ -4089,7 +4166,7 @@ async function startServer() {
           );
 
           if (commentId) {
-            await sleep(commentDelay); // human-like pacing before replying publicly
+            await sleep(Math.min(commentDelay, 500)); // ตอบไวขึ้น แต่ยัง human-like ไม่โผล่ทันทีเหมือนบอท
             await sendFacebookCommentReply(page.page_access_token || '', commentId, replyText);
           }
 
@@ -4097,13 +4174,14 @@ async function startServer() {
           const autoInboxMsg = `สวัสดีค่ะคุณลูกค้า สนใจ ${page.product?.product_name || 'สินค้า'} แอดมินส่งรายละเอียดและของแถมพิเศษให้ในแชทนี้แล้วนะคะ 🙏`;
           addLog('AI_REPLY', senderId, pageId, `📨 ส่งข้อความทัก Inbox: "${autoInboxMsg}"`, 'SUCCESS');
 
-          await sleep(commentDelay);
+          await sleep(Math.min(commentDelay, 500));
           await sendFacebookMessage(page.page_access_token || '', senderId, autoInboxMsg);
 
           // Deliver the configured comment reply images into the customer's inbox
           // (previously they were only counted in the log but never sent).
+          // (Upgraded) ระหว่างรูปแต่ละใบเว้น 400ms พอรักษาลำดับ — ไม่รอ commentDelay ทั้งหมด (กันตอบช้า)
           for (const imgUrl of replyImages) {
-            await sleep(commentDelay);
+            await sleep(400);
             const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl.trim(), pageId);
             if (!imgRes.success) {
               addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปคอมเมนต์เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
@@ -4112,14 +4190,20 @@ async function startServer() {
 
           // Sales Sequence Auto-Trigger also applies to comments: a commenter with
           // purchase intent ("สนใจ" etc.) gets the full configured step sequence.
-          const sequenceSteps = (page.sales_sequence_steps || []).filter(s => s && (s.text_content?.trim() || s.image_url?.trim()));
+          // (Upgraded) เก็บ step ที่มีข้อความหรือรูปจริง (รวมรูป fallback จากสินค้า);
+          // หลังส่งครบ แล้ว mark cooldown 24ชม. + mark แต่ละ step (dedupe 6ชม.)
+          // → ลูกค้าคนเดิมทัก Inbox ตามมา จะได้เพียงคำตอบ AI ไม่ถูกยัดชุดสเต็ปซ้ำ
+          const sequenceSteps = (page.sales_sequence_steps || []).filter(s => s && (s.text_content?.trim() || s.image_url?.trim() || resolveConfiguredStepImage(page, s)));
           if (hasPurchaseIntent && page.sales_sequence_auto_trigger && sequenceSteps.length > 0) {
             addLog('COMMENT', senderId, pageId, `🚀 Sales Sequence Auto-Trigger (คอมเมนต์): ส่ง ${sequenceSteps.length} ขั้นตอนเข้า Inbox`, 'SUCCESS');
             const ordered = [...sequenceSteps].sort((a, b) => a.step_number - b.step_number);
             for (const step of ordered) {
-              await sleep(Math.max(step.delay_seconds ? step.delay_seconds * 1000 : 0, commentDelay));
+              const stepDelay = Number(step.delay_seconds) > 0 ? Math.min(Number(step.delay_seconds) * 1000, 1500) : Math.min(commentDelay, 800);
+              await sleep(stepDelay);
               await sendConfiguredSequenceStep(page, senderId, step.step_number);
+              markSequenceStepSent(pageId, senderId, step.step_number);
             }
+            sequencePresentationLog.set(`${pageId}:${senderId}`, Date.now());
           }
         }
         return;
@@ -4354,13 +4438,17 @@ ${usedRepliesText}
 6. ปิดท้ายทุกข้อความด้วยคำถามสั้นๆ ชวนตัดสินใจหรือชวนคุยต่อ (เช่น "เอาแพ็กนี้เลยไหมคะ" / "สนใจแบบไหนคะ") — ยกเว้นตอนลูกค้ากำลังส่งข้อมูลที่อยู่
 7. ถ้าลูกค้าให้ชื่อ/เบอร์โทร/ที่อยู่ ให้จดจำใช้ตลอดบทสนทนา ไม่ต้องถามซ้ำสิ่งที่ลูกค้าบอกไปแล้ว
 8. ⛔ ความแม่นยำสำคัญที่สุด: ตอบเฉพาะข้อมูลที่มีอยู่ในระบบเท่านั้น — ห้ามเด็ดขาดที่จะแต่งราคา สเปก โปรโมชั่น โบนัส ระยะเวลา หรือนโยบายที่ไม่มีในข้อมูลด้านล่าง ถ้าลูกค้าถามสิ่งที่ไม่มีข้อมูล ให้ตอบสุภาพว่า "เรื่องนี้ขอตรวจสอบกับแอดมินก่อนนะคะ แอดมินจะตามกลับโดยเร็ว" แล้วชวนคุยเรื่องที่มีข้อมูลแทน
-9. 🏆 โหมดนักขายมืออาชีพ: เมื่อลูกค้าแสดงความสนใจ (ถามราคา/โปร/บอกสนใจ/ต่อรอง) ต้องพรีเซนเต็มรูปแบบในข้อความเดียว: จุดขายหลัก → ราคาปกติ vs ราคาโปร (โชว์ส่วนลด) → ของแถม/สิทธิพิเศษ → ปิดแบบให้ลูกค้าเลือกแพ็ก เขียนสั้น แบ่งบรรทัดแบบแชทจริง อ่านง่าย ไม่เกิน 4-5 บรรทัด
+9. 🏆 โหมดนักขายมืออาชีพ: เมื่อลูกค้าแสดงความสนใจ (ถามราคา/โปร/บอกสนใจ/ต่อรอง) ต้องพรีเซนเต็มรูปแบบ โดยแบ่งเป็น 3-4 ข้อความส่งไล่กันเหมือนแอดมินจริง: ข้อความ 1 จุดขายหลัก → ข้อความ 2 ราคาปกติ vs ราคาโปร (โชว์ส่วนลด) → ข้อความ 3 ของแถม/สิทธิพิเศษ → ข้อความ 4 ปิดแบบให้ลูกค้าเลือกแพ็ก แต่ละข้อความเขียนสั้น แบ่งบรรทัดแบบแชทจริง อ่านง่าย ไม่เกิน 3-4 บรรทัดต่อข้อความ
 10. 🎯 เทคนิคปิดการขาย: ใช้ Choice Close (ให้ลูกค้าเลือกระหว่างแพ็ก ไม่ใช่เลือกว่าจะซื้อไหม) เช่น "เอาแพ็กเดี่ยวหรือแพ็กคู่ดีคะ" + ใช้ความเร่งด่วนจากโปรจริงเท่านั้น (เช่น "โปรรอบนี้เท่านั้น") + ลูกค้าถามอะไรก็ตอบจากข้อมูลจริงแล้วดึงกลับสู่การปิดการขายเสมอ
-11. 🎨 จัดรูปแบบข้อความให้สวยงามอ่านง่ายเหมือนแอดมินมืออาชีพ: ใช้บรรทัดสั้น เว้นบรรทัด (\n) แยกหัวข้อชัดเจน ใช้อิโมจินำหน้าบรรทัด เช่น 🔥 ชื่อสินค้า / ✅ จุดเด่น / 💰 ราคาปกติ → ราคาโปร / 🎁 ของแถม / 🚚 ส่งของ / ⭐ การันตี — ห้ามยัดทุกอย่างในบรรทัดเดียวให้ดูรก และตอบเป็นหลายข้อความต่อเนื่อง (messages array) เหมือนแอดมินจริงที่ส่งไล่ ๆ กัน
+11. 🎨 จัดรูปแบบข้อความให้สวยงามอ่านง่ายเหมือนแอดมินมืออาชีพ: ใช้บรรทัดสั้น เว้นบรรทัด (\n) แยกหัวข้อชัดเจน ใช้อิโมจินำหน้าบรรทัด เช่น 🔥 ชื่อสินค้า / ✅ จุดเด่น / 💰 ราคาปกติ → ราคาโปร / 🎁 ของแถม / 🚚 ส่งของ / ⭐ การันตี — ห้ามยัดทุกอย่างในบรรทัดเดียวให้ดูรก และตอบเป็นหลายข้อความต่อเนื่อง (messages array 3-5 ข้อความเมื่อกำลังขาย) เหมือนแอดมินจริงที่ส่งไล่ ๆ กัน
 12. 📸 การแนบรูป (สำคัญ): ระบบจะแนบรูปให้อัตโนมัติตามเจตนาและรูปที่ตั้งไว้ในหน้าแก้ไขเพจ — ไม่จำเป็นต้องใส่ field "image" ใน messages array (ระบบใช้เป็นข้อมูลอ้างอิงเท่านั้น ไม่ใช่คำสั่งสุดท้าย) รูปที่แนบได้ 5 แบบ: main (รูปสินค้า) / detail (รูปรายละเอียด) / promotion (รูปโปรโมชั่น) / review (รูปรีวิว) / closing (รูปปิดการขาย)
 13. 💰 ค่าส่ง (สำคัญ): เมื่อลูกค้าถาม "ค่าส่ง / ส่งฟรีไหม / เก็บเงินปลายทาง" ให้ตอบจากข้อมูล 🚚 การจัดส่ง ด้านล่างเท่านั้น ถ้า "ค่าส่ง (shipping_fee)" ยังไม่ได้ตั้งค่าไว้ → ตอบว่า "ค่าขนส่งคิดตามพื้นที่/น้ำหนักค่ะ ขอตรวจสอบกับแอดมินให้ก่อนนะคะ" แล้วชวนคุยเรื่องอื่น — ห้ามเดาตัวเลขค่าส่ง ห้ามบอกว่า "ส่งฟรี" เว้นแต่ shipping_fee = ฟรีหรือแพ็กเกจที่ free_shipping = true
 14. 👑 ลูกค้าเก่าที่เคยสั่งซื้อแล้ว (สถานะ ⭐ ลูกค้าเก่า): ต้องใช้โทนอบอุ่นแบบรู้จักกัน (เช่น "ขอบคุณที่กลับมาอุดหนุนอีกนะคะ") แล้วตอบตรงคำถามที่ถามเท่านั้น ห้ามพรีเซนสเต็ปขาย/ยัดโปรโมชั่นซ้ำ เว้นแต่ลูกค้าแสดงความสนใจสั่งซื้อเพิ่มเอง จึงเสนอโปรสั้น ๆ ได้
 15. 🛑 ห้ามตอบแบบสเต็ปสคริปต์: ทุกคำตอบต้องเจาะจงกับคำถามล่าสุดของลูกค้า ด้วยถ้อยคำใหม่ — ห้ามยัดสเต็ป 1-6 เรียงเป็นชุด ห้ามลอกข้อความเปิดสเต็ป 1 ซ้ำ เมื่อลูกค้าถามเรื่องใดก็ตอบเรื่องนั้นก่อนเสมอ
+16. 💬 เทคนิคชวนคุยต่อ (แอดมิน AI มือโปร): ถ้าลูกค้าตอบสั้น ๆ/ขอบคุณ/ลังเล (เช่น "ครับ", "โอเค", "ขอบคุณ", "เดี๋ยวก่อน", "อืม") ห้ามจบบทสนทนาที่นั่น — ให้ทวน/ยืนยันสิ่งที่ลูกค้าสนใจ แล้วชวนคุยต่อด้วยคำถามที่เปิดโอกาสการซื้อเพิ่ม เช่น "สะดวกแบบไหนคะ เดี๋ยวจัดให้เลย / มีแพ็กที่คุ้มกว่าค่ะ" โดยไม่กดดัน ใช้โทนเอ็นดูเหมือนแอดมินจริง
+17. 👂 อ่านอารมณ์ลูกค้า: ถ้าลูกค้าดูเอะใจ/สงสัย/ลังเล ให้ตอบข้อกังวลก่อนอย่างเห็นอกเห็นใจแล้วค่อยเสนอทางออก ถ้าลูกค้าตัดสินใจชัดเจนแล้ว ให้สบายใจ ยืนยันขั้นตอนการสั่งซื้อให้สั้นกระชับ ไม่ยื้อ
+18. 🔁 ความหลากหลายของประโยค: ห้ามใช้คำเปิด/คำปิดซ้ำกันติด ๆ กันหลายรอบต่อเนื่อง (เช่น "ได้เลยค่า", "รับสิทธิ์ได้เลยนะคะ") — เปลี่ยนวิธีพูดทุกครั้ง อ้างอิงสิ่งที่ลูกค้าพูดเป็นหลัก เพื่อให้บทสนทนาดูเหมือนคนจริงคุยกับคนจริง
+19. ✍️ ตอบแบบแชทจริง: พิมพ์เป็นภาษาไทยอ่านง่าย ใช้เว้นบรรทัด/อิโมจิน้อย ๆ (ไม่เกิน 1-2 ต่อข้อความ) แบบแอดมินมือถือ ไม่เป็นทางการเกิน ไม่ใช้ภาษาเขียนยาวเหยียด
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
@@ -4430,7 +4518,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         }
         // Provider-aware AI call: capped by the timeout race inside
         // generateAiJson (primary model + fast retry) before any fallback.
-        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.5, maxOutputTokens: 1024, mediaParts });
+        const { parsed, model: usedModel, latencyMs: aiLatencyMs } = await generateAiJson(promptContext, { temperature: 0.5, maxOutputTokens: 2048, mediaParts });
         const selectedModel = usedModel;
 
         let intent = parsed.intent === 'ORDER' || parsed.isOrderDetected ? 'ORDER' : 'QUESTION';
@@ -4477,7 +4565,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         const buildOutgoing = (p: any): Array<{ text: string; imageUrl?: string }> => {
                     const out: Array<{ text: string; imageUrl?: string }> = [];
           if (Array.isArray(p.messages)) {
-            for (const m of p.messages.slice(0, 4)) {
+            // (Upgraded) รับได้ถึง 6 ข้อความ — ตรงกับรูป 5 ใบ + ข้อความปิดการขาย
+            for (const m of p.messages.slice(0, 6)) {
               if (!m?.text?.trim()) continue;
               // ✅ ไม่ตั้ง imageUrl จาก m.image — ปล่อย autoAttachImages จัดสรรรูป
               // เหตุผล: AI มักให้ image ซ้ำกัน → ทำให้รูปซ้ำกัน → ต้องให้ระบบควบคุม
@@ -4547,23 +4636,32 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           }
           return mapped;
         };
-                outgoing = autoAttachImages(outgoing);
-
-        // ✅ เติมข้อความสั้นให้ครอบคลุมรูปที่เหลือ: AI มักคืน 1-3 ข้อความ แต่มีรูปครบ 5 ใบ
-        // → ใช้ข้อความจาก sales_sequence_steps เติมให้ครอบคลุม imageQueue.length
-        if (imageQueue.length > outgoing.length) {
-          const seqStepsArr = (page.sales_sequence_steps || []) as any[];
-          for (let pad = outgoing.length; pad < imageQueue.length; pad++) {
-            const key = imageQueue[pad];
-            const stepNum = ALL_IMAGE_KEYS.indexOf(key) + 1;
-            const step = seqStepsArr.find(s => Number(s?.step_number) === stepNum);
-            const padText = (step?.text_content?.trim() || step?.image_url?.trim())
-              ? (step?.text_content?.trim() || 'รายละเอียดเพิ่มเติมค่ะ 👇')
-              : 'รายละเอียดเพิ่มเติมค่ะ 👇';
-            outgoing.push({ text: padText.slice(0, 1200) });
+                // ✅ (Upgraded) รวม auto-attach + padding เป็นฟังก์ชันเดียว — เรียกใหม่ได้ทุกครั้ง
+        // ที่ outgoing ถูก rebuild (PRICE GUARD / anti-repeat regeneration) เพื่อกัน
+        // "ตอบได้แค่ 2 ข้อความ 2 รูป" เมื่อ AI ตอบสั้นหรือคำตอบถูกสร้างใหม่
+        const applyImageSpread = (list: Array<{ text: string; imageUrl?: string }>): Array<{ text: string; imageUrl?: string }> => {
+          let spread = autoAttachImages(list);
+          const salesIntents = ['PRICE', 'PROMOTION', 'NEGOTIATION', 'ORDER', 'TRUST', 'FOLLOWUP'];
+          const minOutgoing = salesIntents.includes(intentHint) || salesIntents.includes(String(parsed.intent || '').toUpperCase())
+            ? 5
+            : 3;
+          const targetOutgoing = Math.min(6, Math.max(imageQueue.length, minOutgoing));
+          if (targetOutgoing > spread.length) {
+            const seqStepsArr = (page.sales_sequence_steps || []) as any[];
+            for (let pad = spread.length; pad < targetOutgoing; pad++) {
+              const key = imageQueue.length ? imageQueue[pad % imageQueue.length] : undefined;
+              const stepNum = key ? ALL_IMAGE_KEYS.indexOf(key) + 1 : pad + 1;
+              const step = seqStepsArr.find(s => Number(s?.step_number) === stepNum);
+              const padText = (step?.text_content?.trim() || step?.image_url?.trim())
+                ? (step?.text_content?.trim() || 'รายละเอียดเพิ่มเติมค่ะ 👇')
+                : 'รายละเอียดเพิ่มเติมค่ะ 👇';
+              spread.push({ text: padText.slice(0, 1200), imageUrl: key ? imgMap[key] : undefined });
+            }
+            addLog('INFO', senderId, pageId, `📎 เติมข้อความให้ตอบครบชุด → ส่ง ${spread.length} ชุด (ข้อความ+รูป) | เป้าขั้นต่ำ ${minOutgoing} ชุด | รูปใน DB ${imageQueue.length} ใบ${spread.length > imageQueue.length ? ' (วนใช้รูปซ้ำบางชุด)' : ''}`, 'INFO');
           }
-          addLog('INFO', senderId, pageId, `📎 เติมข้อความสั้นให้ครอบคลุมรูปทั้งหมด → ส่ง ${imageQueue.length} ชุด (ข้อความ+รูป)`, 'INFO');
-        }
+          return spread;
+        };
+        outgoing = applyImageSpread(outgoing);
 
         // ข้อความรวมสำหรับ log/anti-repeat
         const combinedText = outgoing.map(o => o.text).join('\n•\n') || replyText;
@@ -4592,7 +4690,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             extraInstruction: `⛔ ข้อความก่อนหน้าใส่ราคาที่ไม่มีในระบบ (${priceNumbers.join(',')}) — ผิดกฎ! อนุญาตเฉพาะราคาเหล่านี้เท่านั้น: ${allowedText} บาท ห้ามใช้ตัวเลขอื่นนอกจากนี้เด็ดขาด ตอบใหม่อีกครั้งอย่างถูกต้อง`
           });
           const rebuilt = buildOutgoing(guardResult.parsed);
-          if (rebuilt.length) outgoing = rebuilt;
+          // (Upgraded) applyImageSpread ซ้ำ — กันชุดรูป/ข้อความเติมหายเมื่อคำตอบถูก rebuild
+          if (rebuilt.length) outgoing = applyImageSpread(rebuilt);
           replyText = outgoing.map(o => o.text).join('\n•\n');
           parsed.orderData = { ...(parsed.orderData || {}), ...(guardResult.parsed.orderData || {}) };
           const stillBad = (replyText.match(/฿\s?([\d,]+)/g) || []).map(s => Number(s.replace(/[฿,\s]/g, ''))).some(n => !allowedPrices.includes(n));
@@ -4630,7 +4729,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             });
             const regenParsed: any = regenResult.parsed;
             const regenOut = buildOutgoing(regenParsed);
-            if (regenOut.length) outgoing = regenOut;
+            // (Upgraded) applyImageSpread ซ้ำ — กันชุดรูป/ข้อความเติมหายเมื่อคำตอบถูก regenerate
+            if (regenOut.length) outgoing = applyImageSpread(regenOut);
             replyText = regenOut.map(o => o.text).join('\n•\n') || (regenParsed.replyText || replyText);
             intent = regenParsed.intent === 'ORDER' || regenParsed.isOrderDetected ? 'ORDER' : intent;
             regenerationCount++;
@@ -4691,8 +4791,9 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         );
 
         // เตรียมชุดสเต็ปที่จะส่ง (เฉพาะสเต็ปที่มีข้อความ/รูป) + ตรวจว่า "sequence กำลังจะ fire"
+        // (Upgraded) รวม step ที่ได้รูปจาก fallback สินค้า (resolveConfiguredStepImage) ด้วย — กัน "ส่งรูปไม่ครบ"
         const sequenceStepsToSend = (page.sales_sequence_steps || [])
-          .filter(s => s && (s.text_content?.trim() || s.image_url?.trim()))
+          .filter(s => s && (s.text_content?.trim() || s.image_url?.trim() || resolveConfiguredStepImage(page, s)))
           .sort((a, b) => a.step_number - b.step_number);
         const sequenceWillFire = shouldTriggerSalesSequence && sequenceStepsToSend.length > 0;
 
@@ -4705,7 +4806,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         const shouldPresentFullSequence = sequenceWillFire && !presentedRecently;
 
         // Send the AI answer with human-like pacing
-        await sleep(pageDelay);
+        // (Upgraded) cap 2.5s — pageDelay ที่ตั้งสูง ไม่ต้องรอทั้ง 30 วิ ก่อนตอบ
+        await sleep(Math.min(pageDelay, 2500));
 
         // ── ส่งแบบแอดมินจริง (แบบเดิม + อัปเกรด) ──
         // AI ตอบ "ทุกครั้ง" — ไม่ข้ามข้อความ AI อีกต่อไป (ต้นเหตุ "ตอบแค่ข้อความเดียวแล้วเงียบ")
@@ -4732,7 +4834,9 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           } catch (sendErr: any) {
             addLog('AI_REPLY', senderId, pageId, `⚠️ ส่งข้อความ/รูป ${i + 1}/${outgoing.length} ผิดพลาด (ข้ามไปก่อน): ${sendErr?.message || sendErr}`, 'WARNING');
           }
-          if (!isLast && pageDelay > 0) await sleep(Math.min(600, pageDelay));
+          // (Upgraded) มี gap ระหว่างข้อความเสมอ เพื่อรักษาลำดับข้อความ→รูปให้ถูกต้อง
+          // (pageDelay > 0 → ใช้ไม่เกิน 500ms; pageDelay = 0 → gap สั้น 300ms กันข้อความพร่องลำดับ)
+          if (!isLast) await sleep(pageDelay > 0 ? Math.min(500, pageDelay) : 300);
           try { dbService.addChatMessage(pageId, senderId, 'admin', msg.text); } catch { /* non-critical */ }
         }
         // Remember what we answered for the conversation memory + anti-repeat.
@@ -4742,19 +4846,28 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // "ข้อความก่อน → รูปตาม" อยู่แล้วใน sendConfiguredSequenceStep
         // ⏱️ delay ต่อสเต็ปถูกจำกัดไม่เกิน 5 วิ — กันช่องเงียบยาว (ต้นเหตุ "ส่งแล้วเงียบ")
         if (!shouldTriggerSalesSequence && isNewCustomer) {
-          // auto-trigger ปิด: ส่งสเต็ป 1 (ข้อความเปิด) เฉพาะลูกค้าใหม่ครั้งแรก (dedupe กันซ้ำ 6 ชม.)
-          await sendConfiguredSequenceStep(page, senderId, 1, true);
+          // auto-trigger ปิด: ลูกค้าใหม่ครั้งแรก — AI ตอบข้อความไปแล้ว ส่งเฉพาะรูปประจำ
+          // สเต็ป 1 ต่อท้าย (กันจอเงียบ) ไม่ต้องทักข้อความเปิดซ้ำที่ AI เพิ่งเขียน
+          const step1Img = resolveConfiguredStepImage(page, { step_number: 1 });
+          if (step1Img) {
+            const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, step1Img, pageId);
+            if (imgRes.success) addLog('AI_REPLY', senderId, pageId, '🖼️ ส่งรูปเปิดบทสเต็ป 1 ต่อท้ายคำตอบแรก สำเร็จ', 'SUCCESS');
+            else addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปเปิดบทสเต็ป 1 ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+          }
+          markSequenceStepSent(pageId, senderId, 1); // dedupe 6ชม. ไม่ส่งซ้ำรอบถัดไป
         }
 
         if (shouldPresentFullSequence) {
           sequencePresentationLog.set(presentationKey, Date.now()); // mark พรีเซนแล้ว (24 ชม.)
           addLog('INFO', senderId, pageId, `🚀 Sales Sequence Auto-Trigger: พรีเซนลำดับการขายทั้งหมด ${sequenceStepsToSend.length} ขั้นตอน (ครั้งแรก/สนใจซื้อจริง)`, 'SUCCESS');
           for (const step of sequenceStepsToSend) {
-            const rawStepDelayMs = Number(step.delay_seconds) > 0 ? Number(step.delay_seconds) * 1000 : pageDelay;
-            const stepDelayMs = Math.min(rawStepDelayMs, 5000);
+            // (Upgraded) delay ต่อสเต็ป cap 2.5s (เดิม 5s) — ตอบเร็วขึ้นแต่ยังเป็นจังหวะธรรมชาติ
+            const rawStepDelayMs = Number(step.delay_seconds) > 0 ? Number(step.delay_seconds) * 1000 : Math.min(pageDelay, 1500);
+            const stepDelayMs = Math.min(rawStepDelayMs, 2500);
             await sleep(stepDelayMs);
             try {
               await sendConfiguredSequenceStep(page, senderId, step.step_number);
+              markSequenceStepSent(pageId, senderId, step.step_number); // mark กันซ้ำทั้งชุด (dedupe 6ชม.)
             } catch (seqErr: any) {
               addLog('INFO', senderId, pageId, `⚠️ ส่งสเต็ป ${step.step_number} ผิดพลาด (ข้ามไปก่อน): ${seqErr?.message || seqErr}`, 'WARNING');
             }
@@ -4870,7 +4983,9 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             }
           }
         } catch { /* รูปไม่สำคัญพอจะทำให้ fallback ล้ม */ }
-        await sendConfiguredSequenceStep(page, senderId, 1, true);
+        // (Upgraded) fallback ตอบข้อความ+รูป main ไปแล้ว — ไม่ส่ง step1 เต็ม (text) ซ้ำ
+        // แค่ mark ว่าส่งแล้ว (dedupe 6ชม.) เพื่อลูกค้าจะไม่ได้ข้อความเปิดซ้ำตอนทักรอบถัดไป
+        markSequenceStepSent(pageId, senderId, 1);
       }
 
       persistData();
@@ -7006,8 +7121,7 @@ ${String(rawText).slice(0, 12000)}
 ${convo}
 สินค้าจริง: ${prod.product_name || page.page_name} ราคาโปร ฿${Number(prod.display_price) || 0}${promoLines ? ' | แพ็ก: ' + promoLines : ''}
 สไตล์ข้อความรอบนี้: ${next.style}
-เขียนข้อความติดตาม 1 ข้อความ: สั้น 1-3 บรรทัด เป็นมนุษย์แอดมินจริง อ้างอิงประเด็นที่ลูกค้าถามค้างไว้ ใช้ราคา/โปรจริงเท่านั้นห้ามมั่ว จบด้วยคำถามชวนตัดสินใจ
-ตอบ JSON เท่านั้น: {"followupText": "..."}`;
+เขียนข้อความติดตาม 1 ข้อความ: สั้น 1-3 บรรทัด เป็นมนุษย์แอดมินจริง อ้างอิงจุดที่ลูกค้ายังสงสัย/ถามค้างไว้อย่างเจาะจง (เช่น \"ที่ถามเรื่องขนาด/ราคาไว้\") ใช้ราคา/โปรจริงเท่านั้นห้ามมั่ว ปิดท้ายด้วยคำถามที่ทำให้ลูกค้าตอบกลับง่าย เช่น เลือกแพ็ก/ถามต่อ/ยืนยันการจัดส่ง — ห้ามกดดันรุนแรง ห้ามเขียนยาว ห้ามทักแบบพร้อมท์ซ้ำกับรอบก่อน\nตอบ JSON เท่านั้น: {"followupText": "..."}`;
           try {
             const r = await generateAiJson(prompt, { temperature: 0.6, maxOutputTokens: 400 });
             followText = String(r.parsed.followupText || '').trim();
@@ -7026,6 +7140,15 @@ ${convo}
           continue;
         }
         try { await dbService.addChatMessage(page.page_id, senderId, 'admin', followText); } catch { /* non-critical */ }
+        // (อัปเกรด) แนบรูปสินค้าประจำสเต็ป 1 (main) กำกับข้อความติดตาม เพื่อให้ลูกค้าเห็น
+        // สินค้า/โปรชัดเจนอีกครั้ง — คล้ายแอดมินจริงส่งภาพตามหลังข้อความ
+        try {
+          const followImg = resolveConfiguredStepImage(page, { step_number: 1 });
+          if (followImg) {
+            const imgS = await sendFacebookImageSmart(page.page_access_token || '', senderId, followImg, page.page_id);
+            if (!imgS.success) addLog('FOLLOW_UP', senderId, page.page_id, `⚠️ แนบรูป follow-up ไม่สำเร็จ: ${imgS.error}`, 'WARNING');
+          }
+        } catch { /* รูปไม่สำคัญพอจะทำให้ follow-up ล้ม */ }
         await dbService.updateConversationState(page.page_id, senderId, {
           followup_level: next.level,
           followup_at: new Date().toISOString()
