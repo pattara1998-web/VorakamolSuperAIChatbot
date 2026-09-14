@@ -442,7 +442,7 @@ const SEQUENCE_PRESENTATION_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 // (Upgraded) บันทึก "ข้อความ/รูปที่ส่งจริง" ต่อ page:sender ล่าสุด — เพื่อให้
 // /api/simulate คืนผลลัพธ์ตรงกับที่ลูกค้าจะได้รับจริง (แก้ Live Simulator
-// โชว์ข้อความ fake 1 ข้อความ + ราคาเริ่มต้น 990 ที่ไม่ตรงกับ AI จริง)
+// โชว์ข้อความ fake 1 ข้อความ + ราคาปลอมที่ไม่ตรงกับ AI จริง)
 const simulatedSentReplies = new Map<string, Array<{ text: string; imageUrl?: string; timestamp: string }>>();
 function recordSimulatedSend(pageId: string, senderId: string, text: string, imageUrl?: string) {
   try {
@@ -4809,15 +4809,14 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         const quickReplies = page.quick_replies || [];
         const shouldSendQuickReplies = quickReplies.length > 0;
 
-        // ── Sales Sequence trigger ──
-        // พรีเซนสเต็ปขาย เฉพาะลูกค้าที่ยังไม่เคยสั่งซื้อ (!isReturningCustomer):
-        //   - ทักครั้งแรก (isNewCustomer) + เปิด auto-trigger → พรีเซนเต็มชุด
-        //   - แสดงความสนใจซื้อจริง + เปิด auto-trigger → พรีเซนเต็มชุด
-        // ลูกค้าเก่าที่เคยสั่งซื้อแล้ว → ไม่พรีเซน ตอบตรงคำถามเท่านั้น
+        // ── Sales Sequence trigger (ระบบคีย์เวิร์ด) ──
+        // (Upgraded) ลูกค้าพิมพ์คีย์เวิร์ดความสนใจ (สนใจ/อยากได้/ซื้อ ฯลฯ) → ยิงสเต็ปขายทันที
+        // ไม่ต้องรอเปิด auto-trigger เฉพาะทักครั้งแรกอีกต่อไป
+        // ลูกค้าเก่าที่เคยสั่งซื้อแล้ว → ไม่พรีเซนชุดเต็ม ตอบตรงคำถามเท่านั้น
         const autoTrigger = page.sales_sequence_auto_trigger === true;
         const shouldTriggerSalesSequence = !isReturningCustomer && (
           (isNewCustomer && autoTrigger) ||
-          (autoTrigger && hasStrongPurchaseIntent)
+          hasStrongPurchaseIntent
         );
 
         // เตรียมชุดสเต็ปที่จะส่ง (เฉพาะสเต็ปที่มีข้อความ/รูป) + ตรวจว่า "sequence กำลังจะ fire"
@@ -4915,7 +4914,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         if (intent === 'ORDER' || (parsed.orderData && (parsed.orderData.phone_number || parsed.orderData.address))) {
           const od = parsed.orderData || {};
           const qty = Number(od.quantity) || 1;
-          const unitPrice = Number(od.unit_price) || Number(page.product?.display_price || matchedProduct.display_price) || 990;
+          const unitPrice = Number(od.unit_price) || Number(page.product?.display_price || matchedProduct.display_price) || 0;
           const totalAmount = od.total_amount || qty * unitPrice;
           const custName = (od.customer_name || customer.customer_name || '').trim();
           const phone = String(od.phone_number || customer.phone_number || '').replace(/\D/g, '');
@@ -6987,7 +6986,7 @@ ${String(rawText).slice(0, 12000)}
       phone_number: sample_order?.phone || '0927015995',
       items: sample_order?.item || `${basePage.product?.product_name || 'กล้องส่องพระแบบเซียน'} 1 ชุด`,
       quantity: 1,
-      total_amount: sample_order?.total || 990,
+      total_amount: sample_order?.total || Number(basePage.product?.display_price) || 0,
       payment_status: 'PENDING',
       created_at: new Date().toISOString(),
       tracking_number: 'TH999888777FL',
@@ -7284,7 +7283,7 @@ ${convo}
   app.post('/api/simulate', async (req: Request, res: Response) => {
     const { event_type, sender_id, page_id, message_text, comment_id } = req.body;
     // (Upgraded) คืน "ข้อความ/รูปที่ส่งจริง" จาก AI pipeline ให้ Live Simulator แสดงผล
-    // ตรงกับที่ลูกค้าจะได้รับ (กันข้อความ fake 1 ข้อความ + ราคา 990 ในฝั่ง UI)
+    // ตรงกับที่ลูกค้าจะได้รับ (กันข้อความ fake 1 ข้อความ + ราคาปลอมในฝั่ง UI)
     const simPageId = page_id || 'AMULET_PAGE_ID';
     const simSenderId = sender_id || `PSID_${Math.floor(1000000000 + Math.random() * 9000000000)}`;
     simulatedSentReplies.delete(`${simPageId}:${simSenderId}`);
