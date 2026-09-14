@@ -463,6 +463,49 @@ function stripStartingPricePhrasing(text: string): string {
     .replace(/เริ่มต้น\s*฿/g, 'ราคา ฿');
 }
 
+// (Upgraded) จับคีย์เวิร์ดแบบทนพิมพ์ผิด — ลูกค้าอาจพิมพ์ "สนใต" "สนจัย" "สนใจ้"
+// normalizeThai: ตัดวรรณยุกต์/สระบน-ล่างออกก่อนเทียบ (สนใจ้ = สนใจ)
+function normalizeThai(text: string): string {
+  return String(text || '').replace(/[\u0E31\u0E34-\u0E3A\u0E47-\u0E4E]/g, '');
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev: number[] = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const curr: number[] = [i];
+    for (let j = 1; j <= b.length; j++) {
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = curr;
+  }
+  return prev[b.length];
+}
+
+// เทียบคีย์เวิร์ดกับข้อความแบบทนพิมพ์ผิด: exact substring ก่อน (เร็ว)
+// แล้ว sliding window (ยาว kw ±1 ตัวอักษร) + Levenshtein
+// (≤1 สำหรับคำสั้น ≤4 ตัว / ≤2 สำหรับคำยาว) บนข้อความ normalized
+function fuzzyKeywordMatch(text: string, keyword: string): boolean {
+  const rawKw = String(keyword || '').trim().toLowerCase();
+  if (!rawKw) return false;
+  const rawText = String(text || '').toLowerCase();
+  if (rawText.includes(rawKw)) return true;
+  const t = normalizeThai(rawText);
+  const kw = normalizeThai(rawKw);
+  if (!kw || t.includes(kw)) return kw ? t.includes(kw) : false;
+  const maxDist = kw.length <= 4 ? 1 : 2;
+  if (t.length < kw.length - maxDist) return false;
+  for (let len = Math.max(1, kw.length - 1); len <= kw.length + 1; len++) {
+    if (len > t.length) continue;
+    for (let start = 0; start + len <= t.length; start++) {
+      if (levenshtein(t.slice(start, start + len), kw) <= maxDist) return true;
+    }
+  }
+  return false;
+}
+
 // Clean old entries from recentReplies
 function cleanRecentReplies() {
   const now = Date.now();
@@ -4794,13 +4837,22 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // Purchase-intent keywords: when the customer shows buying interest the
         // closing sales sequence fires immediately. Page-configured keywords
         // (from the comment settings) take priority, with a sensible default.
-        const purchaseIntentKeywords = (page.purchase_keywords && page.purchase_keywords.length > 0)
-          ? page.purchase_keywords
-          : ['สนใจ', 'อยากได้', 'อยากซื้อ', 'ต้องการ'];
-        // "สนใจซื้อจริง" เท่านั้น (ไม่รวมคำถามเฉย ๆ เช่น ราคา/ค่าส่ง/เท่าไหร่) ถึงจะ
-        // อนุญาตให้พรีเซนสเต็ปขาย — การถามราคา/ค่าส่งคือสอบถามข้อมูล ไม่ใช่สัญญาณสั่งซื้อ
-        const hasStrongPurchaseIntent = purchaseIntentKeywords.some(kw => messageText.toLowerCase().includes(String(kw).toLowerCase()))
+        // Purchase-intent keywords (ระบบคีย์เวิร์ด + ทนพิมพ์ผิด):
+        // (Upgraded) รวมคีย์เวิร์ดที่เพจตั้งเองกับ default เข้าด้วยกัน (ไม่ทับกัน)
+        // และใช้ fuzzyKeywordMatch — "สนใต"/"สนจัย"/"สนใจ้" ก็จับได้
+        const DEFAULT_PURCHASE_KEYWORDS = ['สนใจ', 'อยากได้', 'อยากซื้อ', 'ต้องการ'];
+        const purchaseIntentKeywords = Array.from(new Set([
+          ...((page.purchase_keywords || []) as string[]).map(k => String(k).trim()).filter(Boolean),
+          ...DEFAULT_PURCHASE_KEYWORDS
+        ]));
+        // "สนใจซื้อจริง" เท่านั้น (ไม่รวมคำถามเฉย ๆ เช่น ค่าส่ง/เท่าไหร่) ถึงจะ
+        // อนุญาตให้พรีเซนสเต็ปขาย — การถามค่าส่งคือสอบถามข้อมูล ไม่ใช่สัญญาณสั่งซื้อ
+        const matchedKeyword = purchaseIntentKeywords.find(kw => fuzzyKeywordMatch(messageText, kw));
+        const hasStrongPurchaseIntent = Boolean(matchedKeyword)
           || ['ORDER', 'NEGOTIATION'].includes(intentHint);
+        if (matchedKeyword) {
+          addLog('INFO', senderId, pageId, `🔑 จับคีย์เวิร์ดความสนใจ: "${matchedKeyword}" (จากข้อความ "${messageText.slice(0, 60)}")`, 'INFO');
+        }
 
         // Quick Reply buttons go to every NEW customer (first contact) and on
         // any message when the customer hasn't tapped one yet — not only when
@@ -4821,7 +4873,42 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
 
         // เตรียมชุดสเต็ปที่จะส่ง (เฉพาะสเต็ปที่มีข้อความ/รูป) + ตรวจว่า "sequence กำลังจะ fire"
         // (Upgraded) รวม step ที่ได้รูปจาก fallback สินค้า (resolveConfiguredStepImage) ด้วย — กัน "ส่งรูปไม่ครบ"
-        const sequenceStepsToSend = (page.sales_sequence_steps || [])
+        // (Upgraded 2) ถ้า sales_sequence_steps ยังว่าง → สร้างสเต็ป 1-6 อัตโนมัติจาก
+        // "ลำดับแบบเก่า" (page.sequence: step1_opening_text, step2_product_image, ...) +
+        // รูปประจำสเต็ปจากช่องสินค้า — ข้อความ/รูปที่วางไว้ใช้ได้ทันทีโดยไม่ต้องตั้งซ้ำ
+        let configuredSteps = ((page.sales_sequence_steps || []) as any[]).filter(Boolean);
+        if (configuredSteps.length === 0) {
+          const seq = (page.sequence || {}) as any;
+          const oldSeqTexts: Record<number, string | undefined> = {
+            1: seq.step1_opening_text,
+            3: seq.step3_promotion_detail,
+            6: seq.step6_closing_text
+          };
+          const oldSeqImages: Record<number, string | undefined> = {
+            2: seq.step2_product_image,
+            4: seq.step4_promotion_image,
+            5: seq.step5_review_image
+          };
+          const synthesized: any[] = [];
+          for (let n = 1; n <= 6; n++) {
+            const text = String(oldSeqTexts[n] || '').trim();
+            const img = String(oldSeqImages[n] || '').trim() || resolveConfiguredStepImage(page, { step_number: n });
+            if (text || img) {
+              synthesized.push({
+                step_number: n,
+                type: text && img ? 'BOTH' : text ? 'TEXT' : 'IMAGE',
+                text_content: text,
+                image_url: img,
+                delay_seconds: 0
+              });
+            }
+          }
+          if (synthesized.length) {
+            configuredSteps = synthesized;
+            addLog('INFO', senderId, pageId, `🔧 sales_sequence_steps ยังว่าง → สร้างสเต็ปอัตโนมัติ ${synthesized.length} สเต็ปจากลำดับแบบเก่า (sequence) ที่ตั้งไว้`, 'INFO');
+          }
+        }
+        const sequenceStepsToSend = configuredSteps
           .filter(s => s && (s.text_content?.trim() || s.image_url?.trim() || resolveConfiguredStepImage(page, s)))
           .sort((a, b) => a.step_number - b.step_number);
         const sequenceWillFire = shouldTriggerSalesSequence && sequenceStepsToSend.length > 0;
@@ -4904,10 +4991,12 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
               addLog('INFO', senderId, pageId, `⚠️ ส่งสเต็ป ${step.step_number} ผิดพลาด (ข้ามไปก่อน): ${seqErr?.message || seqErr}`, 'WARNING');
             }
           }
+          // (Upgraded) log สรุปจำนวนสเต็ปที่ส่งจริง เพื่อตรวจสอบความครบถ้วน
+          addLog('INFO', senderId, pageId, `✅ ส่งลำดับการขายครบ ${sequenceStepsToSend.length} สเต็ป (${sequenceStepsToSend.map(s => s.step_number).join('→')})`, 'SUCCESS');
         } else if (sequenceWillFire && presentedRecently) {
           addLog('INFO', senderId, pageId, 'ℹ️ ลูกค้าเพิ่งได้รับชุดพรีเซนภายใน 24 ชม. — ส่งเฉพาะคำตอบ AI ตรงคำถาม ไม่ยัดชุดสเต็ปซ้ำ', 'INFO');
         } else if (shouldTriggerSalesSequence) {
-          addLog('INFO', senderId, pageId, '⚠️ Sales Sequence Auto-Trigger เปิดอยู่ แต่ยังไม่ได้ตั้งค่าสเต็ป (ข้อความ/รูปภาพ) ในแท็บ "ลำดับการขาย" — จึงไม่มีอะไรถูกส่ง', 'WARNING');
+          addLog('INFO', senderId, pageId, '⚠️ ยังไม่มีสเต็ปให้ส่ง — ตั้งค่าในแท็บ "ลำดับการส่งภาพและข้อความปิดการขาย" (sales_sequence_steps) หรือกรอกข้อความ/รูปในลำดับแบบเก่า (step1-step6) ก่อน', 'WARNING');
         }
 
         // If ORDER is detected
