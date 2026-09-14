@@ -283,7 +283,7 @@ export const SalesDashboardTab: React.FC<SalesDashboardTabProps> = ({
 
       const revenue = pageOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
       const orderCount = pageOrders.length;
-      const avgTicket = orderCount > 0 ? Math.round(revenue / orderCount) : p.product?.display_price || 990;
+      const avgTicket = orderCount > 0 ? Math.round(revenue / orderCount) : p.product?.display_price || 0;
       const pageInquiries = p.inquiries_count || (orderCount > 0 ? Math.round(orderCount / 0.9) : 10);
       const pageConversionRate = pageInquiries > 0
         ? Math.min(100, Math.round((orderCount / pageInquiries) * 100))

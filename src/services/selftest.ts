@@ -287,7 +287,7 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
   await run('db-order-crud', 'ฐานข้อมูล', 'Orders: สร้าง/ยกเลิก/นับ', async () => {
     const orderId = `${PREFIX}order`;
     try {
-      await dbService.upsertOrder({ order_id: orderId, psid: `${PREFIX}cus2`, total_amount: 990, quantity: 1, payment_status: 'PENDING' });
+      await dbService.upsertOrder({ order_id: orderId, psid: `${PREFIX}cus2`, total_amount: 0, quantity: 1, payment_status: 'PENDING' });
       let count = await dbService.getCustomerOrderCount(`${PREFIX}cus2`);
       if (count !== 1) throw new Error(`นับออเดอร์ได้ ${count}`);
       await dbService.cancelOrder(orderId);

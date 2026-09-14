@@ -325,7 +325,9 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
     setIsAiTyping(true);
 
     try {
-      // Simulate real Facebook Webhook endpoint call
+      // (Upgraded) เรียก AI pipeline จริงผ่าน /api/simulate แล้วแสดง "ข้อความ/รูป
+      // ที่ระบบส่งจริง" กลับมาทีละข้อความตามลำดับ — ตรงกับที่ลูกค้าบน Messenger
+      // จะได้รับจริง (ยกเลิกข้อความ fake จากฝั่ง UI ที่ตอบ 1 ข้อความ + ราคา 990 มั่ว)
       const res = await fetch('/api/simulate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -336,49 +338,38 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
           message_text: fullQuery
         })
       });
+      const data = await res.json().catch(() => ({} as any));
+      const sentReplies: Array<{ text?: string; imageUrl?: string }> = Array.isArray(data?.sentReplies) ? data.sentReplies : [];
 
-      // Prepare response based on configured page product & promotions
-      setTimeout(() => {
-        const isOrderQuery =
-          fullQuery.includes('สั่ง') ||
-          fullQuery.includes('เอา') ||
-          fullQuery.includes('ส่ง') ||
-          fullQuery.includes('ที่อยู่') ||
-          fullQuery.includes('08') ||
-          fullQuery.includes('09');
-
-        const primaryProdName = selectedPage.product?.product_name || currentPrimaryProduct?.product_name;
-        const primaryPrice = selectedPage.product?.display_price || currentPrimaryProduct?.display_price || 990;
-
-        let replyText = '';
-        let replyImage = selectedPage.sequence?.step2_product_image || currentPrimaryProduct?.image_main;
-
-        if (isOrderQuery) {
-          replyText = `🎉 ขอบพระคุณสำหรับคำสั่งซื้อค่ะ!\n\n📦 สินค้า: ${primaryProdName}\n💰 ยอดรวม: ฿${primaryPrice.toLocaleString()} (${(selectedPage.product?.promotions || []).some((pr: any) => pr.free_shipping === true) ? 'จัดส่งฟรี ' : ''}มีเก็บเงินปลายทาง)\n📍 ที่อยู่จัดส่ง: ${customerAddress || 'บันทึกเรียบร้อย'}\n\nแอดมิน ${selectedPage.admin_name || 'น้ำหวาน'} รับออเดอร์เรียบร้อย และเตรียมจัดส่งรอบบ่ายนี้ค่ะ ขอบคุณค่ะ 🙏`;
-          replyImage = selectedPage.sequence?.step4_promotion_image || currentPrimaryProduct?.image_closing;
-        } else if (fullQuery.includes('ราคา') || fullQuery.includes('โปร')) {
-          replyText = `${selectedPage.sequence?.step3_promotion_detail || currentPrimaryProduct?.promotion_text}\n\n${selectedPage.sequence?.step6_closing_text || currentPrimaryProduct?.closing_text}`;
-          replyImage = selectedPage.sequence?.step4_promotion_image || currentPrimaryProduct?.image_promotion;
-        } else if (fullQuery.includes('คาถา') && (currentPrimaryProduct as any)?.spell) {
-          replyText = `บทสวดบูชา ${primaryProdName}:\n\n"${(currentPrimaryProduct as any).spell}"\n\n📌 พุทธคุณ: ${(currentPrimaryProduct as any).belief_info}\n\nบูชาเพียง ฿${primaryPrice} บาท สั่งซื้อได้เลยนะคะ 🙏`;
-          replyImage = currentPrimaryProduct?.image_detail || currentPrimaryProduct?.image_main;
-        } else {
-          replyText = `สวัสดีค่ะ แอดมิน ${selectedPage.admin_name || 'น้ำหวาน'} ยินดีให้บริการค่ะ\n\n${selectedPage.product?.description || currentPrimaryProduct?.detail_text}\n\n${selectedPage.sequence?.step3_promotion_detail || currentPrimaryProduct?.promotion_text}`;
-          replyImage = selectedPage.sequence?.step2_product_image || currentPrimaryProduct?.image_main;
-        }
-
-        const botMsg: MessageItem = {
-          id: `msg-bot-${Date.now()}`,
-          sender: 'bot',
-          text: replyText,
-          timestamp: new Date().toLocaleTimeString('th-TH'),
-          image: replyImage,
-          isOrder: isOrderQuery
-        };
-
-        setMessages(prev => [...prev, botMsg]);
+      if (sentReplies.length === 0) {
+        setMessages(prev => [...prev, {
+          id: `msg-bot-none-${Date.now()}`,
+          sender: 'bot' as const,
+          text: 'ℹ️ ระบบประมวลผลแล้วแต่ไม่มีข้อความถูกส่งออก — ตรวจสอบ Log ระบบ การตั้งค่า AI API หรือ Page Access Token',
+          timestamp: new Date().toLocaleTimeString('th-TH')
+        }]);
         setIsAiTyping(false);
-      }, 600);
+        return;
+      }
+
+      // แสดงผลทีละข้อความตามลำดับที่ส่งจริง (ข้อความ → รูป → ข้อความ → รูป …)
+      for (let i = 0; i < sentReplies.length; i++) {
+        const r = sentReplies[i];
+        const text = String(r.text || '').trim();
+        if (!text && !r.imageUrl) continue;
+        setMessages(prev => [...prev, {
+          id: `msg-bot-${Date.now()}-${i}`,
+          sender: 'bot' as const,
+          text,
+          timestamp: new Date().toLocaleTimeString('th-TH'),
+          image: r.imageUrl || undefined,
+          isOrder: /รับออเดอร์|คำสั่งซื้อ|ยอดรวม/i.test(text)
+        }]);
+        if (i < sentReplies.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 450));
+        }
+      }
+      setIsAiTyping(false);
     } catch (err) {
       console.error('Error sending simulated message:', err);
       setIsAiTyping(false);

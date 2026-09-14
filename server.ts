@@ -440,6 +440,29 @@ setInterval(() => {
 const sequencePresentationLog = new Map<string, number>();
 const SEQUENCE_PRESENTATION_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
+// (Upgraded) บันทึก "ข้อความ/รูปที่ส่งจริง" ต่อ page:sender ล่าสุด — เพื่อให้
+// /api/simulate คืนผลลัพธ์ตรงกับที่ลูกค้าจะได้รับจริง (แก้ Live Simulator
+// โชว์ข้อความ fake 1 ข้อความ + ราคาเริ่มต้น 990 ที่ไม่ตรงกับ AI จริง)
+const simulatedSentReplies = new Map<string, Array<{ text: string; imageUrl?: string; timestamp: string }>>();
+function recordSimulatedSend(pageId: string, senderId: string, text: string, imageUrl?: string) {
+  try {
+    const key = `${pageId}:${senderId}`;
+    const arr = simulatedSentReplies.get(key) || [];
+    arr.push({ text: text || '', imageUrl: imageUrl || undefined, timestamp: new Date().toISOString() });
+    simulatedSentReplies.set(key, arr);
+  } catch { /* non-critical */ }
+}
+
+// (Upgraded) ตัดวลี "ราคาเริ่มต้น" ออกจากข้อความทุกชุดก่อนส่งจริง — ร้านไม่มีระบบ
+// "ราคาเริ่มต้น" ต้องบอกราคาของแพ็กตรงตัวตามที่ตั้งไว้ในระบบเท่านั้น
+function stripStartingPricePhrasing(text: string): string {
+  return String(text || '')
+    .replace(/ราคาเริ่มต้น(ที่)?/g, 'ราคา')
+    .replace(/เริ่มต้นราคา(ที่)?/g, 'ราคา')
+    .replace(/เริ่มต้นที่\s*฿/g, 'ราคา ฿')
+    .replace(/เริ่มต้น\s*฿/g, 'ราคา ฿');
+}
+
 // Clean old entries from recentReplies
 function cleanRecentReplies() {
   const now = Date.now();
@@ -1243,7 +1266,7 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
 
   const info = AI_PROVIDERS[provider];
   const model = getProviderModel(provider);
-  const jsonInstruction = `${options.extraInstruction ? options.extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "messages": [{"text": "ข้อความสั้นๆ", "image": "main|detail|promotion|review|closing|"}], "sequenceStep": 1-6, "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}} — ตอบเป็น messages array เหมือนแอดมินส่งไล่กัน (บังคับ: 3-5 ข้อความสำหรับเจตนา PRICE/PROMOTION/NEGOTIATION/ORDER/TRUST — แต่ละข้อความพูดเรื่องละจุด เช่น ข้อ1 ตอบคำถาม ข้อ2 จุดขาย/ราคาโปร ข้อ3 ของแถม ข้อ4 รีวิว/การันตี ข้อ5 ปิดการขาย; 2-3 ข้อความสำหรับ GREETING/QUESTION/SHIPPING — และแนบรูป (image) เมื่อพรีเซนสินค้าหรือโปรโมชั่น: main=รูปสินค้า detail=รายละเอียด promotion=โปรโมชั่น review=รีวิว closing=ปิดการขาย`;
+  const jsonInstruction = `${options.extraInstruction ? options.extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "messages": [{"text": "ข้อความสั้นๆ", "image": "main|detail|promotion|review|closing|"}], "sequenceStep": 1-6, "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}} — ตอบเป็น messages array เหมือนแอดมินส่งไล่กัน (บังคับ: 3-5 ข้อความสำหรับเจตนา PRICE/PROMOTION/NEGOTIATION/ORDER/TRUST — แต่ละข้อความพูดเรื่องละจุด เช่น ข้อ1 ตอบคำถาม ข้อ2 จุดขาย/ราคาโปร ข้อ3 ของแถม ข้อ4 รีวิว/การันตี ข้อ5 ปิดการขาย; 2-3 ข้อความสำหรับ GREETING/QUESTION/SHIPPING — และแนบรูป (image) เมื่อพรีเซนสินค้าหรือโปรโมชั่น: main=รูปสินค้า detail=รายละเอียด promotion=โปรโมชั่น review=รีวิว closing=ปิดการขาย\n⛔ ห้ามใช้คำว่า "ราคาเริ่มต้น" หรือ "เริ่มต้นที่" เด็ดขาด — บอกราคาของแพ็กตรงตัวตามที่ตั้งไว้ในระบบเท่านั้น (เช่น "แพ็ก 1 ชุด ฿X")`;
 
   const raw = await callOpenAiCompatible(provider, fullPrompt, model, maxOutputTokens, temperature, true)
     .catch(async (primaryErr: any) => {
@@ -2998,13 +3021,16 @@ async function startServer() {
     const effectiveImage = resolveConfiguredStepImage(page, step);
     const sentParts: string[] = [];
     if (step.type !== 'IMAGE' && step.text_content?.trim()) {
-      await sendFacebookMessage(page.page_access_token || '', recipientId, step.text_content.trim());
+      const stepText = stripStartingPricePhrasing(step.text_content.trim());
+      await sendFacebookMessage(page.page_access_token || '', recipientId, stepText);
+      recordSimulatedSend(page.page_id, recipientId, stepText);
       sentParts.push('ข้อความ✓');
       if (effectiveImage) await sleep(300); // รักษาลำดับ ข้อความ→รูป ไม่ให้รูปแซง
     }
     if (step.type !== 'TEXT' && effectiveImage) {
       const imgRes = await sendFacebookImageSmart(page.page_access_token || '', recipientId, effectiveImage, page.page_id);
       if (imgRes.success) {
+        recordSimulatedSend(page.page_id, recipientId, '', effectiveImage);
         sentParts.push('รูป✓');
       } else {
         addLog('INFO', recipientId, page.page_id, `❌ ส่งรูปสเต็ป ${stepNumber} ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
@@ -4745,6 +4771,10 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           replyText = `รบกวนสอบถามเพิ่มเติมหน่อยนะคะ ${adminName} ยินดีช่วยเหลือเรื่อง ${page.product?.product_name || 'สินค้า'} เต็มที่ค่ะ พิมพ์สิ่งที่อยากทราบมาได้เลยค่า 🙏`;
         }
 
+        // (Upgraded) ตัดวลี "ราคาเริ่มต้น/เริ่มต้นที่" ออกจากทุกข้อความก่อนส่งจริง
+        outgoing = outgoing.map(o => ({ ...o, text: stripStartingPricePhrasing(o.text) }));
+        replyText = outgoing.map(o => o.text).join('\n•\n') || replyText;
+
         // Track this reply to prevent future repetitions
         addRecentReply(pageId, senderId, replyText);
 
@@ -4818,14 +4848,17 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           try {
             if (isLast && shouldSendQuickReplies) {
               await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
+              recordSimulatedSend(pageId, senderId, msg.text);
               addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})`, 'SUCCESS');
             } else {
               await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
+              recordSimulatedSend(pageId, senderId, msg.text);
             }
             // รูปตามหลังข้อความเหมือนสเต็ปที่ตั้งไว้
             if (msg.imageUrl) {
               const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, msg.imageUrl, pageId);
               if (imgRes.success) {
+                recordSimulatedSend(pageId, senderId, '', msg.imageUrl);
                 addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} สำเร็จ`, 'SUCCESS');
               } else {
                 addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบ ${i + 1}/${outgoing.length} ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
@@ -7250,12 +7283,17 @@ ${convo}
   // 8. Interactive Simulation endpoint
   app.post('/api/simulate', async (req: Request, res: Response) => {
     const { event_type, sender_id, page_id, message_text, comment_id } = req.body;
+    // (Upgraded) คืน "ข้อความ/รูปที่ส่งจริง" จาก AI pipeline ให้ Live Simulator แสดงผล
+    // ตรงกับที่ลูกค้าจะได้รับ (กันข้อความ fake 1 ข้อความ + ราคา 990 ในฝั่ง UI)
+    const simPageId = page_id || 'AMULET_PAGE_ID';
+    const simSenderId = sender_id || `PSID_${Math.floor(1000000000 + Math.random() * 9000000000)}`;
+    simulatedSentReplies.delete(`${simPageId}:${simSenderId}`);
     await handleWebhookPost(
       {
         body: {
           event_type: event_type || 'MESSAGE',
-          sender_id: sender_id || `PSID_${Math.floor(1000000000 + Math.random() * 9000000000)}`,
-          page_id: page_id || 'AMULET_PAGE_ID',
+          sender_id: simSenderId,
+          page_id: simPageId,
           message_text: message_text || 'สอบถามราคาครับ',
           comment_id: comment_id || null
         },
@@ -7271,7 +7309,8 @@ ${convo}
       success: true,
       latestLogs: db.logs.slice(0, 6),
       ordersCount: db.orders.length,
-      customersCount: db.customers.length
+      customersCount: db.customers.length,
+      sentReplies: simulatedSentReplies.get(`${simPageId}:${simSenderId}`) || []
     });
   });
 

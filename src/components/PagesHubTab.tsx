@@ -902,13 +902,13 @@ export const PagesHubTab: React.FC<PagesHubTabProps> = ({
 
               <div>
                 <label className="text-xs font-bold text-slate-800 dark:text-zinc-300 block mb-1">
-                  5. ราคาขายเริ่มต้น (บาท)
+                  5. ราคาขาย (บาท)
                 </label>
                 <input
                   type="number"
                   value={newProductPrice}
                   onChange={e => setNewProductPrice(e.target.value)}
-                  placeholder="990"
+                  placeholder="กรอกราคาขายจริง"
                   className="w-full bg-slate-50 dark:bg-[#141418] border border-slate-200 dark:border-zinc-800 rounded-xl px-3 py-2 text-xs text-slate-900 dark:text-zinc-100 placeholder-slate-400 focus:outline-none focus:border-indigo-500 focus:bg-white"
                 />
               </div>

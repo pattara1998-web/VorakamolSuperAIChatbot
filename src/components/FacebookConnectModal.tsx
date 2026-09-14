@@ -392,32 +392,30 @@ export const FacebookConnectModal: React.FC<FacebookConnectModalProps> = ({
             { interval: '30 นาที', message: 'แจ้งชื่อ-ที่อยู่จัดส่งไว้ได้เลยนะคะ ทางร้านจัดส่งด่วนรอบบ่ายนี้ค่ะ 📦' },
             { interval: '21:00 น.', message: 'สวัสดีรอบค่ำค่ะ สินค้าใกล้หมดสต็อกแล้วนะคะ หากรับแจ้งแอดมินได้เลยค่า ⚡' }
           ],
+          // (Upgraded) ไม่แต่งราคาปลอมอีกต่อไป — ราคาต้องตั้งจริงในหน้า "แก้ไขเพจ"
+          // เดิม seed ราคา 990 อัตโนมัติ ทำให้ AI ขายราคาที่ร้านไม่ได้ตั้ง
           product: {
             product_id: `PROD-${pageId.slice(-4)}`,
             product_name: `สินค้าประจำเพจ ${fbData.name || pageId}`,
             category: 'AMULET',
-            base_price: 990,
-            display_price: 990,
+            base_price: 0,
+            display_price: 0,
             description: 'สินค้าคุณภาพสูง จัดส่งฟรี มีบริการเก็บเงินปลายทาง',
-            promotions: [
-              { id: 'p1', name: '1 ชุด (ชุดทดลอง)', quantity: 1, price: 990, description: 'จัดส่งฟรี มีเก็บเงินปลายทาง' },
-              { id: 'p2', name: '2 ชุด (สุดคุ้มยอดนิยม)', quantity: 2, price: 1800, free_gifts: 'ของสมนาคุณพิเศษ 1 ชิ้น', description: 'แถมฟรีของสมนาคุณ จัดส่งฟรี COD', is_popular: true },
-              { id: 'p3', name: '3 ชุด (ชุดครอบครัว)', quantity: 3, price: 2500, free_gifts: 'ของสมนาคุณพรีเมียม 2 ชิ้น', description: 'แถมฟรีชุดพรีเมียม จัดส่งฟรี COD' }
-            ],
+            promotions: [],
             images: {
-              main: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800',
-              detail: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800',
-              promotion: 'https://images.unsplash.com/photo-1607082348824-0a96f2a4b9da?w=800',
-              review: 'https://images.unsplash.com/photo-1556742049-0a67e55722c3?w=800',
-              closing: 'https://images.unsplash.com/photo-1563013544-824ae1b704d3?w=800'
+              main: '',
+              detail: '',
+              promotion: '',
+              review: '',
+              closing: ''
             }
           },
           sequence: {
             step1_opening_text: `สวัสดีค่ะ ยินดีต้อนรับสู่เพจ ${fbData.name || 'ทางร้าน'} สนใจสินค้าตัวไหนสอบถามได้เลยค่ะ 🙏`,
-            step2_product_image: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800',
-            step3_promotion_detail: 'โปรโมชั่นพิเศษวันนี้ 1 ชุด ฿990 / 2 ชุด ฿1,800 แถมฟรีของสมนาคุณ ส่งฟรี COD',
-            step4_promotion_image: 'https://images.unsplash.com/photo-1607082348824-0a96f2a4b9da?w=800',
-            step5_review_image: 'https://images.unsplash.com/photo-1556742049-0a67e55722c3?w=800',
+            step2_product_image: '',
+            step3_promotion_detail: 'โปรโมชั่นพิเศษประจำวันนี้ สอบถามแอดมินได้เลยค่ะ 🎁',
+            step4_promotion_image: '',
+            step5_review_image: '',
             step6_closing_text: 'คุณพี่รับกี่ชุดดีคะ แจ้งชื่อ ที่อยู่ และเบอร์โทร สำหรับจัดส่งได้เลยนะคะ 📦'
           }
         };

@@ -304,8 +304,8 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
               id: 'promo-1',
               name: 'โปรโมชั่น 1 ชิ้น (ชุดทดลอง)',
               quantity: 1,
-              price: page?.product?.display_price || 990,
-              original_price: page?.product?.base_price || 1590,
+              price: page?.product?.display_price || 0,
+              original_price: page?.product?.base_price || 0,
               free_gifts: 'ส่งฟรีเก็บเงินปลายทาง',
               description: 'เหมาะสำหรับผู้เริ่มต้น',
               is_popular: false
@@ -314,8 +314,8 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
               id: 'promo-2',
               name: 'โปรโมชั่น 2 ชิ้น (ชุดสุดคุ้มยอดนิยม)',
               quantity: 2,
-              price: Math.round((page?.product?.display_price || 990) * 1.8),
-              original_price: (page?.product?.base_price || 1590) * 2,
+              price: Math.round((page?.product?.display_price || 0) * 1.8),
+              original_price: (page?.product?.base_price || 0) * 2,
               free_gifts: 'ของแถมพรีเมียม + ส่งฟรี COD',
               description: 'ประหยัดเพิ่มขึ้น 20%',
               is_popular: true
@@ -324,8 +324,8 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
               id: 'promo-3',
               name: 'โปรโมชั่น 3 ชิ้น (ชุดเหมาสุดคุ้ม)',
               quantity: 3,
-              price: Math.round((page?.product?.display_price || 990) * 2.5),
-              original_price: (page?.product?.base_price || 1590) * 3,
+              price: Math.round((page?.product?.display_price || 0) * 2.5),
+              original_price: (page?.product?.base_price || 0) * 3,
               free_gifts: 'ของแถมพรีเมียม 2 เท่า + ส่งฟรีด่วนพิเศษ',
               description: 'คุ้มค่าที่สุดสำหรับครอบครัวหรือแจกญาติมิตร',
               is_popular: false
@@ -514,8 +514,8 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
       id: `promo-${Date.now()}`,
       name: `โปรโมชั่น ${formData.product.promotions.length + 1} ชิ้น`,
       quantity: formData.product.promotions.length + 1,
-      price: Math.round((formData.product.display_price || 990) * (formData.product.promotions.length + 1) * 0.9),
-      original_price: Math.round((formData.product.base_price || 1590) * (formData.product.promotions.length + 1)),
+      price: Math.round((formData.product.display_price || 0) * (formData.product.promotions.length + 1) * 0.9),
+      original_price: Math.round((formData.product.base_price || 0) * (formData.product.promotions.length + 1)),
       free_gifts: '',
       gift_quantity: 0,
       free_shipping: false,
@@ -2326,7 +2326,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                       phone_number: '092-xxx-xxxx',
                       shipping_address: 'ที่อยู่ตัวอย่าง ถ.ลาดกระบัง กรุงเทพฯ 10520',
                       items: `${formData.product?.product_name || 'สินค้า'} 1 ชุด`,
-                      total_amount: Number(formData.product?.display_price || 990)
+                      total_amount: Number(formData.product?.display_price || 0)
                     })}
                   </pre>
                 </div>

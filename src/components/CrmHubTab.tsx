@@ -392,7 +392,7 @@ export const CrmHubTab: React.FC<CrmHubTabProps> = ({
           address: line.replace(cleanName, '').replace(phone, '').trim() || 'กรุงเทพมหานคร',
           items: 'สินค้าทั่วไป',
           quantity: 1,
-          total_amount: 990,
+          total_amount: 0,
           category: 'AMULET'
         };
       });
@@ -517,7 +517,7 @@ export const CrmHubTab: React.FC<CrmHubTabProps> = ({
           shipping_address: item.address || '',
           items: item.items || 'สินค้าทั่วไป',
           quantity: item.quantity || 1,
-          total_amount: item.total_amount || 990,
+          total_amount: item.total_amount || 0,
           payment_status: 'PAID',
           created_at: item.order_date || new Date().toISOString(),
           tracking_number: item.tracking_number || `TH${Math.floor(1000000000 + Math.random() * 9000000000)}FL`,
