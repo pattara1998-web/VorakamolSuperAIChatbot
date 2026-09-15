@@ -1,5 +1,7 @@
 import * as dbService from './database.js';
 import type { DatabaseStore } from './dbBridge.js';
+import fs from 'fs';
+import path from 'path';
 
 /**
  * Self-Test Suite (ระบบทดสอบตัวเอง)
@@ -979,8 +981,6 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
 
 /** เขียนรายงาน Markdown ลงโฟลเดอร์ reports/ เพื่อนำไปวิเคราะห์และแก้ไขต่อ */
 export function writeReportFile(report: SelfTestReport): string {
-  const fs = require('fs');
-  const path = require('path');
   const dir = path.join(process.cwd(), 'reports');
   fs.mkdirSync(dir, { recursive: true });
 
