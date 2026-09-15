@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+﻿import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
@@ -5260,12 +5260,14 @@ ${convo || '(ไม่มีประวัติ)'}
         }
         // Remember what we answered for the conversation memory + anti-repeat.
         pushHistory(pageId, senderId, 'admin', replyText.replace(/\n•\n/g, ' | '));
-// ── รับประกัน "ข้อความปิดการขาย" (ต้นเหตุเดิม: ส่งรูปรีวิวแล้วเงียบ ไม่มีปิดการขาย) ──
+          // ── รับประกัน "ข้อความปิดการขาย" (ต้นเหตุเดิม: ส่งรูปรีวิวแล้วเงียบ ไม่มีปิดการขาย) ──
           // ถ้าคำตอบ AI ยังไม่ได้ขอข้อมูลผู้รับ และรอบนี้ส่งรูปรีวิวไป (หรือถึงขั้นปิดการขาย)
           // → ให้ AI เขียนข้อความปิดการขายส่งต่อทันที (ขอ ชื่อ/ที่อยู่/เบอร์ + ถามจำนวนชุด)
-          const askedForOrderInfo = /ชื่อ|นามสกุล|ที่อยู่|เบอร์|กี่ชุด|จำนวนชุด|จำนวน|จัดส่ง/.test(replyText);
+          // แยก regex: ตรวจสอบเฉพาะการขอข้อมูลผู้รับจริง (ไม่รวม "กี่ชุด/จำนวน" ที่อาจเป็น
+          // การถามจำนวนชุดแต่ยังไม่ได้ขอชื่อ/ที่อยู่/เบอร์ → ทำให้ closing message ถูกข้ามไปผิด)
+          const askedForOrderInfo = /ชื่อ|นามสกุล|ที่อยู่|เบอร์โทร|เบอร์มือถือ|เบอร์|จัดส่ง|ที่อยู่จัดส่ง/.test(replyText);
           const sentReviewImage = outgoing.some(o => Boolean(o.imageUrl) && o.imageUrl === imgMap.review);
-          if (!askedForOrderInfo && (sentReviewImage || includeClosingAsk)) {
+          if (!askedForOrderInfo && (sentReviewImage || includeClosingAsk || intent === 'ORDER')) {
             const closingText = await generateAiClosingMessage();
             if (closingText) {
               await sleep(pageDelay > 0 ? Math.min(700, pageDelay) : 400);
