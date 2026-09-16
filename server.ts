@@ -616,6 +616,46 @@ function containsBannedProductContent(text: string): boolean {
   return matchBannedProductPhrase(text) !== null;
 }
 
+/**
+ * ⛔ "ตัด" เนื้อหาสินค้า/โปรที่ถูกแบนออกจากข้อความ แล้วส่งส่วนที่เหลือให้ลูกค้า
+ *
+ * ทำไมต้องตัดแทนการทิ้งทั้งข้อความ: เพจที่ยังมีสินค้าอยู่ (และเป็นเพจเดียวที่มี
+ * สินค้าในระบบ production) คือเพจที่สินค้าถูกแบน → AI พูดชื่อสินค้าในทุกคำตอบ →
+ * ถ้าทิ้งทั้งข้อความ ลูกค้าจะไม่ได้รับคำตอบอะไรเลย (อาการ "ระบบไม่ตอบ")
+ * การตัดบรรทัด/วลีที่ถูกแบนออก ยังทำให้ลูกค้าได้คำตอบส่วนอื่นตามปกติ
+ *
+ * คืนค่า null เมื่อ "ไม่มีอะไรเหลือพอจะส่ง" (ข้อความคือสคริปต์ขายเก่าล้วน ๆ)
+ */
+function scrubBannedProductContent(text: string): string | null {
+  loadBannedProductPhrases();
+  let out = String(text || '');
+  if (!out) return null;
+
+  // 1) ตัด "ทั้งบรรทัด" ที่มีคำแบน (สคริปต์ขายเก่ามักมาเป็นบรรทัด ๆ)
+  out = out
+    .split(/\r?\n/)
+    .filter(line => !matchBannedProductPhrase(line))
+    .join('\n');
+
+  // 2) ตัดวลีที่โผล่กลางบรรทัด (กันข้อความที่เหลือติดคำแบน)
+  for (const phrase of bannedProductPhrases) {
+    if (!out) break;
+    if (!matchBannedProductPhrase(out)) break;
+    const pattern = phrase
+      .trim()
+      .split(/\s+/)
+      .map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('\\s*');
+    if (pattern) out = out.replace(new RegExp(pattern, 'gi'), ' ');
+  }
+
+  out = out.replace(/[ \t]{2,}/g, ' ').replace(/\n{2,}/g, '\n').trim();
+  // ต้องมี "เนื้อความจริง" เหลือพอให้ลูกค้าอ่านรู้เรื่อง (ไทย/อังกฤษ ≥ 8 ตัวอักษร)
+  const meaningful = out.replace(/[^\u0E00-\u0E7Fa-zA-Z]/g, '');
+  if (meaningful.length < 8) return null;
+  return out;
+}
+
 // แทรกลงในทุก prompt เพื่อกัน AI "พูดเลียนแบบ" ข้อความเก่าจากประวัติแชท
 function getBannedProductPromptRule(): string {
   loadBannedProductPhrases();
@@ -3317,12 +3357,18 @@ async function startServer() {
 
   // Helper to send Facebook Messenger Private Message using Graph API
   async function sendFacebookMessage(accessToken: string, recipientId: string, text: string) {
-    // 🚫 BANNED PRODUCT GUARD (ชั้นที่ 3 — จุดส่งจริง): ข้อความใดก็ตามที่ตรงกับ
-    // สคริปต์ขายสินค้าเก่าที่ถูกแบน จะไม่ถูกส่งถึงลูกค้าเด็ดขาด ไม่ว่าจะมาจาก AI,
-    // สเต็ปขาย, followup หรือ broadcast
+    // 🚫 BANNED PRODUCT GUARD (ชั้นที่ 3 — จุดส่งจริง): ถ้าข้อความมีสคริปต์ขาย
+    // สินค้าเก่าที่ถูกแบน → "ตัด" ส่วนนั้นออกแล้วส่งส่วนที่เหลือ (ไม่ทิ้งทั้งข้อความ
+    // เพราะลูกค้าจะไม่ได้รับคำตอบอะไรเลย) ถ้าไม่เหลืออะไรจึงไม่ส่ง
     if (containsBannedProductContent(text)) {
-      addLog('INFO', recipientId, '', `⛔ BANNED_PRODUCT_GUARD: บล็อกข้อความที่มีเนื้อหาสินค้า/โปรที่ถูกแบน — ไม่ส่งถึงลูกค้า | ตรงคำ: "${matchBannedProductPhrase(text)}"`, 'WARNING');
-      return { success: false, blocked: 'BANNED_PRODUCT_CONTENT' };
+      const hit = matchBannedProductPhrase(text);
+      const scrubbed = scrubBannedProductContent(text);
+      if (!scrubbed) {
+        addLog('INFO', recipientId, '', `⛔ BANNED_PRODUCT_GUARD: บล็อกทั้งข้อความ (เหลือแต่เนื้อหาที่ถูกแบน) — ไม่ส่งถึงลูกค้า | ตรงคำ: "${hit}"`, 'WARNING');
+        return { success: false, blocked: 'BANNED_PRODUCT_CONTENT' };
+      }
+      addLog('INFO', recipientId, '', `⚠️ BANNED_PRODUCT_GUARD: ตัดข้อความกลุ่มสินค้าที่ถูกแบนออกแล้วส่งส่วนที่เหลือให้ลูกค้า | ตรงคำ: "${hit}"`, 'WARNING');
+      text = scrubbed;
     }
     const rawToken = decryptToken(accessToken);
     if (!rawToken || !rawToken.startsWith('EAA')) {
@@ -3481,9 +3527,16 @@ async function startServer() {
   // single bad button can never fail the whole message.
   async function sendFacebookQuickReplies(accessToken: string, recipientId: string, text: string, quickReplies: { title: string; payload: string }[]) {
     // 🚫 BANNED PRODUCT GUARD: ปุ่ม Quick Reply ส่งตรงผ่าน Graph API จึงต้องกันเอง
+    // (ตัดเนื้อหาที่ถูกแบนออกก่อนส่ง — ไม่ทิ้งทั้งข้อความ)
     if (containsBannedProductContent(text)) {
-      addLog('INFO', recipientId, '', `⛔ BANNED_PRODUCT_GUARD: บล็อกข้อความ (Quick Reply) ที่มีเนื้อหาสินค้า/โปรที่ถูกแบน | ตรงคำ: "${matchBannedProductPhrase(text)}"`, 'WARNING');
-      return { success: false, blocked: 'BANNED_PRODUCT_CONTENT' };
+      const hit = matchBannedProductPhrase(text);
+      const scrubbed = scrubBannedProductContent(text);
+      if (!scrubbed) {
+        addLog('INFO', recipientId, '', `⛔ BANNED_PRODUCT_GUARD: บล็อกข้อความ (Quick Reply) ที่เหลือแต่เนื้อหาถูกแบน | ตรงคำ: "${hit}"`, 'WARNING');
+        return { success: false, blocked: 'BANNED_PRODUCT_CONTENT' };
+      }
+      addLog('INFO', recipientId, '', `⚠️ BANNED_PRODUCT_GUARD: ตัดข้อความ (Quick Reply) กลุ่มที่ถูกแบนออกแล้วส่งส่วนที่เหลือ | ตรงคำ: "${hit}"`, 'WARNING');
+      text = scrubbed;
     }
     const rawToken = decryptToken(accessToken);
     if (!rawToken || !rawToken.startsWith('EAA')) {
@@ -3586,9 +3639,17 @@ async function startServer() {
   // Helper to reply to a Facebook Comment using Graph API
   async function sendFacebookCommentReply(accessToken: string, commentId: string, text: string) {
     // 🚫 BANNED PRODUCT GUARD (ชั้นที่ 3 — จุดส่งจริงฝั่งคอมเมนต์)
+        // BANNED PRODUCT GUARD (ชั้นที่ 3 — จุดส่งจริงฝั่งคอมเมนต์)
+    // ตัดเนื้อหาที่ถูกแบนออกก่อนส่ง — ไม่ทิ้งทั้งคอมเมนต์
     if (containsBannedProductContent(text)) {
-      addLog('INFO', 'FACEBOOK_API', commentId, `⛔ BANNED_PRODUCT_GUARD: บล็อกคอมเมนต์ตอบกลับที่มีเนื้อหาสินค้า/โปรที่ถูกแบน | ตรงคำ: "${matchBannedProductPhrase(text)}"`, 'WARNING');
-      return { success: false, blocked: 'BANNED_PRODUCT_CONTENT' };
+      const hitC = matchBannedProductPhrase(text);
+      const scrubbedC = scrubBannedProductContent(text);
+      if (!scrubbedC) {
+        addLog('INFO', 'FACEBOOK_API', commentId, ` BANNED_PRODUCT_GUARD: บล็อกคอมเมนต์ตอบกลับ (เหลือแต่เนื้อหาที่ถูกแบน) | ตรงคำ: "${hitC}"`, 'WARNING');
+        return { success: false, blocked: 'BANNED_PRODUCT_CONTENT' };
+      }
+      addLog('INFO', 'FACEBOOK_API', commentId, `⚠️ BANNED_PRODUCT_GUARD: ตัดเนื้อหากลุ่มที่ถูกแบนออกจากคอมเมนต์ตอบกลับแล้วส่งส่วนที่เหลือ | ตรงคำ: "${hitC}"`, 'WARNING');
+      text = scrubbedC;
     }
     const rawToken = decryptToken(accessToken);
     if (!rawToken || !rawToken.startsWith('EAA')) {
@@ -5434,6 +5495,27 @@ ${convo || '(ไม่มีประวัติ)'}
 
         // (Upgraded) ตัดวลี "ราคาเริ่มต้น/เริ่มต้นที่" ออกจากทุกข้อความก่อนส่งจริง
         outgoing = outgoing.map(o => ({ ...o, text: stripStartingPricePhrasing(o.text) }));
+
+        // (Upgraded) BANNED PRODUCT GUARD ชั้นที่ 2.5 — ตัดเนื้อหาสินค้า/โปรที่ถูกแบน
+        // ออกจากข้อความ "ก่อน" ส่ง/บันทึกประวัติ เพื่อให้ทั้งกล่องแชท ประวัติ และสิ่งที่
+        // ลูกค้าได้รับ สะอาดตรงกัน (เดิมพึ่งจุดส่งจริงอย่างเดียว → ประวัติยังเก็บข้อความแบน)
+        outgoing = outgoing
+          .map(o => {
+            if (!containsBannedProductContent(o.text)) return o;
+            const hit = matchBannedProductPhrase(o.text);
+            const scrubbed = scrubBannedProductContent(o.text);
+            addLog('AI_REPLY', senderId, pageId, `⚠️ BANNED_PRODUCT_GUARD: ตัดเนื้อหาสินค้าที่ถูกแบนออกจากคำตอบ AI ก่อนส่ง | ตรงคำ: "${hit}"`, 'WARNING');
+            return scrubbed ? { ...o, text: scrubbed } : null;
+          })
+          .filter((o): o is { text: string; imageUrl?: string } => Boolean(o));
+
+        // ถ้าทุกข้อความถูกตัดจนไม่เหลืออะไร → ใช้ข้อความกลาง ๆ ที่ยังคุยกับลูกค้าได้
+        if (outgoing.length === 0) {
+          const safeFallback = `รบกวนสอบถามเพิ่มเติมหน่อยนะคะ ${adminName} ยินดีช่วยเหลือเต็มที่ค่ะ พิมพ์สิ่งที่อยากทราบมาได้เลยค่า 🙏`;
+          addLog('AI_REPLY', senderId, pageId, '⚠️ BANNED_PRODUCT_GUARD: คำตอบ AI เป็นเนื้อหาที่ถูกแบนทั้งหมด → ใช้ข้อความกลาง ๆ ที่ปลอดภัยแทน', 'WARNING');
+          outgoing = [{ text: safeFallback }];
+        }
+
         replyText = outgoing.map(o => o.text).join('\n•\n') || replyText;
 
         // Track this reply to prevent future repetitions
@@ -5769,6 +5851,15 @@ ${convo || '(ไม่มีประวัติ)'}
           addLog('AI_REPLY', senderId, pageId, `🔄 AI fallback success (AI execution error) — ใช้ AI ซ้ำด้วย fallback prompt`, 'INFO');
         }
         await sleep(resolvePageDelay(page));
+        // (Upgraded) ตัดวลี "ราคาเริ่มต้น" + เนื้อหาสินค้าที่ถูกแบนออกจากคำตอบสำรอง
+        // กันลูกค้าได้รับข้อความที่ไม่ควรถูกพูดถึงแม้ AI หลักล่ม
+        fallbackReply = stripStartingPricePhrasing(fallbackReply);
+        if (containsBannedProductContent(fallbackReply)) {
+          const hitFb = matchBannedProductPhrase(fallbackReply);
+          const scrubbedFb = scrubBannedProductContent(fallbackReply);
+          fallbackReply = scrubbedFb || `กำลังตรวจสอบรายละเอียดสินค้าให้ค่ะ รอสักครู่แอดมินจะรีบตอบนะคะ 🙏`;
+          addLog('AI_REPLY', senderId, pageId, `⚠️ BANNED_PRODUCT_GUARD: ตัดเนื้อหาที่ถูกแบนออกจากคำตอบสำรอง | ตรงคำ: "${hitFb}"`, 'WARNING');
+        }
         // (Upgraded) บันทึกคำตอบสำรองลงกล่องจำลองด้วย — เดิมไม่บันทึก ทำให้เวลา AI ล่ม
         // แล้วระบบตอบด้วยข้อความสำรอง เจ้าของร้านเห็นเป็น "ระบบไม่ตอบเลย" ใน Live Simulator
         const fbRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply);
