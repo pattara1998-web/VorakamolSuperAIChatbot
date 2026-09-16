@@ -411,8 +411,12 @@ ${convoLines}
     const r = await generateAiJson(prompt, { temperature, maxOutputTokens: maxTokens });
     const text = String(r.parsed?.replyText || '').trim();
     return text || null;
-  } catch {
+  } catch (fbErr: any) {
     // fallback prompt ล้มเหลวจริง ๆ — ใช้ข้อความเป็นกลาง ไม่ระบุราคา ไม่สร้างราคาเอง
+    // (Upgraded) บันทึกสาเหตุจริงลง activity log เพื่อวินิจฉัยได้ทันที (เดิมแค่ console.error มองไม่เห็น)
+    try {
+      addLog('ERROR', 'AI_FALLBACK', 'SYSTEM', `❌ AI fallback ล้มเหลว: ${String(fbErr?.message || fbErr).slice(0, 300)}`, 'ERROR');
+    } catch { /* logging ต้องไม่ทำให้พังเพิ่ม */ }
     return null;
   }
 }
@@ -5612,6 +5616,11 @@ ${convo || '(ไม่มีประวัติ)'}
 
       } catch (aiErr: any) {
         console.error('Gemini AI execution error:', aiErr);
+        // (Upgraded) บันทึกสาเหตุจริงของ AI หลักล้มเหลวลง activity log — เดิมมีแต่
+        // console.error ทำให้วินิจฉัย "ระบบไม่ตอบ" บน Render ไม่ได้
+        try {
+          addLog('AI_REPLY', senderId, pageId, `❌ AI หลักล้มเหลว: ${String(aiErr?.message || aiErr).slice(0, 300)}`, 'ERROR');
+        } catch { /* logging ต้องไม่ทำให้พังเพิ่ม */ }
         // ลูกค้าต้องได้คำตอบที่ "ขายต่อ" เสมอ — แต่ต้องผ่าน AI เสมอ
         // ไม่ใช่ canned message ที่ใส่ราคาจาก DB เอง (เสี่ยงราคาผิด)
         // เรียก AI ซ้ำด้วย fallback prompt ที่มีข้อมูลราคาจริง + เจตนาจริง
