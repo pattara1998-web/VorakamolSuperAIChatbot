@@ -1,0 +1,170 @@
+// Smoke test: ⚡ Instant Sales Engine (Tier 1)
+// ดึงฟังก์ชันจริงจาก server.ts มาทดสอบ (ไม่ duplicate logic) —
+// buildInstantAck / buildInstantSalesReply / buildLocalClosingAsk / buildLocalOrderInfoRequest
+import fs from 'fs';
+import { transformSync } from 'esbuild';
+
+const src = fs.readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
+
+function extract(name) {
+  const start = src.indexOf(`function ${name}(`);
+  if (start < 0) throw new Error(`ไม่พบ function ${name} ใน server.ts`);
+  let i = src.indexOf('{', start);
+  if (i < 0) throw new Error(`หา body brace ของ ${name} ไม่เจอ`);
+  // signature หลายบรรทัดอาจมี return type เป็น object literal `): { ... }` ก่อน body
+  // → ไล่จับกลุ่ม brace ทีละกลุ่ม ถ้าจบกลุ่มแล้ว next non-ws คือ `{` อีก = กลุ่มก่อนคือ return type
+  for (;;) {
+    let depth = 0;
+    let j = i;
+    for (; j < src.length; j++) {
+      if (src[j] === '{') depth++;
+      else if (src[j] === '}') { depth--; if (depth === 0) { j++; break; } }
+    }
+    let k = j;
+    while (k < src.length && /\s/.test(src[k])) k++;
+    if (src[k] === '{') { i = k; continue; }
+    return src.slice(start, j);
+  }
+}
+
+function extractConst(prefix) {
+  const line = src.split('\n').find(l => l.includes(prefix));
+  if (!line) throw new Error(`ไม่พบ ${prefix}`);
+  return line;
+}
+
+// stub: scrubBannedProductContent ตัวจริงต้องอ่านไฟล์คำแบน — ในเทสต์ให้ผ่านข้อความสะอาด
+const stubScrub = `function scrubBannedProductContent(text: string): string | null { const t = String(text || '').trim(); return t || null; }`;
+
+const tsCode = [
+  "type IntentHint = 'GREETING' | 'PRICE' | 'PROMOTION' | 'SHIPPING' | 'TRUST' | 'NEGOTIATION' | 'ORDER' | 'FOLLOWUP' | 'QUESTION';",
+  "type OrderDataProblem = 'PHONE_MISSING' | 'PHONE_NOT_START_ZERO' | 'PHONE_TOO_SHORT' | 'PHONE_TOO_LONG' | 'PHONE_NOT_MOBILE' | 'NAME_MISSING' | 'ADDRESS_TOO_SHORT';",
+  extractConst('const MAX_OUTGOING_SEGMENT_CHARS').replace('process.env.MAX_OUTGOING_SEGMENT_CHARS || 120', '120'),
+  // ORDER_PROBLEM_FIX_HINT เป็น multi-line record — ดึงทั้งก้อน
+  (() => {
+    const start = src.indexOf('const ORDER_PROBLEM_FIX_HINT');
+    if (start < 0) throw new Error('ไม่พบ ORDER_PROBLEM_FIX_HINT');
+    const end = src.indexOf('};', start) + 2;
+    return src.slice(start, end);
+  })(),
+  extract('sanitizeCustomerFacingText'),
+  extract('stripStartingPricePhrasing'),
+  extract('splitLongOutgoingText'),
+  extract('resolveProductPricing'),
+  stubScrub,
+  'type InstantOutgoing = Array<{ text: string; imageUrl?: string; images?: string[] }>;',
+  extract('polishInstantText'),
+  extract('resolveInstantImageMap'),
+  'let instantAckRotation = 0;',
+  extract('buildInstantAck'),
+  extract('buildInstantSalesReply'),
+  extract('buildLocalClosingAsk'),
+  extract('buildLocalOrderInfoRequest')
+].join('\n');
+
+const jsCode = transformSync(tsCode, { loader: 'ts', format: 'cjs', target: 'node18' }).code;
+const {
+  buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest
+} = new Function(
+  `${jsCode}\nreturn { buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest };`
+)();
+
+let pass = 0, fail = 0;
+const check = (label, cond) => { if (cond) { pass++; console.log(`  ✅ ${label}`); } else { fail++; console.log(`  ❌ ${label}`); } };
+
+// ── เพจทดสอบเต็มรูปแบบ (เหมือนเพจสมุนไพรจริง) ──
+const fullPage = {
+  page_name: 'สมุนไพรคุณย่า',
+  admin_name: 'น้องฟ้า',
+  product: {
+    product_name: 'ยาสมุนไพรบำรุงกำลัง',
+    benefit: 'ช่วยบำรุงร่างกาย แก้อาการอ่อนเพลีย',
+    description: 'สมุนไพรแท้ 100%\nผ่าน อย. เรียบร้อย',
+    shipping_fee: 'ฟรี',
+    delivery_days: '1-3 วัน',
+    courier_brand: 'Flash Express',
+    images: {
+      main: 'https://img.example/main.jpg',
+      detail: 'https://img.example/detail.jpg',
+      promotion: 'https://img.example/promo.jpg',
+      review: 'https://img.example/review.jpg',
+      closing: 'https://img.example/closing.jpg'
+    },
+    promotions: [
+      { name: '1 ชุด', quantity: 1, price: 390, free_shipping: false },
+      { name: '3 ชุดสุดคุ้ม', quantity: 3, price: 990, free_shipping: true }
+    ]
+  }
+};
+
+// ── เพจข้อมูลน้อย (ไม่มีรูป ไม่มีโปร มีแค่ราคาเดียว) ──
+const minimalPage = {
+  page_name: 'ร้านน้องใหม่',
+  product: { product_name: 'กระเป๋าผ้า', price_1: 199 }
+};
+
+console.log('── buildInstantAck (ทักทายทันที + รูปหลัก) ──');
+const ack = buildInstantAck(fullPage, 'GREETING');
+check('ได้ ≥1 ข้อความ', ack.length >= 1);
+check('แนบรูปหลักมากับข้อความแรก', ack[0].images?.[0] === 'https://img.example/main.jpg');
+check('มีคำทักทาย', /สวัสดี|หวัดดี/.test(ack[0].text));
+const ackSales = buildInstantAck(fullPage, 'PRICE');
+check('intent ไม่ใช่ GREETING → เอ่ยชื่อสินค้า', ackSales[0].text.includes('ยาสมุนไพรบำรุงกำลัง'));
+const ackMin = buildInstantAck(minimalPage, 'GREETING');
+check('เพจไม่มีรูป → ได้ข้อความทักทายอย่างเดียว ไม่พัง', ackMin.length >= 1 && !ackMin[0].images);
+const ackA = buildInstantAck(fullPage, 'GREETING')[0].text;
+const ackB = buildInstantAck(fullPage, 'GREETING')[0].text;
+const ackC = buildInstantAck(fullPage, 'GREETING')[0].text;
+check('หมุนเวียนคำทักทาย 3 แบบไม่ซ้ำ', new Set([ackA, ackB, ackC]).size === 3);
+
+console.log('── buildInstantSalesReply (พรีเซนเต็มชุดจาก DB) ──');
+const pres = buildInstantSalesReply(fullPage, null, 'PRICE');
+check('ได้ 3-8 ข้อความ', pres.length >= 3 && pres.length <= 8);
+const allText = pres.map(m => m.text).join('\n');
+check('เอ่ยชื่อสินค้า', allText.includes('ยาสมุนไพรบำรุงกำลัง'));
+check('บอกราคาจริงจากแพ็ก (390 + 990)', allText.includes('390') && allText.includes('990'));
+check('ไม่แต่งราคาเอง (ไม่มี ฿ เลขอื่นนอกจากแพ็กจริง)', !/฿\s*\d/.test(allText.replace(/฿390|฿990/g, '')));
+check('บอกส่งฟรีตามแพ็กจริง', allText.includes('ส่งฟรี'));
+check('บอกขนส่ง+ระยะเวลาจริง', allText.includes('Flash Express') && allText.includes('1-3 วัน'));
+check('ปิดท้ายด้วยคำถามปิดการขาย', /ชุดไหน|กี่ชุด|เลยไหม/.test(pres[pres.length - 1].text));
+check('มีรูปประกอบ ≥2 ใบ', pres.filter(m => m.images?.length).length >= 2);
+check('ทุกข้อความ ≤120 ตัวอักษร', pres.every(m => m.text.length <= 120));
+check('ไม่มีคำว่า COD', !/COD/i.test(allText));
+check('ไม่มีข้อความถ่วงเวลา "รอสักครู่"', !/รอสักครู่|กำลังตรวจสอบ/.test(allText));
+check('ไม่มีคำว่า "ราคาเริ่มต้น"', !/ราคาเริ่มต้น/.test(allText));
+
+const presMin = buildInstantSalesReply(minimalPage, null, 'GREETING');
+const minText = presMin.map(m => m.text).join('\n');
+check('เพจข้อมูลน้อย → ยังพรีเซนได้ ไม่พัง', presMin.length >= 2);
+check('เพจข้อมูลน้อย → บอกราคาเดียวที่มีจริง (199)', minText.includes('199'));
+check('เพจข้อมูลน้อย → ยังปิดการขายด้วยคำถาม', /กี่ชุด|ชุดไหน|เลยไหม/.test(minText));
+check('เพจไม่มีรูป → ไม่มี images ติดมา', presMin.every(m => !m.images || m.images.length === 0));
+
+const presShip = buildInstantSalesReply(fullPage, null, 'SHIPPING');
+check('intent SHIPPING → รูปแรกไม่ใช่ review (เน้น main/promo)', presShip.find(m => m.images)?.images?.[0] !== 'https://img.example/review.jpg');
+const presTrust = buildInstantSalesReply(fullPage, null, 'TRUST');
+check('intent TRUST → เอารูปรีวิวขึ้นก่อน', presTrust.find(m => m.images)?.images?.[0] === 'https://img.example/review.jpg');
+
+console.log('── buildLocalClosingAsk (ชวนปิดการขาย) ──');
+const close = buildLocalClosingAsk(fullPage, null);
+const closeText = close.map(m => m.text).join('\n');
+check('ได้ ≥2 ข้อความ', close.length >= 2);
+check('ถามเลือกรับชุดไหน', closeText.includes('ชุดไหน'));
+check('โชว์แพ็กจริงพร้อมราคา', closeText.includes('390') && closeText.includes('990'));
+check('ขอชื่อ-ที่อยู่-เบอร์โทร', /ชื่อ/.test(closeText) && /ที่อยู่/.test(closeText) && /เบอร์โทร/.test(closeText));
+check('แนบรูป closing', close.some(m => m.images?.[0] === 'https://img.example/closing.jpg'));
+check('ทุกข้อความ ≤120 ตัวอักษร', close.every(m => m.text.length <= 120));
+
+console.log('── buildLocalOrderInfoRequest (ขอข้อมูลสั่งซื้อที่ขาด) ──');
+const fix = buildLocalOrderInfoRequest(['PHONE_NOT_START_ZERO', 'ADDRESS_TOO_SHORT']);
+const fixText = fix.map(m => m.text).join('\n');
+check('ได้ ≥2 ข้อความ', fix.length >= 2);
+check('ขอบคุณก่อนขอข้อมูล', fixText.includes('ขอบคุณ'));
+check('บอกปัญหาจริงจาก hint (เบอร์ไม่ขึ้นต้น 0)', fixText.includes('ไม่ขึ้นต้นด้วย 0'));
+check('บอกปัญหาที่อยู่ไม่ครบ', fixText.includes('ที่อยู่จัดส่งยังไม่ครบ'));
+check('ทุกข้อความ ≤120 ตัวอักษร', fix.every(m => m.text.length <= 120));
+const fixEmpty = buildLocalOrderInfoRequest([]);
+check('problems ว่าง → ยังขอข้อมูลครบชุดได้ ไม่พัง', fixEmpty.length >= 1 && fixEmpty.map(m => m.text).join('').includes('ชื่อ-นามสกุล'));
+
+console.log(`\nสรุป: ผ่าน ${pass} / ไม่ผ่าน ${fail}`);
+process.exit(fail > 0 ? 1 : 0);

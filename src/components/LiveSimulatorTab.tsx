@@ -32,6 +32,7 @@ interface MessageItem {
   text: string;
   timestamp: string;
   image?: string;
+  images?: string[];
   sequenceStep?: number;
   isOrder?: boolean;
   orderDetails?: any;
@@ -339,7 +340,7 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
         })
       });
       const data = await res.json().catch(() => ({} as any));
-      const sentReplies: Array<{ text?: string; imageUrl?: string }> = Array.isArray(data?.sentReplies) ? data.sentReplies : [];
+      const sentReplies: Array<{ text?: string; imageUrl?: string; images?: string[] }> = Array.isArray(data?.sentReplies) ? data.sentReplies : [];
 
       if (sentReplies.length === 0) {
         setMessages(prev => [...prev, {
@@ -356,15 +357,39 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
       for (let i = 0; i < sentReplies.length; i++) {
         const r = sentReplies[i];
         const text = String(r.text || '').trim();
-        if (!text && !r.imageUrl) continue;
-        setMessages(prev => [...prev, {
-          id: `msg-bot-${Date.now()}-${i}`,
-          sender: 'bot' as const,
-          text,
-          timestamp: new Date().toLocaleTimeString('th-TH'),
-          image: r.imageUrl || undefined,
-          isOrder: /รับออเดอร์|คำสั่งซื้อ|ยอดรวม/i.test(text)
-        }]);
+        if (!text && !r.imageUrl && !r.images) continue;
+        
+        // ✅ ใหม่: รองรับ images array — สร้างข้อความ bot 1 รายการต่อแต่ละรูปใน images
+        // (ข้อความหลักจะถูกสร้างรายการแรก จากนั้นแต่ละรูปเพิ่มเป็นรายการแยกต่อท้าย)
+        const entries: Array<{ text: string; image?: string; images?: string[] }> = [];
+        if (text) {
+          entries.push({ text, image: r.imageUrl || undefined, images: r.images || undefined });
+        }
+        if (r.images && r.images.length > 0) {
+          // images array แล้ว → แต่ละรูปเป็นรายการแยกต่อท้าย (ไม่มีข้อความ)
+          for (let k = 0; k < r.images.length; k++) {
+            entries.push({ text: '', image: r.images[k], images: undefined });
+          }
+        } else if (r.imageUrl) {
+          entries.push({ text: '', image: r.imageUrl, images: undefined });
+        }
+        if (entries.length === 0) continue;
+        
+        for (let ei = 0; ei < entries.length; ei++) {
+          const e = entries[ei];
+          setMessages(prev => [...prev, {
+            id: `msg-bot-${Date.now()}-${i}-${ei}`,
+            sender: 'bot' as const,
+            text: e.text || '',
+            timestamp: new Date().toLocaleTimeString('th-TH'),
+            image: e.image || undefined,
+            images: e.images || undefined,
+            isOrder: /รับออเดอร์|คำสั่งซื้อ|ยอดรวม/i.test(text)
+          }]);
+          if (ei < entries.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 450));
+          }
+        }
         if (i < sentReplies.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 450));
         }
@@ -660,7 +685,21 @@ export const LiveSimulatorTab: React.FC<LiveSimulatorTabProps> = ({
                     </div>
                   )}
 
-                  {msg.image && (
+                  {msg.images && msg.images.length > 0 && (
+                    <div className="mb-2.5 space-y-2">
+                      {msg.images.map((imgSrc, idx) => (
+                        <div key={idx} className="rounded-lg overflow-hidden border border-zinc-800/80 bg-[#0A0A0C]">
+                          <img
+                            src={imgSrc}
+                            alt={`Attached product ${idx + 1}`}
+                            referrerPolicy="no-referrer"
+                            className="w-full h-44 object-cover"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {msg.image && !msg.images && (
                     <div className="mb-2.5 rounded-lg overflow-hidden border border-zinc-800/80 bg-[#0A0A0C]">
                       <img
                         src={msg.image}

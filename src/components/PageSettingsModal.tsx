@@ -202,7 +202,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
       : [
           { id: 'step-1', step_number: 1, type: 'BOTH', title: 'Step 1: ภาพหน้าปก & ทักทายเปิดเรื่องราว', text_content: page?.product?.opening_text || page?.product?.description || 'สวัสดีค่ะ ยินดีต้อนรับสู่เพจของเรานะคะ 🙏✨ สอบถามรายละเอียดหรือโปรโมชั่นพิเศษทักแชทได้เลยค่ะ', image_url: page?.product?.image_main || page?.product?.images?.main || '' },
           { id: 'step-2', step_number: 2, type: 'BOTH', title: 'Step 2: ภาพจุดเด่น / รายละเอียดสินค้า', text_content: page?.product?.detail_text || 'สินค้าคุณภาพเกรดพรีเมียม รับประกันของแท้ 100% มีใบรับรองมาตรฐานค่ะ', image_url: page?.product?.image_detail || page?.product?.images?.detail || '' },
-          { id: 'step-3', step_number: 3, type: 'BOTH', title: 'Step 3: ภาพโปรโมชั่น / ของแถมพิเศษ', text_content: page?.product?.promotion_text || 'โปรโมชั่นเปิดตัวพิเศษ ซื้อวันนี้ส่งฟรีเก็บเงินปลายทาง COD ไม่บวกเพิ่มค่ะ', image_url: page?.product?.image_promotion || page?.product?.images?.promotion || '' },
+          { id: 'step-3', step_number: 3, type: 'BOTH', title: 'Step 3: ภาพโปรโมชั่น / ของแถมพิเศษ', text_content: page?.product?.promotion_text || 'โปรโมชั่นเปิดตัวพิเศษ ซื้อวันนี้ส่งฟรีเก็บเงินปลายทาง ไม่บวกเพิ่มค่ะ', image_url: page?.product?.image_promotion || page?.product?.images?.promotion || '' },
           { id: 'step-4', step_number: 4, type: 'BOTH', title: 'Step 4: ภาพรีวิวจากลูกค้าจริง', text_content: page?.product?.review_text || 'การันตีรีวิวจากผู้ใช้งานจริงทั่วประเทศ ส่งจริง ได้รับของชัวร์ 100% ค่ะ', image_url: page?.product?.image_review || page?.product?.images?.review || '' },
           { id: 'step-5', step_number: 5, type: 'BOTH', title: 'Step 5: ภาพสรุปโปรโมชั่นเร่งปิดการขาย', text_content: page?.product?.closing_text || 'สนใจรับสิทธิ์โปรโมชั่น พิมพ์แจ้งชื่อ ที่อยู่ เบอร์โทรศัพท์ ไว้ในแชทได้เลยนะคะ', image_url: page?.product?.image_closing || page?.product?.images?.closing || '' },
           { id: 'step-6', step_number: 6, type: 'BOTH', title: 'Step 6: ภาพขอบพระคุณ & บริการหลังการขาย', text_content: page?.product?.step6_text || 'ขอบพระคุณลูกค้ามากๆ ค่ะ ทางร้านจะจัดส่งสินค้าและแจ้งเลขพัสดุให้นะคะ', image_url: page?.product?.image_step6 || '' }
@@ -264,7 +264,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
         authenticity_cert: page?.product?.specs?.authenticity_cert || 'มีใบรับรองมาตรฐาน',
         spell_or_instructions: page?.product?.specs?.spell_or_instructions || 'วิธีการใช้งานหรือบทสวดบูชาตามคำแนะนำ',
         box_contents: page?.product?.specs?.box_contents || 'ตัวสินค้า + ของแถม + ใบรับประกัน',
-        cod_note: page?.product?.specs?.cod_note || 'บริการเก็บเงินปลายทาง (COD) ไม่ต้องโอนก่อน',
+        cod_note: page?.product?.specs?.cod_note || 'บริการเก็บเงินปลายทาง ไม่ต้องโอนก่อน',
         shipping_time: page?.product?.specs?.shipping_time || 'จัดส่ง 1-3 วันถึง',
         shipping_duration: initialShipping.shipping_duration,
         shipping_fee: initialShipping.shipping_fee,
@@ -316,7 +316,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
               quantity: 2,
               price: Math.round((page?.product?.display_price || 0) * 1.8),
               original_price: (page?.product?.base_price || 0) * 2,
-              free_gifts: 'ของแถมพรีเมียม + ส่งฟรี COD',
+              free_gifts: 'ของแถมพรีเมียม + ส่งฟรีเก็บเงินปลายทาง',
               description: 'ประหยัดเพิ่มขึ้น 20%',
               is_popular: true
             },
@@ -815,7 +815,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
         <div className="flex border-b border-slate-200 dark:border-zinc-800 bg-slate-100/60 dark:bg-[#0E0E11] px-6 overflow-x-auto gap-2 shrink-0">
           {[
             { id: 'ai_persona', label: '1. บุคลิก AI & โมเดล Gemini', icon: Bot },
-            { id: 'sales_sequence', label: '2. แพตเทิร์น 6 สเต็ป + รูปภาพ', icon: Layers },
+            { id: 'sales_sequence', label: '2. ข้อมูลร้านให้ AI (ข้อความ+รูป)', icon: Layers },
             { id: 'comments', label: '3. ตอบคอมเมนต์ + รูป 6 ใบ', icon: MessageSquare },
             { id: 'followup', label: '4. ปรับเวลาติดตามออเดอร์', icon: Clock },
             { id: 'detailed_specs', label: '5. ข้อมูลสินค้าละเอียด & ขนส่ง 🚚', icon: FileText },
@@ -958,7 +958,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                   className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md cursor-pointer shrink-0 transition-all"
                 >
                   <Plus className="w-4 h-4" />
-                  <span>+ เพิ่มสเต็ปปิดการขาย</span>
+                  <span>+ เพิ่มชุดข้อมูลให้ AI</span>
                 </button>
               </div>
 
@@ -1114,7 +1114,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                   className="w-full sm:w-auto px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-md cursor-pointer transition-all inline-flex items-center justify-center gap-2"
                 >
                   <Plus className="w-4 h-4" />
-                  <span>+ เพิ่มสเต็ปการส่งปิดการขาย (สเต็ปที่ {(formData.sales_sequence_steps || []).length + 1})</span>
+                  <span>+ เพิ่มชุดข้อมูลให้ AI (ชุดที่ {(formData.sales_sequence_steps || []).length + 1})</span>
                 </button>
               </div>
             </div>
@@ -2776,48 +2776,30 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                 </div>
               </div>
 
-              {/* Sales Sequence Auto-Trigger */}
+              {/* AI-first reply notice — แทน toggle "Sales Sequence Auto-Trigger" เดิม
+                  (ระบบไม่ยิงข้อความสคริปต์ตรง ๆ อีกแล้ว toggle จึงไม่มีผลเชิงพฤติกรรม) */}
               <div className="bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-xl p-5 space-y-4 shadow-xs">
-                <div className="flex items-center justify-between">
+                <div className="flex items-start gap-2">
+                  <Zap className="w-4 h-4 text-indigo-600 dark:text-indigo-400 mt-0.5 shrink-0" />
                   <div>
-                    <h4 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 flex items-center gap-2">
-                      <Zap className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
-                      Sales Sequence Auto-Trigger
+                    <h4 className="text-sm font-semibold text-slate-900 dark:text-zinc-100">
+                      🧠 AI เป็นผู้ตอบหนึ่งเดียว (AI-first)
                     </h4>
                     <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
-                      ส่งลำดับการขายทันทีเมื่อลูกค้าทักครั้งแรกหรือพูดว่า "สนใจ"
+                      ข้อความทุกข้อความที่ลูกค้าได้รับ ถูกเรียบเรียงโดย AI จากข้อมูลร้านในแท็บนี้ — ระบบไม่ยิงข้อความสคริปต์สเต็ปตรง ๆ อีกเลย
                     </p>
                   </div>
-                  <label className="relative inline-flex items-center cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={formData.sales_sequence_auto_trigger || false}
-                      onChange={e => setFormData(prev => ({ ...prev, sales_sequence_auto_trigger: e.target.checked }))}
-                      className="sr-only peer"
-                    />
-                    <div className="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500"></div>
-                  </label>
                 </div>
 
-                <div className={`p-3 rounded-lg border ${
-                  formData.sales_sequence_auto_trigger
-                    ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800/60'
-                    : 'bg-slate-50 dark:bg-[#16161C] border-slate-200 dark:border-zinc-800'
-                }`}>
-                  <span className={`text-xs font-medium ${
-                    formData.sales_sequence_auto_trigger
-                      ? 'text-emerald-900 dark:text-emerald-200'
-                      : 'text-slate-700 dark:text-zinc-300'
-                  }`}>
-                    {formData.sales_sequence_auto_trigger
-                      ? '🧠 AI เป็นสมองหลักอยู่แล้ว — ข้อมูล/สคริปต์ที่กรอกไว้จะถูกส่งให้ AI ใช้เรียบเรียงคำตอบเอง (ไม่ได้ยิงเป็นข้อความซ้ำ) และเมื่อลูกค้าทักครั้งแรก/พูดคีย์เวิร์ดสนใจ ระบบจะส่งชุดพรีเซน (ข้อความ+รูป) หนึ่งครั้งเพื่อเปิดบทสนทนา'
-                      : '⏸️ ปิดใช้งาน - AI ตอบลูกค้าทุกจุดด้วยตัวเอง โดยใช้ข้อมูล/สคริปต์ที่กรอกไว้เป็นความรู้ และส่งเฉพาะรูปภาพประกอบเท่านั้น (ไม่ยิงข้อความสคริปต์ซ้ำ)'}
+                <div className="p-3 rounded-lg border bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800/60">
+                  <span className="text-xs font-medium text-emerald-900 dark:text-emerald-200">
+                    🧠 ข้อมูล/สคริปต์ที่กรอกไว้ถูกส่งเป็น "ความรู้" ให้ AI อ่านแล้วเรียบเรียงคำตอบเองตามคำถามของลูกค้า (ไม่ถูกยิงเป็นข้อความซ้ำ) และรูปภาพที่ตั้งไว้ AI จะใช้เป็นภาพประกอบตามเจตนาบทสนทนา
                   </span>
                 </div>
 
                 <div className="p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 rounded-lg">
                   <span className="text-xs text-amber-900 dark:text-amber-200 font-medium">
-                    ⚠️ คำเตือน: เมื่อเปิดใช้งาน ระบบจะส่งชุดพรีเซน (ข้อความ+รูปที่กรอกไว้) หนึ่งครั้งเมื่อลูกค้าทักครั้งแรก/สนใจชัดเจน — หลังจากนั้น AI จะตอบเองทุกข้อความด้วยข้อมูลของร้าน
+                    ⚠️ หมายเหตุ: สวิตช์ "Sales Sequence Auto-Trigger" แบบเก่าถูกถอดออกแล้ว เพราะพฤติกรรมไม่เปลี่ยนอีกต่อไป (AI ตอบทุกจุด) — ฟิลด์ยังค้างในฐานข้อมูลแต่ไม่มีผลต่อการส่ง
                   </span>
                 </div>
               </div>

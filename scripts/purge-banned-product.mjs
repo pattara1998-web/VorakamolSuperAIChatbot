@@ -14,13 +14,14 @@
  * วิธีรัน:
  *   - บนเครื่อง (ชี้ Production): DATABASE_URL="postgres://..." node scripts/purge-banned-product.mjs
  *   - บน Render Shell:            node scripts/purge-banned-product.mjs   (ใช้ DATABASE_URL จาก env อยู่แล้ว)
+ *   - ฐานข้อมูล local (PGlite):   node scripts/purge-banned-product.mjs   (ไม่ตั้ง DATABASE_URL → เปิด data/pglite ตรง ๆ)
+ *     ⚠️ ต้องหยุดเซิร์ฟเวอร์ dev/start ก่อนรัน เพราะ PGlite ล็อกได้ทีละ process
  *   - เพิ่มคำแบนเอง:              node scripts/purge-banned-product.mjs --phrase "ข้อความที่อยากแบน"
  *   - ดูอย่างเดียวไม่ลบ:          node scripts/purge-banned-product.mjs --dry-run
  */
 
 import fs from 'fs';
 import path from 'path';
-import pg from 'pg';
 
 const DEFAULT_BANNED_PRODUCT_PHRASES = [
   'กล่องตัดยา',
@@ -36,10 +37,6 @@ const phraseIdx = args.indexOf('--phrase');
 const extraPhrases = phraseIdx !== -1 ? args.slice(phraseIdx + 1).filter(a => !a.startsWith('--')) : [];
 
 const DATABASE_URL = process.env.DATABASE_URL || '';
-if (!DATABASE_URL) {
-  console.error('❌ ต้องตั้ง DATABASE_URL ก่อน (เช่น DATABASE_URL="postgres://..." node scripts/purge-banned-product.mjs)');
-  process.exit(2);
-}
 
 // รวมคำแบนจากไฟล์เดิม (ถ้ามี) + default + ที่ส่งมาทาง --phrase
 const phrasesFile = path.join(process.cwd(), 'data', 'banned-product-phrases.json');
@@ -58,10 +55,28 @@ console.log(`   คำแบน ${phrases.length} รายการ:`);
 for (const p of phrases) console.log(`   - "${p}"`);
 console.log('');
 
-const client = new pg.Client({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1') ? false : { rejectUnauthorized: false }
-});
+// เลือกไดรเวอร์เหมือน src/services/database.ts:
+// มี DATABASE_URL → Postgres จริง, ไม่มี → PGlite local (data/pglite)
+let client;
+if (DATABASE_URL) {
+  const pg = (await import('pg')).default;
+  client = new pg.Client({
+    connectionString: DATABASE_URL,
+    ssl: DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1') ? false : { rejectUnauthorized: false }
+  });
+} else {
+  const dataDir = process.env.PGLITE_DATA_DIR || path.join(process.cwd(), 'data', 'pglite');
+  console.log(` ไม่พบ DATABASE_URL → ใช้ PGlite local ที่ ${dataDir}`);
+  console.log('   ⚠️ ตรวจสอบว่าหยุดเซิร์ฟเวอร์ (npm run dev / npm start) แล้ว ไม่งั้นจะเปิด DB ไม่ขึ้น\n');
+  const { PGlite } = await import('@electric-sql/pglite');
+  const db = new PGlite(dataDir);
+  await db.waitReady;
+  client = {
+    connect: async () => {},
+    query: (text, params) => db.query(text, params),
+    end: () => db.close()
+  };
+}
 
 const report = { chatHistoryDeleted: 0, pagesReset: [], productsDeleted: 0 };
 
