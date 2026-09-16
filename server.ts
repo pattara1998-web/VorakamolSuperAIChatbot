@@ -209,31 +209,78 @@ function resolvePageDelay(page: { reply_delay_ms?: number } | undefined): number
 // Hard cap on any single AI call so a hung Gemini request can never leave a
 // customer waiting for minutes — we race the call against a timer and, on
 // timeout, retry once on the lite model before falling back to a template.
-const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 12000);
-const AI_FAST_RETRY_MS = Number(process.env.AI_FAST_RETRY_MS || 6000);
+// (Upgraded) 20s: โมเดล thinking ใหม่ใช้เวลา 8-15 วิปกติ — 12 วิเดิมทำให้ถูกตัดทิ้ง
+// ทั้งที่ยังไม่ error จริง (ต้นเหตุ AI_TIMEOUT ทั้งที่ Google ตอบช้าแค่ 13 วิ)
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 20000);
+const AI_FAST_RETRY_MS = Number(process.env.AI_FAST_RETRY_MS || 10000);
+// งบเวลารวมของ "หนึ่งคำตอบ" — ต่อให้ลองหลายโมเดล/หลายรอบ ระบบจะหยุดที่งบนี้
+// แล้วตอบด้วยข้อความสำรองที่ยังขายได้ เพื่อไม่ให้ลูกค้ารอนานเป็นนาที
+const AI_DEADLINE_MS = Number(process.env.AI_DEADLINE_MS || 35000);
 const AI_FAST_MODEL = process.env.AI_FAST_MODEL || 'gemini-2.5-flash-lite';
+// โมเดลที่เพิ่งโดน 503/quota จะถูกพักชั่วคราว — กันเสียเวลาไปกับโมเดลที่กำลัง
+// overload ทุกลูกค้าในช่วงเดียวกับที่ Google ประกาศ high demand
+const modelCooldownUntil = new Map<string, number>();
+const MODEL_COOLDOWN_MS = Number(process.env.AI_MODEL_COOLDOWN_MS || 60000);
 function withTimeout<T>(promise: Promise<T>, ms: number, label = 'AI'): Promise<T> {
   return Promise.race([
     promise,
     new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label}_TIMEOUT`)), ms))
   ]);
 }
+/**
+ * "ความล้มเหลวชั่วคราว" ของผู้ให้บริการ AI — 503 UNAVAILABLE (high demand),
+ * 429 quota, 500/502/504, network reset, timeout
+ *
+ * ทำไมสำคัญ: เดิมระบบนับเฉพาะ 404/quota ว่า "ลองโมเดลถัดไป" ส่วน 503 ถูกมองเป็น
+ * error ถาวร → model chain โยน error ออกทันทีทั้งที่อีกหลายโมเดลยังใช้ได้
+ * (ต้นเหตุจริงของอาการ "ระบบไม่ตอบเลย": log ❌ AI หลักล้มเหลว 503 / AI_TIMEOUT)
+ */
+function isTransientAiError(err: any): boolean {
+  const msg = String(err?.message || err || '');
+  const status = Number(err?.status || err?.code || 0);
+  if ([429, 500, 502, 503, 504].includes(status)) return true;
+  return /AI_TIMEOUT|TIMEOUT|DEADLINE|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|fetch failed|network|terminated|503|500|502|504|UNAVAILABLE|INTERNAL|overload|high demand|try again|temporarily|resource.?exhausted|rate.?limit|429/i.test(msg);
+}
+function markModelCooling(model: string) {
+  if (model) modelCooldownUntil.set(model, Date.now() + MODEL_COOLDOWN_MS);
+}
+function isModelCooling(model: string): boolean {
+  const until = modelCooldownUntil.get(model);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    modelCooldownUntil.delete(model);
+    return false;
+  }
+  return true;
+}
 // Two-stage AI call: primary model first; if it stalls or errors, one quick
 // retry on the lite model. Bounds worst-case latency at primaryMs + fastMs
 // instead of dropping straight to a template reply — only a total AI outage
 // (auth/quota/network down) reaches the fallback template.
+// (Upgraded) โยน error ที่ "บอกสาเหตุจริง": ถ้าตัวหลัก timeout แต่ตัวเร็วตอบ 503
+// UNAVAILABLE ต้องรายงาน 503 (transient → ลองโมเดลถัดไป) ไม่ใช่ AI_TIMEOUT
+// (ถาวร → chain ตายทั้งระบบและลูกค้าไม่ได้รับคำตอบเลย)
 async function generateWithFastRetry(ai: any, primaryModel: string, params: any, primaryMs: number, fastMs: number): Promise<any> {
+  let primaryErr: any = null;
   try {
     return await withTimeout(ai.models.generateContent({ ...params, model: primaryModel }), primaryMs);
-  } catch (primaryErr: any) {
-    // ถ้าโมเดลด่วนถูก Google ปิดไปแล้ว (deprecated) ใช้โมเดลหลักยิงซ้ำด้วย timeout สั้นแทน
-    const fastModel = DEPRECATED_GEMINI_MODELS.has(AI_FAST_MODEL) ? primaryModel : AI_FAST_MODEL;
+  } catch (err) {
+    primaryErr = err;
+  }
+  // ถ้าโมเดลด่วนถูก Google ปิดไปแล้ว (deprecated) ใช้โมเดลหลักยิงซ้ำด้วย timeout สั้นแทน
+  const fastModel = DEPRECATED_GEMINI_MODELS.has(AI_FAST_MODEL) ? primaryModel : AI_FAST_MODEL;
+  let fastErr: any = null;
+  if (fastModel !== primaryModel) {
     try {
       return await withTimeout(ai.models.generateContent({ ...params, model: fastModel }), fastMs);
-    } catch {
-      throw primaryErr;
+    } catch (err) {
+      fastErr = err;
     }
   }
+  // error แบบ "ถาวร" (auth/permission/deprecated) ต้องรายงานตรง ๆ เพื่อให้ chain หยุด
+  // ส่วน error ชั่วคราว (503/timeout) ให้รายงานตัวนั้น เพื่อให้ chain สลับโมเดลต่อ
+  const hardErr = [primaryErr, fastErr].find(e => e && !isTransientAiError(e));
+  throw hardErr || fastErr || primaryErr || new Error('AI_CALL_FAILED');
 }
 // Dedupe stores: webhook pushes + Graph API polling may deliver the same
 // message/comment twice — never process (or reply to) an event twice.
@@ -408,7 +455,9 @@ ${convoLines}
 ข้อควรระวังเพิ่มเติม: ราคาที่ระบุในระบบคือ ฿${priceFormatted} (แพ็กโปร: ${promoLines || 'ไม่มี'}) — ตอบตามตัวเลขนี้เท่านั้น ห้ามสร้างราคาขึ้นมาเอง`;
 
   try {
-    const r = await generateAiJson(prompt, { temperature, maxOutputTokens: maxTokens });
+    // (Upgraded) preferFastModel: คำตอบสำรองต้องเร็ว — เริ่มที่ flash-lite ก่อนเสมอ
+    // ไม่งั้นถ้าโมเดลหลักกำลัง 503/ช้า จะเสียเวลาซ้ำสองรอบกว่าลูกค้าจะได้คำตอบ
+    const r = await generateAiJson(prompt, { temperature, maxOutputTokens: maxTokens, preferFastModel: true });
     const text = String(r.parsed?.replyText || '').trim();
     return text || null;
   } catch (fbErr: any) {
@@ -1485,11 +1534,43 @@ function salvagePlainText(raw: string): string {
 }
 
 /**
+ * ตาข่ายนิรภัย "ข้ามผู้ให้บริการ" — เมื่อ Gemini ทุกโมเดลล่มพร้อมกัน (503 high
+ * demand / quota หมดทั้งคีย์) ระบบยังต้องตอบลูกค้าได้ ถ้ามีคีย์ Z.AI (GLM) ตั้งไว้
+ * (env ZAI_API_KEY หรือช่องในหน้าตั้งค่า) จะยิงคำถามเดิมด้วย glm-4-flash ทันที
+ * คืนค่า null เมื่อไม่มีคีย์สำรอง/สำรองก็ล้มเหลว → ผู้เรียกไปใช้ข้อความสำรองต่อ
+ */
+async function generateAiJsonViaBackupProvider(
+  fullPrompt: string,
+  temperature: number,
+  maxOutputTokens: number,
+  extraInstruction?: string
+): Promise<{ parsed: any; model: string; latencyMs: number } | null> {
+  const started = Date.now();
+  let key = '';
+  try { key = getProviderApiKey('ZAI'); } catch { key = ''; }
+  if (!key) return null;
+  const model = String(process.env.AI_BACKUP_MODEL || db.settings.zaiModel || AI_PROVIDERS.ZAI.defaultModel || 'glm-4-flash').trim();
+  const jsonInstruction = `${extraInstruction ? extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "messages": [{"text": "ข้อความสั้นๆ", "image": "main|detail|promotion|review|closing|"}], "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}}`;
+  try {
+    const raw = await withTimeout(
+      callOpenAiCompatible('ZAI', `${fullPrompt}\n\n${jsonInstruction}`, model, maxOutputTokens, temperature, true),
+      AI_FAST_RETRY_MS,
+      'AI_BACKUP'
+    );
+    addLog('INFO', 'AI_ENGINE', model, `🛟 AI หลัก (Gemini) ทุกโมเดลไม่พร้อมใช้ — ตอบลูกค้าด้วยผู้ให้บริการสำรอง ${model} สำเร็จ`, 'WARNING');
+    return { parsed: parseLooseJson(raw), model: `${model} (สำรอง)`, latencyMs: Date.now() - started };
+  } catch (bakErr: any) {
+    addLog('ERROR', 'AI_ENGINE', model, ` AI สำรอง (${model}) ล้มเหลวเช่นกัน: ${String(bakErr?.message || bakErr).slice(0, 200)}`, 'ERROR');
+    return null;
+  }
+}
+
+/**
  * Provider-aware AI call returning parsed JSON + metadata.
  * GEMINI uses the native SDK with a strict response schema and a fast-retry
  * on the lite model; every other provider uses the OpenAI-compatible caller.
  */
-async function generateAiJson(prompt: string, options: { temperature?: number; maxOutputTokens?: number; extraInstruction?: string; mediaParts?: Array<{ mimeType: string; data: string }> } = {}): Promise<{ parsed: any; model: string; latencyMs: number }> {
+async function generateAiJson(prompt: string, options: { temperature?: number; maxOutputTokens?: number; extraInstruction?: string; mediaParts?: Array<{ mimeType: string; data: string }>; preferFastModel?: boolean } = {}): Promise<{ parsed: any; model: string; latencyMs: number }> {
   const provider = getCurrentProvider();
   const temperature = options.temperature ?? 0.9;
   const maxOutputTokens = options.maxOutputTokens ?? 500;
@@ -1502,7 +1583,14 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
   if (provider === 'GEMINI') {
     const configuredModel = getProviderModel('GEMINI');
     // ลำดับลอง: โมเดลที่ตั้งไว้ก่อน → จากนั้น fallback สำหรับคีย์ฟรี
-    const candidates = [...new Set([configuredModel, ...GEMINI_GENERATION_FALLBACKS])];
+    // (Upgraded) โมเดลที่เพิ่งโดน 503/quota จะถูกต่อท้าย (cooldown 60 วิ) — กันเสีย
+    // เวลา 25 วิไปกับโมเดลที่กำลัง overload ทุกลูกค้า; และ preferFastModel (ใช้กับ
+    // คำตอบสำรอง/งานที่ต้องเร็ว) จะเริ่มที่ flash-lite ก่อนเสมอ
+    const baseCandidates = [...new Set([configuredModel, ...GEMINI_GENERATION_FALLBACKS, AI_FAST_MODEL])].filter(Boolean);
+    const candidates = options.preferFastModel
+      ? [...new Set([...GEMINI_GENERATION_FALLBACKS, AI_FAST_MODEL, configuredModel])].filter(Boolean)
+      : [...baseCandidates.filter(m => !isModelCooling(m)), ...baseCandidates.filter(m => isModelCooling(m))];
+    const deadlineAt = started + AI_DEADLINE_MS;
     // สื่อแนบ (รูป/เสียง/วิดีโอ base64) -> ส่งเข้า Gemini Vision พร้อม prompt
     const contents: any = options.mediaParts?.length
       ? [{ text: fullPrompt }, ...options.mediaParts.map(m => ({ inlineData: m }))]
@@ -1526,6 +1614,11 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
     let lastErr: any = null;
     const runModelChain = async () => {
       for (const model of candidates) {
+        // งบเวลารวมหมดแล้ว → หยุดทันที (ผู้เรียกจะได้ไปใช้คำตอบสำรอง ไม่ปล่อยลูกค้ารอ)
+        if (Date.now() >= deadlineAt) {
+          addLog('INFO', 'AI_ENGINE', model, `⏳ AI ใช้งบเวลา ${Math.round((Date.now() - started) / 1000)} วิ ครบแล้ว — หยุดลองโมเดลเพิ่มเพื่อไม่ให้ลูกค้ารอนาน`, 'WARNING');
+          break;
+        }
         // งบ output: ถ้า JSON ถูกตัดเพราะ MAX_TOKENS จะยิงซ้ำโมเดลเดิมด้วยงบสองเท่า (สูงสุด 1 ครั้ง)
         let budget = maxOutputTokens;
         for (let tokenRetry = 0; tokenRetry < 2; tokenRetry++) {
@@ -1539,7 +1632,8 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
               responseSchema: AI_REPLY_SCHEMA
             }
           }, AI_TIMEOUT_MS, AI_FAST_RETRY_MS);
-          // โมเดลนี้ยิงได้จริง — จำไว้เป็นค่าเริ่มต้นของครั้งต่อไป
+          // โมเดลนี้ยิงได้จริง — จำไว้เป็นค่าเริ่มต้นของครั้งต่อไป + เลิกพักโมเดลนี้
+          modelCooldownUntil.delete(model);
           if (model !== db.settings.geminiModel) {
             db.settings.geminiModel = model;
           }
@@ -1575,7 +1669,11 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
             budget = Math.min(budget * 2, 2048);
             continue;
           }
-          if (!isModelOrQuotaError(err)) throw err;
+          // (Upgraded) 503 UNAVAILABLE / timeout / 429 → "ลองโมเดลถัดไป" ไม่ใช่ตายทั้งระบบ
+          // เดิมใช้แค่ isModelOrQuotaError ทำให้ 503 โยน error ออกไปทั้งที่โมเดลอื่นยังว่าง
+          if (!isModelOrQuotaError(err) && !isTransientAiError(err)) throw err;
+          markModelCooling(model); // พักโมเดลนี้ 60 วิ ให้ลูกค้าคนถัดไปไม่ต้องรอซ้ำ
+          addLog('INFO', 'AI_ENGINE', model, `⚠️ โมเดล ${model} ไม่พร้อมใช้ชั่วคราว (${String(err?.message || err).slice(0, 120)}) — สลับไปโมเดลถัดไป`, 'WARNING');
           break; // โมเดลนี้ไม่พร้อมใช้ -> ลองโมเดลถัดไป
         }
       }
@@ -1586,11 +1684,24 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
     try {
       return await runModelChain();
     } catch (chainErr: any) {
-      // คีย์ฟรีโดนเพดานต่อนาทีบ่อย (429) — พักสั้นแล้วลองทั้ง chain อีกครั้งก่อนยอมแพ้
-      if (isModelOrQuotaError(chainErr)) {
+      // คีย์ฟรีโดนเพดานต่อนาทีบ่อย (429) หรือ Google ประกาศ high demand (503) —
+      // รอสั้น ๆ ให้ผู้ให้บริการคลายโหลด แล้วลองทั้ง chain อีกครั้งก่อนยอมแพ้
+      // (เฉพาะเมื่อยังมีงบเวลาเหลือพอที่จะรอ + ยิงจริง)
+      const canRetry = (isModelOrQuotaError(chainErr) || isTransientAiError(chainErr))
+        && Date.now() + 2500 + 6000 < deadlineAt;
+      if (canRetry) {
+        addLog('INFO', 'AI_ENGINE', 'SYSTEM', `🔁 AI ทุกโมเดลไม่พร้อมใช้ชั่วคราว (${String(chainErr?.message || chainErr).slice(0, 120)}) — รอ 2.5 วิ แล้วลองทั้งชุดอีกครั้ง`, 'WARNING');
         await new Promise(r => setTimeout(r, 2500));
-        return await runModelChain();
+        try {
+          return await runModelChain();
+        } catch (secondErr: any) {
+          chainErr = secondErr;
+        }
       }
+      // ก่อนยอมแพ้จริง: ถ้ามีคีย์ผู้ให้บริการสำรอง (Z.AI/GLM) ให้ลูกค้ายังได้คำตอบ
+      // — กันอาการ "ระบบไม่ตอบเลย" ตอน Gemini ล่มทั้งค่าย
+      const backup = await generateAiJsonViaBackupProvider(fullPrompt, temperature, maxOutputTokens, options.extraInstruction);
+      if (backup) return backup;
       throw chainErr;
     }
   }
@@ -3446,19 +3557,22 @@ async function startServer() {
     const sentParts: string[] = [];
     if (step.type !== 'IMAGE' && step.text_content?.trim()) {
       const stepText = stripStartingPricePhrasing(step.text_content.trim());
-      const stepRes = await sendFacebookMessage(page.page_access_token || '', recipientId, stepText);
-      if (stepRes.success) {
+      const stepRes: any = await sendFacebookMessage(page.page_access_token || '', recipientId, stepText);
+      // (Upgraded) ใช้ .blocked (Banned Guard) เป็นตัวตัดสิน "ไม่ส่ง" เท่านั้น
+      // เดิมใช้ .success ทำให้ Live Simulator (PSID ปลอม → Messenger ปฏิเสธ) ไม่เห็น
+      // สเต็ปใด ๆ เลย → เจ้าของร้านเข้าใจผิดว่า "ระบบไม่ตอบ"
+      if (!stepRes.blocked) {
         recordSimulatedSend(page.page_id, recipientId, stepText);
         sentParts.push('ข้อความ✓');
       } else {
-        sentParts.push('ข้อความ✗' + ((stepRes as any).blocked ? '(ถูกแบน)' : ''));
+        sentParts.push('ข้อความ✗(ถูกแบน)');
       }
       if (effectiveImage) await sleep(300); // รักษาลำดับ ข้อความ→รูป ไม่ให้รูปแซง
     }
     if (step.type !== 'TEXT' && effectiveImage) {
       const imgRes = await sendFacebookImageSmart(page.page_access_token || '', recipientId, effectiveImage, page.page_id);
+      recordSimulatedSend(page.page_id, recipientId, '', effectiveImage);
       if (imgRes.success) {
-        recordSimulatedSend(page.page_id, recipientId, '', effectiveImage);
         sentParts.push('รูป✓');
       } else {
         addLog('INFO', recipientId, page.page_id, `❌ ส่งรูปสเต็ป ${stepNumber} ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
@@ -4640,7 +4754,8 @@ async function startServer() {
           addLog('AI_REPLY', senderId, pageId, `📨 ส่งข้อความทัก Inbox: "${autoInboxMsg}"`, 'SUCCESS');
 
           await sleep(Math.min(commentDelay, 500));
-          await sendFacebookMessage(page.page_access_token || '', senderId, autoInboxMsg);
+          const inboxRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, autoInboxMsg);
+          if (!inboxRes.blocked) recordSimulatedSend(pageId, senderId, autoInboxMsg);
 
           // Deliver the configured comment reply images into the customer's inbox
           // (previously they were only counted in the log but never sent).
@@ -4736,7 +4851,12 @@ async function startServer() {
 
 (ลูกค้า "${customer?.customer_name || 'ไม่ทราบชื่อ'}" ทักเข้ามาถาม: "${messageText.slice(0, 100)}")`;
 
-        await sendFacebookMessage(page.page_access_token || '', senderId, '🙏 ขออภัยค่ะ แอดมินกำลังอัปเดตข้อมูลสินค้า กรุณารอสักครู่ แอดมินจะรีบมาตอบให้เร็วที่สุดค่ะ');
+        const noDataRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, '🙏 ขออภัยค่ะ แอดมินกำลังอัปเดตข้อมูลสินค้า กรุณารอสักครู่ แอดมินจะรีบมาตอบให้เร็วที่สุดค่ะ');
+        // ลูกค้า (และกล่องจำลอง) ต้องเห็นข้อความนี้ — บันทึกเข้าประวัติแชทจริงด้วย
+        if (!noDataRes.blocked) {
+          recordSimulatedSend(pageId, senderId, '🙏 ขออภัยค่ะ แอดมินกำลังอัปเดตข้อมูลสินค้า กรุณารอสักครู่ แอดมินจะรีบมาตอบให้เร็วที่สุดค่ะ');
+          try { dbService.addChatMessage(pageId, senderId, 'admin', '🙏 ขออภัยค่ะ แอดมินกำลังอัปเดตข้อมูลสินค้า กรุณารอสักครู่ แอดมินจะรีบมาตอบให้เร็วที่สุดค่ะ'); } catch { /* non-critical */ }
+        }
         addLog('INFO', 'KNOWLEDGE', pageId, `📝 เพจไม่มีข้อมูลสินค้า - แจ้งแอดมินให้กรอกข้อมูล (ลูกค้า: ${senderId})`, 'WARNING');
         dbBridge.broadcastSSE('knowledge_needed', { page_id: pageId, customer_message: messageText, sender_id: senderId });
         return;
@@ -5043,8 +5163,9 @@ ${problemsTh}
             text = `ขอบคุณที่สนใจนะคะ 🙏 รบกวนขอข้อมูลอีกครั้งค่ะ: ${problems.map(p => ORDER_PROBLEM_FIX_HINT[p]).join(' / ')}`;
           }
           await sleep(Math.min(resolvePageDelay(page), 2500));
-          const fixRes = await sendFacebookMessage(page.page_access_token || '', senderId, text);
-          if (fixRes.success) {
+          const fixRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, text);
+          if (!fixRes.blocked) {
+            recordSimulatedSend(pageId, senderId, text);
             try { dbService.addChatMessage(pageId, senderId, 'admin', text); } catch { /* non-critical */ }
             pushHistory(pageId, senderId, 'admin', text);
           }
@@ -5464,21 +5585,30 @@ ${convo || '(ไม่มีประวัติ)'}
           try {
             if (isLast && shouldSendQuickReplies) {
               const qrRes: any = await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
-              if (qrRes?.success) {
+              // ⛔ บล็อกเฉพาะเมื่อ Banned Guard สั่งห้าม — ที่เหลือบันทึกคำตอบที่ AI เรียบร้อย
+              // เสมอ เพื่อให้ Live Simulator เห็นข้อความจริงที่ระบบส่งออก (เดิม gate ด้วย
+              // .success ทำให้ PSID ปลอมของ simulator ที่ Messenger ปฏิเสธ → โชว์ว่า
+              // "ระบบไม่ตอบ" ทั้งที่ AI ทำงานปกติทุกอย่าง)
+              if (!qrRes?.blocked) {
                 recordSimulatedSend(pageId, senderId, msg.text);
               }
               addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})${qrRes?.blocked ? ' — ⛔ ถูก BANNED_PRODUCT_GUARD บล็อก' : ''}`, qrRes?.blocked ? 'WARNING' : 'SUCCESS');
             } else {
-              const msgRes = await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
-              if (msgRes.success) {
+              const msgRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
+              // ⛔ ไม่บันทึกว่า "ส่งแล้ว" เฉพาะเมื่อถูก Banned Guard บล็อกเท่านั้น
+              if (!msgRes.blocked) {
                 recordSimulatedSend(pageId, senderId, msg.text);
+              } else {
+                addLog('AI_REPLY', senderId, pageId, `⛔ ข้อความตอบกลับ (${i + 1}/${outgoing.length}) ถูก BANNED_PRODUCT_GUARD บล็อก — ไม่ส่งถึงลูกค้า`, 'WARNING');
               }
             }
             // รูปตามหลังข้อความเหมือนสเต็ปที่ตั้งไว้
             if (msg.imageUrl) {
               const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, msg.imageUrl, pageId);
+              // บันทึกลง simulator เสมอ (รูปที่ระบบตั้งใจส่ง) — เพื่อให้เจ้าของร้านตรวจ
+              // ลำดับ "ข้อความ→รูป" ได้จริงใน Live Simulator แม้ PSID ปลอมจะส่งไม่ได้
+              recordSimulatedSend(pageId, senderId, '', msg.imageUrl);
               if (imgRes.success) {
-                recordSimulatedSend(pageId, senderId, '', msg.imageUrl);
                 addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} สำเร็จ`, 'SUCCESS');
               } else {
                 addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบ ${i + 1}/${outgoing.length} ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
@@ -5506,13 +5636,15 @@ ${convo || '(ไม่มีประวัติ)'}
             if (closingText) {
               await sleep(pageDelay > 0 ? Math.min(700, pageDelay) : 400);
               try {
-                const closeRes = await sendFacebookMessage(page.page_access_token || '', senderId, closingText);
-                if (closeRes.success) {
+                const closeRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, closingText);
+                // ⛔ เฉพาะถูก Banned Guard บล็อกจึงไม่นับว่าส่ง — กรณีอื่น (PSID ปลอมใน
+                // simulator) ยังต้องแสดงข้อความปิดการขายให้เจ้าของร้านเห็นในกล่องจำลอง
+                if (!closeRes.blocked) {
                   recordSimulatedSend(pageId, senderId, closingText);
                   try { dbService.addChatMessage(pageId, senderId, 'admin', closingText); } catch { /* non-critical */ }
                   pushHistory(pageId, senderId, 'admin', closingText);
                 }
-                addLog('AI_REPLY', senderId, pageId, `🛒 ส่งข้อความปิดการขายต่อท้าย (AI เขียนเอง${sentReviewImage ? ' หลังรูปรีวิว' : ''}): "${closingText.slice(0, 90)}"${(closeRes as any).blocked ? ' — ⛔ ถูก BANNED_PRODUCT_GUARD บล็อก' : ''}`, (closeRes as any).blocked ? 'WARNING' : 'SUCCESS');
+                addLog('AI_REPLY', senderId, pageId, `🛒 ส่งข้อความปิดการขายต่อท้าย (AI เขียนเอง${sentReviewImage ? ' หลังรูปรีวิว' : ''}): "${closingText.slice(0, 90)}"${closeRes.blocked ? ' — ⛔ ถูก BANNED_PRODUCT_GUARD บล็อก' : ''}`, closeRes.blocked ? 'WARNING' : 'SUCCESS');
               } catch (closeErr: any) {
                 addLog('AI_REPLY', senderId, pageId, `⚠️ ส่งข้อความปิดการขายไม่สำเร็จ (ข้ามไปก่อน): ${closeErr?.message || closeErr}`, 'WARNING');
               }
@@ -5602,8 +5734,8 @@ ${convo || '(ไม่มีประวัติ)'}
               `🚚 จัดส่ง ${page.product?.courier_brand || 'Flash Express'} ถึงภายใน ${page.product?.delivery_days || '1-3 วัน'}\n` +
               `🔖 รหัสออเดอร์: ${newOrder.order_id}${newOrder.tracking_number ? `\n📮 เลขพัสดุ: ${newOrder.tracking_number}` : ''}\n` +
               `ขอบคุณที่อุดหนุนนะคะ 🙏`;
-            const sumRes = await sendFacebookMessage(page.page_access_token || '', senderId, summaryText);
-            if (sumRes.success) {
+            const sumRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, summaryText);
+            if (!sumRes.blocked) {
               recordSimulatedSend(pageId, senderId, summaryText);
               try { dbService.addChatMessage(pageId, senderId, 'admin', summaryText); } catch { /* non-critical */ }
               pushHistory(pageId, senderId, 'admin', summaryText);
@@ -5637,7 +5769,14 @@ ${convo || '(ไม่มีประวัติ)'}
           addLog('AI_REPLY', senderId, pageId, `🔄 AI fallback success (AI execution error) — ใช้ AI ซ้ำด้วย fallback prompt`, 'INFO');
         }
         await sleep(resolvePageDelay(page));
-        await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply);
+        // (Upgraded) บันทึกคำตอบสำรองลงกล่องจำลองด้วย — เดิมไม่บันทึก ทำให้เวลา AI ล่ม
+        // แล้วระบบตอบด้วยข้อความสำรอง เจ้าของร้านเห็นเป็น "ระบบไม่ตอบเลย" ใน Live Simulator
+        const fbRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, fallbackReply);
+        if (!fbRes?.blocked) {
+          recordSimulatedSend(pageId, senderId, fallbackReply);
+          try { dbService.addChatMessage(pageId, senderId, 'admin', fallbackReply); } catch { /* non-critical */ }
+          pushHistory(pageId, senderId, 'admin', fallbackReply);
+        }
         // แนบรูปสินค้า main กำกับคำตอบสำรองเสมอ — ลูกค้าต้องได้ "ข้อความ + รูป" แม้ AI ล้ม
         try {
           const fbSeqSteps = (page.sales_sequence_steps || []) as any[];
@@ -5647,10 +5786,11 @@ ${convo || '(ไม่มีประวัติ)'}
           const mainImage = fbProdImgs.main || (page.product as any)?.image_main?.trim() || fbStepImg(1);
           if (mainImage) {
             const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, mainImage, pageId);
+            recordSimulatedSend(pageId, senderId, '', mainImage);
             if (imgRes.success) {
               addLog('AI_REPLY', senderId, pageId, '🖼️ แนบรูปสินค้ากำกับคำตอบสำรองสำเร็จ', 'SUCCESS');
             } else {
-              addLog('AI_REPLY', senderId, pageId, `❌ แนบรูปสินค้ากำกับคำตอบสำรองไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+              addLog('AI_REPLY', senderId, pageId, ` แนบรูปสินค้ากำกับคำตอบสำรองไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
             }
           }
         } catch { /* รูปไม่สำคัญพอจะทำให้ fallback ล้ม */ }
