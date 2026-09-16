@@ -624,6 +624,5 @@ export interface IntentResult {
     total_amount?: number;
   };
   replyText?: string;
-  sequenceStep?: number;
 }
 

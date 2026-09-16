@@ -393,6 +393,7 @@ async function generateAiFallbackReply(
 สินค้าจริง: ${productName} ประเภท ${category}
 ราคาโปร: ฿${priceFormatted}${promoLines ? ' | แพ็กโปรโมชั่น: ' + promoLines : ''}ราคาพื้นฐาน: ฿${pricing.regular.toLocaleString()}${freeShipLine ? ' // แพ็กนี้ส่งฟรี' : ''}
 บอกราคาตรงตัวเท่านั้น ห้ามพิมพ์ตัวเลขเอง ห้ามบอกว่า "เริ่มต้นที่" ห้ามพูดคำว่า "ราคาเริ่มต้น" เด็ดขาด
+${getBannedProductPromptRule()}
 บทสนทนาล่าสุด (${hist.length} ข้อความ):
 ${convoLines}
 ข้อความล่าสุดลูกค้า: ${lastMsgPreview}
@@ -486,6 +487,126 @@ function compactSpecText(specs: string): string {
     })
     .join('\n');
 }
+// ---------------------------------------------------------------------------
+// 🚫 BANNED PRODUCT GUARD (single source of truth)
+// ปัญหาจริง: ข้อความขายสินค้าเก่าที่ถูกยกเลิก ("กล่องตัดยา พกพาง่าย 💊 ... โปรอยู่ ฿990")
+// ยังหลุดไปถึงลูกค้าซ้ำ ๆ ทั้งที่โค้ด/ฐานข้อมูลในเครื่องไม่มีข้อความนี้แล้ว
+// ต้นเหตุ 2 ทาง: (1) ข้อมูลสินค้า/สเต็ปเก่าค้างในฐานข้อมูล Production (2) AI อ่าน
+// ประวัติแชทเก่าแล้ว "พูดเลียนแบบ" (parrot) ข้อความเดิมกลับมา
+// การ์ดนี้จึงมี 3 ชั้น: กรองที่จุดส่งจริงทุกช่องทาง + ห้าม AI พูดถึงใน prompt
+// + เครื่องมือล้างข้อมูล (endpoint /api/admin/purge-banned-product + สคริปต์)
+// รายการคำแบนเพิ่ม/ลดได้ และถูกเก็บถาวรใน data/banned-product-phrases.json
+// ---------------------------------------------------------------------------
+const BANNED_PHRASES_FILE = process.env.BANNED_PHRASES_FILE || path.join(process.cwd(), 'data', 'banned-product-phrases.json');
+const DEFAULT_BANNED_PRODUCT_PHRASES = [
+  'กล่องตัดยา',
+  'ตัดยา พกพาง่าย',
+  'โปรอยู่ 990',
+  'พกพาง่าย 990',
+  'สเปกหรือโปรโมชั่นเพิ่มแจ้งได้เลย'
+];
+let bannedProductPhrases: string[] = [...DEFAULT_BANNED_PRODUCT_PHRASES];
+let bannedPhrasesLoaded = false;
+
+function loadBannedProductPhrases(): void {
+  if (bannedPhrasesLoaded) return;
+  bannedPhrasesLoaded = true;
+  try {
+    if (fs.existsSync(BANNED_PHRASES_FILE)) {
+      const saved = JSON.parse(fs.readFileSync(BANNED_PHRASES_FILE, 'utf8'));
+      if (Array.isArray(saved?.phrases)) {
+        bannedProductPhrases = Array.from(new Set([...DEFAULT_BANNED_PRODUCT_PHRASES, ...saved.phrases.map((p: any) => String(p).trim()).filter(Boolean)]));
+      }
+    }
+  } catch { /* corrupted file -> keep defaults */ }
+}
+
+function saveBannedProductPhrases(): void {
+  try {
+    const dir = path.dirname(BANNED_PHRASES_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // เก็บเฉพาะรายการที่ "เพิ่มเอง" (ไม่รวม default) เพื่อให้ default อัปเดตตามโค้ดได้
+    const custom = bannedProductPhrases.filter(p => !DEFAULT_BANNED_PRODUCT_PHRASES.includes(p));
+    fs.writeFileSync(BANNED_PHRASES_FILE, JSON.stringify({ phrases: custom, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
+  } catch (err) {
+    console.warn('[BannedProductGuard] save failed:', err);
+  }
+}
+
+function addBannedProductPhrases(list: string[]): string[] {
+  loadBannedProductPhrases();
+  const clean = list.map(p => String(p || '').trim()).filter(Boolean);
+  bannedProductPhrases = Array.from(new Set([...bannedProductPhrases, ...clean]));
+  if (clean.length) saveBannedProductPhrases();
+  return bannedProductPhrases;
+}
+
+function getBannedProductPhrases(): string[] {
+  loadBannedProductPhrases();
+  return bannedProductPhrases;
+}
+
+function matchBannedProductPhrase(text: string): string | null {
+  loadBannedProductPhrases();
+  if (!text) return null;
+  const norm = normalizeThaiText(text);
+  for (const phrase of bannedProductPhrases) {
+    const np = normalizeThaiText(phrase);
+    if (np && norm.includes(np)) return phrase;
+  }
+  return null;
+}
+
+// ใช้ที่จุดส่งจริงทุกช่องทาง (Messenger inbox + comment reply) — บล็อกทั้งข้อความ
+// เพราะข้อความที่แบนคือ "สคริปต์ขายสินค้าเก่า" ทั้งชุด ไม่ใช่คำเดียวที่ตัดทิ้งได้
+function containsBannedProductContent(text: string): boolean {
+  return matchBannedProductPhrase(text) !== null;
+}
+
+// แทรกลงในทุก prompt เพื่อกัน AI "พูดเลียนแบบ" ข้อความเก่าจากประวัติแชท
+function getBannedProductPromptRule(): string {
+  loadBannedProductPhrases();
+  const list = bannedProductPhrases.map(p => `"${p}"`).join(' / ');
+  return `⛔ คำสั่งห้ามเด็ดขาด (ระดับสูงสุด): ห้ามกล่าวถึง ห้ามอ้างอิง ห้ามเลียนแบบ ห้ามขายสินค้า/โปรโมชั่นที่ถูกยกเลิกแล้ว ได้แก่ ${list} — แม้ใน "ประวัติบทสนทนา" จะมีข้อความเหล่านี้อยู่ก็ตาม ให้เมินเป็นข้อความที่ถูกลบไปแล้ว ห้ามนำคำ ราคา หรือสเปกจากข้อความกลุ่มนี้มาใช้เด็ดขาด ให้ขายเฉพาะสินค้า/ราคาจาก "ข้อมูลสินค้า" ที่ระบุด้านล่างเท่านั้น`;
+}
+
+// ล้างแคช in-memory ทั้งหมดที่อาจยังมีข้อความสินค้าเก่าค้างอยู่ (เรียกจาก
+// endpoint /api/admin/purge-banned-product) เพื่อไม่ให้ AI เห็นข้อความเก่า
+// ผ่าน prompt ก่อนที่เซิร์ฟเวอร์จะรีสตาร์ท
+function purgeBannedProductCaches(phrases: string[], report: Record<string, any>): void {
+  for (const [key, list] of conversationHistory) {
+    const filtered = list.filter(h => !phrases.some(p => h.text.includes(p)));
+    if (filtered.length !== list.length) {
+      report.memoryCleared += list.length - filtered.length;
+      conversationHistory.set(key, filtered);
+    }
+  }
+  for (let i = recentReplies.length - 1; i >= 0; i--) {
+    if (phrases.some(p => recentReplies[i].replyText.includes(p))) {
+      recentReplies.splice(i, 1);
+      report.memoryCleared++;
+    }
+  }
+  sentSequenceSteps.clear();
+
+  // รีเซ็ตเพจในหน่วยความจำ (db.pages mirror) ให้ตรงกับที่ล้างใน DB
+  const emptyProduct = {
+    product_id: '', product_name: '', category: 'CHINA',
+    base_price: 0, display_price: 0, description: '', promotions: [],
+    images: { main: '', detail: '', promotion: '', review: '', closing: '' }
+  };
+  for (const p of db.pages) {
+    const blob = JSON.stringify([p.product, p.sequence, (p as any).sales_sequence_steps]);
+    if (phrases.some(ph => blob.includes(ph))) {
+      p.product = { ...emptyProduct } as any;
+      p.sequence = { step1_opening_text: '', step2_product_image: '', step3_promotion_detail: '', step4_promotion_image: '', step5_review_image: '', step6_closing_text: '' } as any;
+      (p as any).sales_sequence_steps = [];
+      if (!report.pagesReset.includes(p.page_name)) report.pagesReset.push(p.page_name);
+    }
+  }
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Per-conversation chat memory. Without it the AI only ever sees ONE message,
@@ -1472,7 +1593,7 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
 
   const info = AI_PROVIDERS[provider];
   const model = getProviderModel(provider);
-  const jsonInstruction = `${options.extraInstruction ? options.extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "messages": [{"text": "ข้อความสั้นๆ", "image": "main|detail|promotion|review|closing|"}], "sequenceStep": 1-6, "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}} — ตอบเป็น messages array เหมือนแอดมินส่งไล่กัน (บังคับ: 3-5 ข้อความสำหรับเจตนา PRICE/PROMOTION/NEGOTIATION/ORDER/TRUST — แต่ละข้อความพูดเรื่องละจุด เช่น ข้อ1 ตอบคำถาม ข้อ2 จุดขาย/ราคาโปร ข้อ3 ของแถม ข้อ4 รีวิว/การันตี ข้อ5 ปิดการขาย; 2-3 ข้อความสำหรับ GREETING/QUESTION/SHIPPING — และแนบรูป (image) เมื่อพรีเซนสินค้าหรือโปรโมชั่น: main=รูปสินค้า detail=รายละเอียด promotion=โปรโมชั่น review=รีวิว closing=ปิดการขาย\n⛔ ห้ามใช้คำว่า "ราคาเริ่มต้น" หรือ "เริ่มต้นที่" เด็ดขาด — บอกราคาของแพ็กตรงตัวตามที่ตั้งไว้ในระบบเท่านั้น (เช่น "แพ็ก 1 ชุด ฿X")`;
+  const jsonInstruction = `${options.extraInstruction ? options.extraInstruction + '\n\n' : ''}ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {"intent": "GREETING|QUESTION|PRICE|PROMOTION|SHIPPING|TRUST|NEGOTIATION|ORDER", "replyText": "...", "messages": [{"text": "ข้อความสั้นๆ", "image": "main|detail|promotion|review|closing|"}], "isOrderDetected": true/false, "orderData": {"customer_name": "", "phone_number": "", "address": "", "quantity": 0, "unit_price": 0, "total_amount": 0}} — ตอบเป็น messages array เหมือนแอดมินส่งไล่กัน (บังคับ: 3-5 ข้อความสำหรับเจตนา PRICE/PROMOTION/NEGOTIATION/ORDER/TRUST — แต่ละข้อความพูดเรื่องละจุด เช่น ข้อ1 ตอบคำถาม ข้อ2 จุดขาย/ราคาโปร ข้อ3 ของแถม ข้อ4 รีวิว/การันตี ข้อ5 ปิดการขาย; 2-3 ข้อความสำหรับ GREETING/QUESTION/SHIPPING — และแนบรูป (image) เมื่อพรีเซนสินค้าหรือโปรโมชั่น: main=รูปสินค้า detail=รายละเอียด promotion=โปรโมชั่น review=รีวิว closing=ปิดการขาย\n⛔ ห้ามใช้คำว่า "ราคาเริ่มต้น" หรือ "เริ่มต้นที่" เด็ดขาด — บอกราคาของแพ็กตรงตัวตามที่ตั้งไว้ในระบบเท่านั้น (เช่น "แพ็ก 1 ชุด ฿X")`;
 
   const raw = await callOpenAiCompatible(provider, fullPrompt, model, maxOutputTokens, temperature, true)
     .catch(async (primaryErr: any) => {
@@ -1555,10 +1676,6 @@ const AI_REPLY_SCHEMA = {
         },
         required: ['text']
       }
-    },
-    sequenceStep: {
-      type: Type.NUMBER,
-      description: 'ขั้นตอน Sales Sequence 1-6'
     },
     isOrderDetected: {
       type: Type.BOOLEAN,
@@ -1897,6 +2014,91 @@ async function startServer() {
     auth.blockIP(ip, reason || 'Blocked by admin', duration_hours);
     addLog('INFO', 'ADMIN', 'SYSTEM', `🚫 Block IP ${ip}: ${reason || 'No reason'} โดย ${session.username}`, 'WARNING');
     res.json({ success: true, message: `บล็อก IP ${ip} แล้ว` });
+  });
+
+  // ================================================================
+  // 🚫 BANNED PRODUCT PURGE — ล้างสินค้า/โปรเก่าที่ถูกยกเลิกออกจากฐานข้อมูลจริง
+  // ใช้เมื่อเลิกขายสินค้าราวี่เดียว: (1) ลบ chat_history ที่มีสคริปต์ขายเก่า
+  // (ต้นเหตุที่ AI "เลียนแบบ" ข้อความเก่ากลับมาขายซ้ำ) (2) รีเซ็ต product/sequence
+  // snapshot ของเพจที่ยังติดข้อมูลเก่า (3) ลบแถว products ที่ขายสินค้าค่านี้
+  // (4) ล้างแคช in-memory (ประวัติแชท/คำตอบล่าสุด/สเต็ปที่เคยส่ง)
+  // เพิ่มคำแบนใหม่ได้ผ่าน body.phrases — เก็บถาวรใน data/banned-product-phrases.json
+  // และจะถูกใช้โดย BANNED PRODUCT GUARD ที่บล็อกการส่งจริงทุกช่องทาง
+  // ================================================================
+  app.post('/api/admin/purge-banned-product', async (req: Request, res: Response) => {
+    const sessionId = req.headers['x-session-id'] as string;
+    const session = auth.validateSession(sessionId);
+    if (!session || session.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const phrasesInput: string[] = Array.isArray(req.body?.phrases)
+      ? req.body.phrases.map((p: any) => String(p).trim()).filter(Boolean)
+      : [];
+    const phrases = phrasesInput.length ? addBannedProductPhrases(phrasesInput) : getBannedProductPhrases();
+    const report: Record<string, any> = { phrases, chatHistoryDeleted: 0, pagesReset: [] as string[], productsDeleted: 0, memoryCleared: 0 };
+
+    try {
+      // (1) chat_history — ลบทุกแถวที่ตรงคำแบน
+      for (const phrase of phrases) {
+        try {
+          const cnt = await dbService.executeRaw('SELECT COUNT(*)::int AS c FROM chat_history WHERE text ILIKE $1', [`%${phrase}%`]);
+          const n = Number((cnt as any[])?.[0]?.c || 0);
+          if (n > 0) {
+            await dbService.executeRaw('DELETE FROM chat_history WHERE text ILIKE $1', [`%${phrase}%`]);
+            report.chatHistoryDeleted += n;
+          }
+        } catch (err) {
+          console.warn('[PurgeBanned] chat_history failed for phrase:', phrase, err);
+        }
+      }
+
+      // (2) pages — รีเซ็ต product/sequence snapshot ของเพจที่ติดข้อมูลสินค้าเก่า
+      try {
+        const pageRows = await dbService.executeRaw('SELECT page_id, page_name, product, sequence, sales_sequence_steps FROM pages') as any[];
+        for (const row of pageRows || []) {
+          const blob = JSON.stringify([row.product, row.sequence, row.sales_sequence_steps]);
+          if (phrases.some(p => blob.includes(p))) {
+            await dbService.executeRaw("UPDATE pages SET product = '{}', sequence = '{}', sales_sequence_steps = '[]' WHERE page_id = $1", [row.page_id]);
+            report.pagesReset.push(String(row.page_name || row.page_id));
+          }
+        }
+      } catch (err) {
+        console.warn('[PurgeBanned] pages scan failed:', err);
+      }
+
+      // (3) products — ลบแถวสินค้าที่ขายของค่านี้ (ชื่อ/โปร/ข้อความเปิด-รายละเอียดตรงคำแบน)
+      for (const phrase of phrases) {
+        try {
+          const sel = await dbService.executeRaw(
+            "SELECT product_id FROM products WHERE product_name ILIKE $1 OR promotion_detail ILIKE $1 OR opening_text ILIKE $1 OR detail_text ILIKE $1",
+            [`%${phrase}%`]
+          ) as any[];
+          if (sel.length > 0) {
+            await dbService.executeRaw(
+              "DELETE FROM products WHERE product_name ILIKE $1 OR promotion_detail ILIKE $1 OR opening_text ILIKE $1 OR detail_text ILIKE $1",
+              [`%${phrase}%`]
+            );
+            report.productsDeleted += sel.length;
+          }
+        } catch (err) {
+          console.warn('[PurgeBanned] products failed for phrase:', phrase, err);
+        }
+      }
+
+      await purgeBannedProductCaches(phrases, report);
+
+      addLog('INFO', 'ADMIN', 'SYSTEM', `🧹 Purge banned product โดย ${session.username}: ลบแชท ${report.chatHistoryDeleted} ข้อความ | รีเซ็ตเพจ ${report.pagesReset.length} | ลบสินค้า ${report.productsDeleted} | ล้างแคช ${report.memoryCleared} | คำแบน ${phrases.length} รายการ`, 'WARNING');
+
+      res.json({
+        success: true,
+        message: `ล้างข้อมูลสินค้าที่ถูกแบนเรียบร้อย — ลบประวัติแชท ${report.chatHistoryDeleted} ข้อความ, รีเซ็ต ${report.pagesReset.length} เพจ, ลบ ${report.productsDeleted} สินค้า และระบบจะบล็อกข้อความกลุ่มนี้ไม่ให้ส่งถึงลูกค้าอีก`,
+        report
+      });
+    } catch (err: any) {
+      addLog('ERROR', 'ADMIN', 'SYSTEM', `❌ Purge banned product ล้มเหลว: ${err.message}`, 'ERROR');
+      res.status(500).json({ success: false, error: err.message, report });
+    }
   });
 
   // Unblock an IP
@@ -3000,6 +3202,13 @@ async function startServer() {
 
   // Helper to send Facebook Messenger Private Message using Graph API
   async function sendFacebookMessage(accessToken: string, recipientId: string, text: string) {
+    // 🚫 BANNED PRODUCT GUARD (ชั้นที่ 3 — จุดส่งจริง): ข้อความใดก็ตามที่ตรงกับ
+    // สคริปต์ขายสินค้าเก่าที่ถูกแบน จะไม่ถูกส่งถึงลูกค้าเด็ดขาด ไม่ว่าจะมาจาก AI,
+    // สเต็ปขาย, followup หรือ broadcast
+    if (containsBannedProductContent(text)) {
+      addLog('INFO', recipientId, '', `⛔ BANNED_PRODUCT_GUARD: บล็อกข้อความที่มีเนื้อหาสินค้า/โปรที่ถูกแบน — ไม่ส่งถึงลูกค้า | ตรงคำ: "${matchBannedProductPhrase(text)}"`, 'WARNING');
+      return { success: false, blocked: 'BANNED_PRODUCT_CONTENT' };
+    }
     const rawToken = decryptToken(accessToken);
     if (!rawToken || !rawToken.startsWith('EAA')) {
       addLog('INFO', 'FACEBOOK_API', recipientId, '⛔ ไม่ส่งข้อความ: เพจยังไม่มี Page Access Token จริง', 'ERROR');
@@ -3156,6 +3365,11 @@ async function startServer() {
   // titles, 1000-char payloads. Empty/broken entries are filtered out so a
   // single bad button can never fail the whole message.
   async function sendFacebookQuickReplies(accessToken: string, recipientId: string, text: string, quickReplies: { title: string; payload: string }[]) {
+    // 🚫 BANNED PRODUCT GUARD: ปุ่ม Quick Reply ส่งตรงผ่าน Graph API จึงต้องกันเอง
+    if (containsBannedProductContent(text)) {
+      addLog('INFO', recipientId, '', `⛔ BANNED_PRODUCT_GUARD: บล็อกข้อความ (Quick Reply) ที่มีเนื้อหาสินค้า/โปรที่ถูกแบน | ตรงคำ: "${matchBannedProductPhrase(text)}"`, 'WARNING');
+      return { success: false, blocked: 'BANNED_PRODUCT_CONTENT' };
+    }
     const rawToken = decryptToken(accessToken);
     if (!rawToken || !rawToken.startsWith('EAA')) {
       return { success: false, simulated: true, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
@@ -3228,9 +3442,13 @@ async function startServer() {
     const sentParts: string[] = [];
     if (step.type !== 'IMAGE' && step.text_content?.trim()) {
       const stepText = stripStartingPricePhrasing(step.text_content.trim());
-      await sendFacebookMessage(page.page_access_token || '', recipientId, stepText);
-      recordSimulatedSend(page.page_id, recipientId, stepText);
-      sentParts.push('ข้อความ✓');
+      const stepRes = await sendFacebookMessage(page.page_access_token || '', recipientId, stepText);
+      if (stepRes.success) {
+        recordSimulatedSend(page.page_id, recipientId, stepText);
+        sentParts.push('ข้อความ✓');
+      } else {
+        sentParts.push('ข้อความ✗' + ((stepRes as any).blocked ? '(ถูกแบน)' : ''));
+      }
       if (effectiveImage) await sleep(300); // รักษาลำดับ ข้อความ→รูป ไม่ให้รูปแซง
     }
     if (step.type !== 'TEXT' && effectiveImage) {
@@ -3249,6 +3467,11 @@ async function startServer() {
 
   // Helper to reply to a Facebook Comment using Graph API
   async function sendFacebookCommentReply(accessToken: string, commentId: string, text: string) {
+    // 🚫 BANNED PRODUCT GUARD (ชั้นที่ 3 — จุดส่งจริงฝั่งคอมเมนต์)
+    if (containsBannedProductContent(text)) {
+      addLog('INFO', 'FACEBOOK_API', commentId, `⛔ BANNED_PRODUCT_GUARD: บล็อกคอมเมนต์ตอบกลับที่มีเนื้อหาสินค้า/โปรที่ถูกแบน | ตรงคำ: "${matchBannedProductPhrase(text)}"`, 'WARNING');
+      return { success: false, blocked: 'BANNED_PRODUCT_CONTENT' };
+    }
     const rawToken = decryptToken(accessToken);
     if (!rawToken || !rawToken.startsWith('EAA')) {
       addLog('COMMENT', 'FACEBOOK_API', commentId, '⛔ ไม่ตอบคอมเมนต์: เพจยังไม่มี Page Access Token จริง', 'ERROR');
@@ -4687,6 +4910,7 @@ ${usedRepliesText}
 17. 👂 อ่านอารมณ์ลูกค้า: ถ้าลูกค้าดูเอะใจ/สงสัย/ลังเล ให้ตอบข้อกังวลก่อนอย่างเห็นอกเห็นใจแล้วค่อยเสนอทางออก ถ้าลูกค้าตัดสินใจชัดเจนแล้ว ให้สบายใจ ยืนยันขั้นตอนการสั่งซื้อให้สั้นกระชับ ไม่ยื้อ
 18. 🔁 ความหลากหลายของประโยค: ห้ามใช้คำเปิด/คำปิดซ้ำกันติด ๆ กันหลายรอบต่อเนื่อง (เช่น "ได้เลยค่า", "รับสิทธิ์ได้เลยนะคะ") — เปลี่ยนวิธีพูดทุกครั้ง อ้างอิงสิ่งที่ลูกค้าพูดเป็นหลัก เพื่อให้บทสนทนาดูเหมือนคนจริงคุยกับคนจริง
 19. ✍️ ตอบแบบแชทจริง: พิมพ์เป็นภาษาไทยอ่านง่าย ใช้เว้นบรรทัด/อิโมจิน้อย ๆ (ไม่เกิน 1-2 ต่อข้อความ) แบบแอดมินมือถือ ไม่เป็นทางการเกิน ไม่ใช้ภาษาเขียนยาวเหยียด
+20. ${getBannedProductPromptRule()}
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
@@ -4815,9 +5039,11 @@ ${problemsTh}
             text = `ขอบคุณที่สนใจนะคะ 🙏 รบกวนขอข้อมูลอีกครั้งค่ะ: ${problems.map(p => ORDER_PROBLEM_FIX_HINT[p]).join(' / ')}`;
           }
           await sleep(Math.min(resolvePageDelay(page), 2500));
-          await sendFacebookMessage(page.page_access_token || '', senderId, text);
-          try { dbService.addChatMessage(pageId, senderId, 'admin', text); } catch { /* non-critical */ }
-          pushHistory(pageId, senderId, 'admin', text);
+          const fixRes = await sendFacebookMessage(page.page_access_token || '', senderId, text);
+          if (fixRes.success) {
+            try { dbService.addChatMessage(pageId, senderId, 'admin', text); } catch { /* non-critical */ }
+            pushHistory(pageId, senderId, 'admin', text);
+          }
           addLog('ORDER', senderId, pageId, `🧾 AI แจ้งลูกค้าและขอข้อมูลสั่งซื้อใหม่ (${problems.join(',')}): "${text.slice(0, 90)}"`, 'SUCCESS');
         }
 
@@ -5233,12 +5459,16 @@ ${convo || '(ไม่มีประวัติ)'}
           const isLast = i === outgoing.length - 1;
           try {
             if (isLast && shouldSendQuickReplies) {
-              await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
-              recordSimulatedSend(pageId, senderId, msg.text);
-              addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})`, 'SUCCESS');
+              const qrRes: any = await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
+              if (qrRes?.success) {
+                recordSimulatedSend(pageId, senderId, msg.text);
+              }
+              addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})${qrRes?.blocked ? ' — ⛔ ถูก BANNED_PRODUCT_GUARD บล็อก' : ''}`, qrRes?.blocked ? 'WARNING' : 'SUCCESS');
             } else {
-              await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
-              recordSimulatedSend(pageId, senderId, msg.text);
+              const msgRes = await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
+              if (msgRes.success) {
+                recordSimulatedSend(pageId, senderId, msg.text);
+              }
             }
             // รูปตามหลังข้อความเหมือนสเต็ปที่ตั้งไว้
             if (msg.imageUrl) {
@@ -5272,11 +5502,13 @@ ${convo || '(ไม่มีประวัติ)'}
             if (closingText) {
               await sleep(pageDelay > 0 ? Math.min(700, pageDelay) : 400);
               try {
-                await sendFacebookMessage(page.page_access_token || '', senderId, closingText);
-                recordSimulatedSend(pageId, senderId, closingText);
-                try { dbService.addChatMessage(pageId, senderId, 'admin', closingText); } catch { /* non-critical */ }
-                pushHistory(pageId, senderId, 'admin', closingText);
-                addLog('AI_REPLY', senderId, pageId, `🛒 ส่งข้อความปิดการขายต่อท้าย (AI เขียนเอง${sentReviewImage ? ' หลังรูปรีวิว' : ''}): "${closingText.slice(0, 90)}"`, 'SUCCESS');
+                const closeRes = await sendFacebookMessage(page.page_access_token || '', senderId, closingText);
+                if (closeRes.success) {
+                  recordSimulatedSend(pageId, senderId, closingText);
+                  try { dbService.addChatMessage(pageId, senderId, 'admin', closingText); } catch { /* non-critical */ }
+                  pushHistory(pageId, senderId, 'admin', closingText);
+                }
+                addLog('AI_REPLY', senderId, pageId, `🛒 ส่งข้อความปิดการขายต่อท้าย (AI เขียนเอง${sentReviewImage ? ' หลังรูปรีวิว' : ''}): "${closingText.slice(0, 90)}"${(closeRes as any).blocked ? ' — ⛔ ถูก BANNED_PRODUCT_GUARD บล็อก' : ''}`, (closeRes as any).blocked ? 'WARNING' : 'SUCCESS');
               } catch (closeErr: any) {
                 addLog('AI_REPLY', senderId, pageId, `⚠️ ส่งข้อความปิดการขายไม่สำเร็จ (ข้ามไปก่อน): ${closeErr?.message || closeErr}`, 'WARNING');
               }
@@ -5366,10 +5598,12 @@ ${convo || '(ไม่มีประวัติ)'}
               `🚚 จัดส่ง ${page.product?.courier_brand || 'Flash Express'} ถึงภายใน ${page.product?.delivery_days || '1-3 วัน'}\n` +
               `🔖 รหัสออเดอร์: ${newOrder.order_id}${newOrder.tracking_number ? `\n📮 เลขพัสดุ: ${newOrder.tracking_number}` : ''}\n` +
               `ขอบคุณที่อุดหนุนนะคะ 🙏`;
-            await sendFacebookMessage(page.page_access_token || '', senderId, summaryText);
-            recordSimulatedSend(pageId, senderId, summaryText);
-            try { dbService.addChatMessage(pageId, senderId, 'admin', summaryText); } catch { /* non-critical */ }
-            pushHistory(pageId, senderId, 'admin', summaryText);
+            const sumRes = await sendFacebookMessage(page.page_access_token || '', senderId, summaryText);
+            if (sumRes.success) {
+              recordSimulatedSend(pageId, senderId, summaryText);
+              try { dbService.addChatMessage(pageId, senderId, 'admin', summaryText); } catch { /* non-critical */ }
+              pushHistory(pageId, senderId, 'admin', summaryText);
+            }
             addLog('ORDER', senderId, pageId, `🧾 ส่งสรุปยอดให้ลูกค้าแล้ว ฿${summaryTotal.toLocaleString()} (${qty} ชุด × ฿${unit.toLocaleString()})`, 'SUCCESS');
           } catch (summaryErr: any) {
             addLog('ORDER', senderId, pageId, `⚠️ ส่งสรุปยอดให้ลูกค้าไม่สำเร็จ (ข้ามไปก่อน): ${summaryErr?.message || summaryErr}`, 'WARNING');
