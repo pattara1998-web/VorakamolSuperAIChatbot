@@ -347,6 +347,50 @@ function extractOrderInfo(rawText: string): { phone_number: string; address: str
 // ราคาจริง "จุดเดียว" ของทั้งระบบ (single source of truth)
 // แถวในตาราง products (matchedProduct) มาก่อนเสมอ เพราะเป็นที่ที่แอดมินบันทึกราคาแพ็ก
 // ไว้จริง → ค่อย fallback ไปที่ snapshot ของเพจ
+// ---------------------------------------------------------------------------
+// 🧠 "ข้อมูลที่เจ้าของร้านเตรียมไว้" → ความรู้ของ AI (ไม่ใช่ข้อความที่ส่งตรง)
+//
+// ปรัชญาของระบบ: เจ้าของร้านใส่ "แค่ข้อมูล" (ข้อความขาย/สคริปต์/รูป ที่กรอกไว้ใน
+// สเต็ป 1-6 หรือช่องสินค้า) ส่วน AI เป็นสมองที่อ่านข้อความลูกค้าแล้วหยิบข้อมูล
+// เหล่านี้ไปเรียบเรียงเป็นคำตอบของตัวเอง เหมือนแอดมินมนุษย์ที่อ่านคู่มือร้านแล้ว
+// พูดกับลูกค้าด้วยคำของตัวเอง
+//
+// ⛔ สิ่งที่ "ไม่" ทำแล้ว: ยิงข้อความสคริปต์จากสเต็ปออกไปตรง ๆ ทับคำตอบ AI
+// (ต้นเหตุที่ลูกค้าได้รับข้อความซ้ำ/นอกเรื่อง จนดูเหมือนระบบไม่ตอบคำถาม)
+// ---------------------------------------------------------------------------
+function buildOwnerPreparedData(page: any): string {
+  const lines: string[] = [];
+  const push = (line: string) => {
+    const clean = stripStartingPricePhrasing(String(line || '').replace(/\s+/g, ' ').trim());
+    if (clean.length < 3) return;
+    if (lines.some(l => l.includes(clean))) return; // dedupe
+    lines.push(clean);
+  };
+
+  const steps = ((page?.sales_sequence_steps || []) as any[])
+    .filter(s => s && String(s.text_content || '').trim())
+    .sort((a, b) => Number(a.step_number || 0) - Number(b.step_number || 0));
+  for (const s of steps) push(`- (สเต็ป ${s.step_number}) ${String(s.text_content).trim()}`);
+
+  const seq = (page?.sequence || {}) as any;
+  for (const t of [seq.step1_opening_text, seq.step2_product_text, seq.step3_promotion_detail, seq.step5_review_text, seq.step6_closing_text]) {
+    if (String(t || '').trim()) push(`- ${String(t).trim()}`);
+  }
+
+  const prod = page?.product || {};
+  const extraKnowledge = [
+    prod.custom_specs,
+    prod.specs?.custom_specs,
+    prod.ai_knowledge,
+    prod.knowledge,
+    (page as any)?.ai_knowledge
+  ].map(v => String(v || '').trim()).filter(Boolean);
+  for (const t of extraKnowledge) push(`- ${t}`);
+
+  return lines.join('\n');
+}
+
+
 // นี่คือจุดที่ปิดบั๊ก "AI ตอบราคาเก่า/ราคาที่ไม่มีในระบบ" ให้หมดไป
 // ---------------------------------------------------------------------------
 function resolveProductPricing(page: any, matchedProduct: any): {
@@ -839,6 +883,27 @@ function stripStartingPricePhrasing(text: string): string {
     .replace(/เริ่มต้นที่\s*฿/g, 'ราคา ฿')
     .replace(/เริ่มต้น\s*฿/g, 'ราคา ฿');
 }
+// 🧠 "ข้อมูลที่เจ้าของร้านเตรียมไว้" (สคริปต์เปิด/โปร/ปิดการขาย + ลำดับแบบเก่า)
+// ถูกป้อนให้ AI เป็น "ข้อมูล" เพื่อเรียบเรียงคำตอบเอง — ไม่ส่งเป็นข้อความสำเร็จรูป
+// อีกต่อไป (AI = สมองที่รับข้อความลูกค้าแล้วใช้ข้อมูลนี้ตอบแบบมนุษย์)
+function buildOwnerScriptData(page: any): string {
+  const lines: string[] = [];
+  const steps = (Array.isArray(page?.sales_sequence_steps) ? page.sales_sequence_steps : [])
+    .filter((s: any) => s && String(s.text_content || '').trim())
+    .sort((a: any, b: any) => Number(a.step_number || 0) - Number(b.step_number || 0));
+  for (const s of steps) lines.push(`- ${String(s.text_content).trim().slice(0, 600)}`);
+  if (lines.length === 0) {
+    // ลำดับแบบเก่า (page.sequence) — เจ้าของร้านที่ยังไม่ได้ย้ายมา sales_sequence_steps
+    const seq = (page?.sequence || {}) as any;
+    for (const key of ['step1_opening_text', 'step3_promotion_detail', 'step6_closing_text']) {
+      const t = String(seq?.[key] || '').trim();
+      if (t) lines.push(`- ${t.slice(0, 600)}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+
 
 // (Upgraded) จับคีย์เวิร์ดแบบทนพิมพ์ผิด — ลูกค้าอาจพิมพ์ "สนใต" "สนจัย" "สนใจ้"
 // normalizeThai: ตัดวรรณยุกต์/สระบน-ล่างออกก่อนเทียบ (สนใจ้ = สนใจ)
@@ -4829,22 +4894,36 @@ async function startServer() {
             }
           }
 
-          // Sales Sequence Auto-Trigger also applies to comments: a commenter with
-          // purchase intent ("สนใจ" etc.) gets the full configured step sequence.
-          // (Upgraded) เก็บ step ที่มีข้อความหรือรูปจริง (รวมรูป fallback จากสินค้า);
-          // หลังส่งครบ แล้ว mark cooldown 24ชม. + mark แต่ละ step (dedupe 6ชม.)
-          // → ลูกค้าคนเดิมทัก Inbox ตามมา จะได้เพียงคำตอบ AI ไม่ถูกยัดชุดสเต็ปซ้ำ
+          // 🧠 AI เป็นสมอง (แม้ลูกค้ามาจากคอมเมนต์): เรียบเรียงข้อความทัก Inbox
+          // จาก "ข้อมูลที่เจ้าของร้านเตรียมไว้" แทนการยิงสคริปต์สเต็ปตรง ๆ
+          // → ลูกค้าได้ข้อความที่ตอบความสนใจของตัวเอง ไม่ใช่ชุดสคริปต์ซ้ำ ๆ
+          //   รูปที่เจ้าของตั้งไว้ (ขั้นที่ 2/4/5) ยังส่งต่อเป็นภาพประกอบให้เห็นสินค้า
           const sequenceSteps = (page.sales_sequence_steps || []).filter(s => s && (s.text_content?.trim() || s.image_url?.trim() || resolveConfiguredStepImage(page, s)));
-          if (hasPurchaseIntent && page.sales_sequence_auto_trigger && sequenceSteps.length > 0) {
-            addLog('COMMENT', senderId, pageId, `🚀 Sales Sequence Auto-Trigger (คอมเมนต์): ส่ง ${sequenceSteps.length} ขั้นตอนเข้า Inbox`, 'SUCCESS');
-            const ordered = [...sequenceSteps].sort((a, b) => a.step_number - b.step_number);
+          if (hasPurchaseIntent && sequenceSteps.length > 0) {
+            const ownerData = buildOwnerPreparedData(page);
+            const pitchText = await generateAiFallbackReply(page, page.product, 'PROMOTION', [], senderId, pageId, 0.6, 700);
+            if (pitchText) {
+              await sleep(Math.min(commentDelay, 800));
+              const pitchRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, pitchText);
+              if (!pitchRes.blocked) {
+                recordSimulatedSend(pageId, senderId, pitchText);
+                try { dbService.addChatMessage(pageId, senderId, 'admin', pitchText); } catch { /* non-critical */ }
+                pushHistory(pageId, senderId, 'admin', pitchText);
+              }
+              addLog('COMMENT', senderId, pageId, `🧠 AI เรียบเรียงข้อความพรีเซนจากข้อมูลร้าน ${ownerData ? `${ownerData.split('\n').length} รายการ` : '(ไม่มี)'}: "${pitchText.slice(0, 80)}"`, 'SUCCESS');
+            }
+            // ภาพประกอบตามที่เจ้าของร้านเตรียมไว้ (เฉพาะรูป — ไม่ยิงข้อความสคริปต์)
+            const ordered = [...sequenceSteps].sort((a, b) => (a.step_number || 0) - (b.step_number || 0));
             for (const step of ordered) {
+              const stepImage = String(step.image_url || '').trim() || resolveConfiguredStepImage(page, step);
+              if (!stepImage) continue;
               const stepDelay = Number(step.delay_seconds) > 0 ? Math.min(Number(step.delay_seconds) * 1000, 1500) : Math.min(commentDelay, 800);
               await sleep(stepDelay);
-              await sendConfiguredSequenceStep(page, senderId, step.step_number);
-              markSequenceStepSent(pageId, senderId, step.step_number);
+              const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, stepImage, pageId);
+              if (!imgRes.success) {
+                addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปพรีเซน (สเต็ป ${step.step_number}) เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
+              }
             }
-            sequencePresentationLog.set(`${pageId}:${senderId}`, Date.now());
           }
         }
         return;
@@ -5052,6 +5131,11 @@ async function startServer() {
         ? usedReplies.map(r => `- "${r}"`).join('\n')
         : '(ยังไม่มีคำตอบก่อนหน้า)';
 
+      // 🧠 ข้อมูลที่เจ้าของร้านเตรียมไว้ → ส่งเข้า prompt เป็น "ความรู้" ให้ AI
+      // เรียบเรียงเอง (ไม่ยิงเป็นข้อความสคริปต์ออกไป) — นี่คือหัวใจของโหมด
+      // "เจ้าของร้านใส่แค่ข้อมูล / AI เป็นสมองที่คุยกับลูกค้าเหมือนมนุษย์"
+      const ownerScriptData = buildOwnerPreparedData(page);
+
       let promptContext = `
 คุณคือ "${adminName}" ซึ่งเป็นแอดมินร้านค้าเพจ Facebook: "${page.page_name}"
 ลักษณะการตอบและบุคลิก:
@@ -5096,6 +5180,10 @@ ${usedRepliesText}
 18. 🔁 ความหลากหลายของประโยค: ห้ามใช้คำเปิด/คำปิดซ้ำกันติด ๆ กันหลายรอบต่อเนื่อง (เช่น "ได้เลยค่า", "รับสิทธิ์ได้เลยนะคะ") — เปลี่ยนวิธีพูดทุกครั้ง อ้างอิงสิ่งที่ลูกค้าพูดเป็นหลัก เพื่อให้บทสนทนาดูเหมือนคนจริงคุยกับคนจริง
 19. ✍️ ตอบแบบแชทจริง: พิมพ์เป็นภาษาไทยอ่านง่าย ใช้เว้นบรรทัด/อิโมจิน้อย ๆ (ไม่เกิน 1-2 ต่อข้อความ) แบบแอดมินมือถือ ไม่เป็นทางการเกิน ไม่ใช้ภาษาเขียนยาวเหยียด
 20. ${getBannedProductPromptRule()}
+21. 🧠 ข้อมูลที่เจ้าของร้านเตรียมไว้ (ด้านล่าง "ข้อมูล/สคริปต์ที่เจ้าของร้านเตรียมไว้"): นี่คือ "ความรู้ของร้าน" ไม่ใช่ข้อความที่ต้องส่ง — ให้อ่านทำความเข้าใจ แล้วเลือกหยิบมาเรียบเรียงใหม่ด้วยถ้อยคำของคุณเองแบบแอดมินคุยจริง ⛔ ห้ามคัดลอกทั้งดุ้น ห้ามส่งรวดเดียวทุกบรรทัด ห้ามพูดซ้ำกับที่คุยไปแล้ว ใช้เฉพาะส่วนที่ "ตอบคำถามล่าสุดของลูกค้า" และห้ามใส่ข้อความ/ราคาที่ไม่มีในข้อมูลนี้หรือในสเปกสินค้าด้านล่าง
+
+📝 ข้อมูล/สคริปต์ที่เจ้าของร้านเตรียมไว้ (ใช้เป็น "ความรู้" เท่านั้น — เรียบเรียงใหม่ด้วยคำของคุณเอง เลือกใช้เฉพาะที่ตรงกับคำถามลูกค้า):
+${ownerScriptData || '(เจ้าของร้านยังไม่ได้เตรียมข้อมูลเพิ่มเติม — ตอบจากข้อมูลสินค้าและสเปกด้านล่างนี้เท่านั้น)'}
 
 ข้อมูลสินค้าหลักของเพจนี้ (1 เพจ 1 สินค้า):
 - รหัสสินค้า: ${page.product?.product_id || matchedProduct.product_id}
@@ -5189,6 +5277,19 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
 - 📦 แพ็กและราคาจริงที่ใช้ปิดการขายได้เท่านั้น (ห้ามใช้ราคาอื่น): ${closingPackLines}
 - ตัวอย่างน้ำเสียงปิดการขาย (ปรับถ้อยคำให้เข้ากับสินค้า/แพ็กจริง ห้ามลอกเป๊ะ): "สนใจรับกี่ชุดดีคะ 😊 ถ้าสะดวกสั่งเลย รบกวนแจ้งชื่อ-นามสกุล / เบอร์โทร / ที่อยู่จัดส่ง มาได้เลยนะคะ เดี๋ยวแอดมินสรุปยอดให้ค่ะ"
 - ถ้าลูกค้าแจ้งจำนวนชุดแล้ว ให้สรุปยอด = จำนวนชุด × ราคาแพ็กที่ตรงกับจำนวนนั้น (ใช้ราคาจริงด้านบนเท่านั้น) และบอกขั้นตอนถัดไปให้ลูกค้าอุ่นใจ`;
+        }
+
+        // 🧠 AI = สมองหลักของการตอบ: ข้อความ/สคริปต์ที่เจ้าของร้านเตรียมไว้ (สเต็ป 1-6
+        // ในหน้า "ลำดับการส่งภาพและข้อความปิดการขาย") ถูกป้อนเป็น "ข้อมูล" ให้ AI
+        // เรียบเรียงคำตอบเองตามคำถามลูกค้า — ไม่ส่งเป็นข้อความสำเร็จรูปอีก
+        // (ข้อกำหนด: เจ้าของร้านใส่แค่ข้อมูล ที่เหลือ AI คุยกับลูกค้าเหมือนมนุษย์)
+        const ownerScriptData = buildOwnerScriptData(page);
+        if (ownerScriptData) {
+          promptContext += `
+
+📝 ข้อความที่เจ้าของร้านเตรียมไว้ (ข้อมูลอ้างอิง — ใช้เนื้อหาจริงจากนี้ แต่ต้องเรียบเรียงใหม่ด้วยน้ำเสียงแอดมิน ให้เข้ากับคำถามล่าสุดของลูกค้า ห้ามคัดลอกทั้งดุ้น):
+${ownerScriptData}
+- กฎ: ถ้าข้อมูลชุดนี้ขัดกับ "ข้อมูลสินค้า/ราคา/โปรโมชั่น" ด้านบน ให้ยึดข้อมูลสินค้า/ราคาด้านบนเป็นหลัก และห้ามนำข้อมูลของสินค้า/โปรที่ถูกยกเลิกมาใช้`;
         }
 
         // Provider-aware AI call: capped by the timeout race inside
@@ -5611,55 +5712,29 @@ ${convo || '(ไม่มีประวัติ)'}
         const sequenceStepsToSend = configuredSteps
           .filter(s => s && (s.text_content?.trim() || s.image_url?.trim() || resolveConfiguredStepImage(page, s)))
           .sort((a, b) => a.step_number - b.step_number);
-        const sequenceWillFire = shouldTriggerSalesSequence && sequenceStepsToSend.length > 0;
-
-        // Cooldown พรีเซนชุดเต็ม: 1 ครั้ง / 24 ชม. ต่อลูกค้า — รอบถัดไปได้แค่คำตอบ AI
-        const presentationKey = `${pageId}:${senderId}`;
-        const presentedRecently = (() => {
-          const t = sequencePresentationLog.get(presentationKey);
-          return typeof t === 'number' && Date.now() - t < SEQUENCE_PRESENTATION_COOLDOWN_MS;
-        })();
-        const shouldPresentFullSequence = sequenceWillFire && !presentedRecently;
+        // สเต็ปที่เจ้าของร้านเตรียมไว้ = "ข้อมูล" ให้ AI ใช้ตอบ ไม่ใช่ชุดข้อความที่ส่งตรง
+        // (ดู buildOwnerScriptData + promptContext ด้านบน) — เก็บจำนวนไว้เพื่อ log
+        const ownerPreparedStepCount = sequenceStepsToSend.length;
 
         // Send the AI answer with human-like pacing
         // (Upgraded) cap 2.5s — pageDelay ที่ตั้งสูง ไม่ต้องรอทั้ง 30 วิ ก่อนตอบ
         await sleep(Math.min(pageDelay, 2500));
 
-        // ── ส่งแบบแอดมินจริง (แบบเดิม + อัปเกรด) ──
-        // ── เจ้าของการตอบรอบนี้: STEPS (พรีเซนครั้งแรก ครั้งเดียว) หรือ AI (ที่เหลือ 100%) ──
-        // ข้อกำหนด: สเต็ปใช้ได้แค่ "ทักแรก" หรือ "เจอคีย์เวิร์ดครั้งแรก" เท่านั้น
-        // หลังจากนั้น AI เป็นสมองหลัก — ห้ามมีสเต็ปส่งตามหลังคำตอบ AI อีก
-        const replyOwner: 'STEPS' | 'AI' = shouldPresentFullSequence ? 'STEPS' : 'AI';
-        const ownerReason = shouldPresentFullSequence
-          ? `พรีเซนครั้งแรก (${matchedKeyword ? `คีย์เวิร์ด "${matchedKeyword}"` : isNewCustomer ? 'ลูกค้าทักครั้งแรก' : 'สัญญาณสนใจซื้อ'})`
-          : presentedRecently
-            ? 'พรีเซนไปแล้วภายใน 24 ชม.'
-            : isReturningCustomer
-              ? 'ลูกค้าเก่าที่เคยสั่งซื้อ'
-              : 'ไม่ใช่ทักแรก/ไม่พบคีย์เวิร์ด';
-
-        if (replyOwner === 'STEPS') {
-          // ── รอบนี้ "สเต็ป" เป็นเจ้าของ: พรีเซนชุดสเต็ปแล้วจบรอบ — AI ไม่ตอบซ้อน ──
-          sequencePresentationLog.set(presentationKey, Date.now()); // mark พรีเซนแล้ว (24 ชม.)
-          addLog('INFO', senderId, pageId, `🚀 เจ้าของรอบนี้ = STEPS (${ownerReason}) — พรีเซน ${sequenceStepsToSend.length} สเต็ป: ${sequenceStepsToSend.map(s => s.step_number).join('→')}`, 'SUCCESS');
-          for (const step of sequenceStepsToSend) {
-            // delay ต่อสเต็ป cap 2.5s — ยังเป็นจังหวะธรรมชาติเหมือนแอดมินส่งไล่กัน
-            const rawStepDelayMs = Number(step.delay_seconds) > 0 ? Number(step.delay_seconds) * 1000 : Math.min(pageDelay, 1500);
-            const stepDelayMs = Math.min(rawStepDelayMs, 2500);
-            await sleep(stepDelayMs);
-            try {
-              await sendConfiguredSequenceStep(page, senderId, step.step_number);
-              markSequenceStepSent(pageId, senderId, step.step_number); // กันซ้ำทั้งชุด (dedupe 6 ชม.)
-            } catch (seqErr: any) {
-              addLog('INFO', senderId, pageId, `⚠️ ส่งสเต็ป ${step.step_number} ผิดพลาด (ข้ามไปก่อน): ${seqErr?.message || seqErr}`, 'WARNING');
-            }
-          }
-          addLog('INFO', senderId, pageId, `✅ ส่งชุดพรีเซนครบ ${sequenceStepsToSend.length} สเต็ป — รอบถัดไป AI เป็นเจ้าของการตอบ 100%`, 'SUCCESS');
-        } else {
-          // ── รอบนี้ "AI" เป็นเจ้าของ 100%: ส่งเฉพาะข้อความ AI ไม่มีสเต็ปตามหลัง ──
-          addLog('INFO', senderId, pageId, `🤖 เจ้าของรอบนี้ = AI (${ownerReason}) — ส่งเฉพาะคำตอบ AI ${outgoing.length} ข้อความ ไม่มีสเต็ปตามหลัง`, 'INFO');
-          if (shouldTriggerSalesSequence && sequenceStepsToSend.length === 0) {
-            addLog('INFO', senderId, pageId, '⚠️ พบสัญญาณสนใจซื้อ แต่ยังไม่มีสเต็ปให้ส่ง — ตั้งค่าในแท็บ "ลำดับการส่งภาพและข้อความปิดการขาย" (sales_sequence_steps) หรือกรอกข้อความ/รูปในลำดับแบบเก่า (step1-step6) ก่อน', 'WARNING');
+        // ── AI เป็นสมองหลัก 100% ของทุกคำตอบ ─────────────────────────────────
+        // ระบบไม่ส่งสเต็ปสำเร็จรูปอีกแล้ว: ข้อความที่เจ้าของร้านเตรียมไว้ถูกป้อนเป็น
+        // "ข้อมูล" (ownerScriptData) ให้ AI ใช้เรียบเรียงคำตอบเองตามคำถามลูกค้า
+        // จึงคุยเป็นธรรมชาติเหมือนมนุษย์แอดมิน ไม่ใช่บอทสคริปต์ที่ยิงชุดเดิมซ้ำ
+        {
+          const ownerReason = isReturningCustomer
+            ? 'ลูกค้าเก่าที่เคยสั่งซื้อ'
+            : matchedKeyword
+              ? `พบคีย์เวิร์ดความสนใจ "${matchedKeyword}"`
+              : isNewCustomer
+                ? 'ลูกค้าทักครั้งแรก'
+                : 'บทสนทนาต่อเนื่อง';
+          addLog('INFO', senderId, pageId, `🧠 AI เป็นสมองหลัก (${ownerReason}) — ส่งคำตอบ ${outgoing.length} ข้อความ${ownerScriptData ? ` | ใช้ข้อมูลที่เจ้าของร้านเตรียมไว้ ${ownerPreparedStepCount} รายการ` : ''}`, 'INFO');
+          if (shouldTriggerSalesSequence && ownerPreparedStepCount === 0) {
+            addLog('INFO', senderId, pageId, 'ℹ️ ลูกค้าแสดงความสนใจซื้อ — เติมข้อความ/รูปในแท็บ "ลำดับการส่งภาพและข้อความปิดการขาย" ได้ AI จะนำไปใช้ตอบ (ไม่ใช่ส่งสคริปต์ตรง ๆ)', 'INFO');
           }
           for (let i = 0; i < outgoing.length; i++) {
           const msg = outgoing[i];
