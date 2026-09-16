@@ -152,6 +152,9 @@ async function initTables() {
       courier_brand TEXT DEFAULT '',
       delivery_days TEXT DEFAULT '',
       shipping_duration TEXT DEFAULT '',
+      -- ค่าส่งที่เรียกเก็บจากลูกค้า ("ฟรี" / "90 บาท") — UI ส่งฟิลด์นี้มาตลอด
+      -- ถ้าไม่มีคอลัมน์ upsertRow() จะ INSERT ไม่ผ่านและสินค้าหายทั้งแถว (รวมรูป)
+      shipping_fee TEXT DEFAULT '',
       image_main TEXT DEFAULT '',
       image_detail TEXT DEFAULT '',
       image_promotion TEXT DEFAULT '',
@@ -328,6 +331,11 @@ async function initTables() {
     ALTER TABLE products ADD COLUMN IF NOT EXISTS promotions TEXT DEFAULT '[]';
     ALTER TABLE products ADD COLUMN IF NOT EXISTS courier_brand TEXT DEFAULT '';
     ALTER TABLE products ADD COLUMN IF NOT EXISTS delivery_days TEXT DEFAULT '';
+    -- Shipping Matrix: ค่าส่ง (ฐานข้อมูลบน Render สร้างก่อนฟิลด์นี้มีอยู่จริง)
+    -- เคยทำให้ error 42703 column "shipping_fee" does not exist → บันทึกสินค้า
+    -- ล้มเหลวทั้งก้อน image_main…image_closing ไม่เคยลง DB บอทจึงไม่มีรูปส่งให้ลูกค้า
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS shipping_fee TEXT DEFAULT '';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS shipping_duration TEXT DEFAULT '';
 
     CREATE TABLE IF NOT EXISTS page_daily_expenses (
       page_id TEXT NOT NULL,
@@ -350,9 +358,63 @@ async function initTables() {
 
 // ===================== GENERIC UPSERT HELPERS =====================
 
+/** ชื่อคอลัมน์จริงของแต่ละตาราง (cache) — กันฟิลด์ใหม่ที่ UI ส่งมาทำ INSERT ล้มทั้งก้อน */
+const tableColumnsCache = new Map<string, Set<string>>();
+
+/** อนุญาตเฉพาะชื่อคอลัมน์ที่ปลอดภัยต่อการฝังใน SQL (กัน injection) */
+const SAFE_COLUMN_RE = /^[a-z_][a-z0-9_]{0,62}$/i;
+
+async function getTableColumns(table: string): Promise<Set<string>> {
+  const cached = tableColumnsCache.get(table);
+  if (cached) return cached;
+  try {
+    const res = await q('SELECT column_name FROM information_schema.columns WHERE table_name = ?', [table]);
+    const cols = new Set<string>((res.rows || []).map((r: any) => String(r.column_name).toLowerCase()));
+    if (cols.size > 0) tableColumnsCache.set(table, cols);
+    return cols;
+  } catch {
+    return new Set<string>();
+  }
+}
+
+/**
+ * Self-heal schema drift.
+ * เดิม upsertRow() สร้าง INSERT จาก Object.keys(record) ทั้งหมด → ถ้ามีแม้แต่ 1 ฟิลด์
+ * ที่ตารางยังไม่มีคอลัมน์ (เช่น shipping_fee) จะ error 42703 และ "การบันทึกทั้งแถวล้มเหลว"
+ * ส่งผลให้ image_main…image_closing ไม่เคยลง Postgres บอทจึงไม่มีรูปส่งให้ลูกค้าเลย
+ * ตอนนี้: ฟิลด์ที่ขาดจะถูก ALTER TABLE ADD COLUMN (TEXT) ให้อัตโนมัติครั้งเดียว
+ * ถ้าทำไม่ได้จริง ๆ จะตัดเฉพาะฟิลด์นั้นทิ้ง แล้วบันทึกฟิลด์ที่เหลือตามปกติ
+ */
+async function reconcileColumns(table: string, record: Record<string, any>): Promise<Record<string, any>> {
+  let cols = await getTableColumns(table);
+  if (cols.size === 0) return record; // อ่าน schema ไม่ได้ → ปล่อยผ่าน (คงพฤติกรรมเดิม)
+  const missing = Object.keys(record).filter(k => !cols.has(k.toLowerCase()));
+  if (missing.length === 0) return record;
+
+  const out: Record<string, any> = { ...record };
+  for (const key of missing) {
+    if (!SAFE_COLUMN_RE.test(key)) {
+      delete out[key];
+      continue;
+    }
+    try {
+      await q(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${key} TEXT DEFAULT ''`);
+      cols = new Set(cols);
+      cols.add(key.toLowerCase());
+      tableColumnsCache.set(table, cols);
+      console.warn(`[DB] Self-heal: เพิ่มคอลัมน์ ${table}.${key} (TEXT) อัตโนมัติ — ควรประกาศใน initTables() ด้วย`);
+    } catch (err: any) {
+      delete out[key];
+      console.warn(`[DB] ข้ามฟิลด์ ${table}.${key} (ตารางไม่มีคอลัมน์นี้): ${err?.message || err}`);
+    }
+  }
+  return out;
+}
+
 /** INSERT ... ON CONFLICT(pk) DO UPDATE built from an object's own keys. */
 async function upsertRow(table: string, pk: string, record: Record<string, any>, skipOnUpdate: string[] = []): Promise<void> {
-  const cols = Object.keys(record);
+  const safeRecord = await reconcileColumns(table, record);
+  const cols = Object.keys(safeRecord);
   if (cols.length === 0) return;
   const updateCols = cols.filter(c => c !== pk && !skipOnUpdate.includes(c));
   const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
@@ -362,7 +424,7 @@ async function upsertRow(table: string, pk: string, record: Record<string, any>,
     : 'DO NOTHING';
   await q(
     `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders}) ON CONFLICT (${pk}) ${conflictCols}`,
-    cols.map(c => record[c] ?? null)
+    cols.map(c => safeRecord[c] ?? null)
   );
 }
 
