@@ -5616,7 +5616,7 @@ ${convo || '(ไม่มีประวัติ)'}
         // ไม่ใช่ canned message ที่ใส่ราคาจาก DB เอง (เสี่ยงราคาผิด)
         // เรียก AI ซ้ำด้วย fallback prompt ที่มีข้อมูลราคาจริง + เจตนาจริง
         const fallbackText = await generateAiFallbackReply(
-          page, matchedProduct, intentHint, history, senderId, pageId,
+          page, matchedProduct, intentHint, historyEntries, senderId, pageId,
           0.5, 800,
         );
         let fallbackReply = fallbackText;
