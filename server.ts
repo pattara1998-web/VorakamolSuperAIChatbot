@@ -6366,16 +6366,35 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             const seqOut = buildConfiguredSequenceReply(page, intentHint);
             if (seqOut.length > 0) {
               const seqJoined = seqOut.map(m => m.text).filter(Boolean).join('\n•\n');
+              let seqDelivered = 0;
+              let seqFirstError = '';
               for (let si = 0; si < seqOut.length; si++) {
                 const seqMsg: any = seqOut[si];
                 const seqImages: string[] = Array.isArray(seqMsg.images) ? seqMsg.images : [];
+                const sendText = async (): Promise<boolean> => {
+                  if (!seqMsg.text) return false;
+                  const res: any = await sendFacebookMessage(page.page_access_token || '', senderId, seqMsg.text);
+                  // simulated = เพจทดสอบไม่มี token จริง (Live Simulator) → นับเป็นส่งสำเร็จเพื่อให้เห็นผลในเครื่องมือจำลอง
+                  if (res && res.success === false && !res.simulated) {
+                    if (!seqFirstError) {
+                      const e = res.error;
+                      seqFirstError = typeof e === 'string'
+                        ? e
+                        : (e?.message ? `${e.code || ''} ${e.message}`.trim() : String(res.blocked || JSON.stringify(e) || 'SEND_FAILED'));
+                    }
+                    return false;
+                  }
+                  return true;
+                };
+                let deliveredThis = false;
                 if (seqMsg.send_order === 'IMAGE_FIRST' && seqImages.length > 0) {
                   for (const seqImg of seqImages) { try { await sendFacebookImageSmart(page.page_access_token || '', senderId, seqImg, pageId); } catch { /* รูปไม่ทำให้ชุดล้ม */ } }
-                  if (seqMsg.text) await sendFacebookMessage(page.page_access_token || '', senderId, seqMsg.text);
+                  deliveredThis = await sendText();
                 } else {
-                  if (seqMsg.text) await sendFacebookMessage(page.page_access_token || '', senderId, seqMsg.text);
+                  deliveredThis = await sendText();
                   for (const seqImg of seqImages) { try { await sendFacebookImageSmart(page.page_access_token || '', senderId, seqImg, pageId); } catch { /* รูปไม่ทำให้ชุดล้ม */ } }
                 }
+                if (deliveredThis) seqDelivered++;
                 if (seqMsg.text) {
                   recordSimulatedSend(pageId, senderId, seqMsg.text, seqImages);
                   try { dbService.addChatMessage(pageId, senderId, 'admin', seqMsg.text); } catch { /* non-critical */ }
@@ -6386,12 +6405,18 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
                 // (Speed) 150ms ระหว่างสเต็ป — ทั้งชุด 5-8 ข้อความ+รูป จบใน ~1-2 วิ
                 if (si < seqOut.length - 1) await sleep(150);
               }
-              configuredSequenceSentAt.set(seqStateKey, Date.now());
-              addRecentReply(pageId, senderId, seqJoined);
-              addLog('AI_REPLY', senderId, pageId, `⚡ Fast Sequence: ส่งสเต็ปตามที่เจ้าของตั้งไว้ครบ ${seqOut.length} ชุด (ข้อความ+รูปตรงตามตั้งค่า 100% ไม่รอ AI)`, 'SUCCESS');
-              void sendTypingIndicator(page.page_access_token || '', senderId, false);
-              persistData();
-              return;
+              // 🔧 กันลูกค้าโดนเงียบ: ถ้า Meta ปฏิเสธการส่งทั้งหมด (token หมดอายุ/เลยหน้าต่าง 24 ชม./ถูกบล็อก)
+              // → ห้าม return ทิ้ง ให้บันทึก error ของ Meta แล้วสลับกลับไป flow AI ตามปกติ
+              if (seqDelivered === 0) {
+                addLog('AI_REPLY', senderId, pageId, `⛔ Fast Sequence: Meta ปฏิเสธการส่งทุกข้อความ (${seqFirstError || 'SEND_FAILED'}) → สลับไป flow AI/สำรอง — เช็ค Page Access Token หรือหน้าต่าง 24 ชม.`, 'ERROR');
+              } else {
+                configuredSequenceSentAt.set(seqStateKey, Date.now());
+                addRecentReply(pageId, senderId, seqJoined);
+                addLog('AI_REPLY', senderId, pageId, `⚡ Fast Sequence: ส่งสเต็ปตามที่เจ้าของตั้งไว้ครบ ${seqOut.length} ชุด (ข้อความ+รูปตรงตามตั้งค่า 100% ไม่รอ AI)`, 'SUCCESS');
+                void sendTypingIndicator(page.page_access_token || '', senderId, false);
+                persistData();
+                return;
+              }
             }
           } catch (seqErr: any) {
             addLog('AI_REPLY', senderId, pageId, `⚠️ Fast Sequence ส่งไม่สำเร็จ → กลับไป flow AI ตามปกติ: ${seqErr?.message || seqErr}`, 'WARNING');
