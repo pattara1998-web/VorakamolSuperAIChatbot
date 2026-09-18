@@ -1,0 +1,5 @@
+perf: 0ms artificial delay + parallel image send
+- default REPLY_DELAY 0, remove sleep in fast paths
+- text+image parallel per-step (IMAGE_FIRST preserved)
+- pre-warm attachments + compress cache, timing/error logs per image
+- parallel order queries, persist fire-and-forget
