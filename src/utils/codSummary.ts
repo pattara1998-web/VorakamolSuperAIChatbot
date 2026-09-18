@@ -26,7 +26,7 @@ export const DEFAULT_COD_FIELDS = {
   include_closing_blessing: true
 };
 
-export function buildCodSummaryText(page: Partial<PageConfig>, order: Partial<Order>): string {
+export function buildCodSummaryText(page: Partial<PageConfig>, order: Partial<Order>, quote?: { shipping: number }): string {
   const fields = { ...DEFAULT_COD_FIELDS, ...(page.cod_summary_fields || {}) };
   const template = String(page.cod_summary_template || DEFAULT_COD_TEMPLATE).trim();
 
@@ -34,7 +34,12 @@ export function buildCodSummaryText(page: Partial<PageConfig>, order: Partial<Or
   const phoneNum = order.phone_number || 'รอระบุเบอร์โทร';
   const address = order.shipping_address || 'รอระบุที่อยู่จัดส่ง';
   const itemsStr = order.items || page.product?.product_name || 'สินค้าโปรโมชั่น';
-  const totalAmt = Number(order.total_amount || page.product?.display_price || 1000).toLocaleString();
+  const amount = order.total_amount;
+  const totalAmt = typeof amount === 'number' && Number.isFinite(amount) && amount >= 0
+    ? amount.toLocaleString() : 'รอยืนยันยอด';
+  const shippingNote = quote?.shipping === 0 ? 'จัดส่งฟรี ไม่บวกเพิ่ม'
+    : quote && quote.shipping > 0 ? `รวมค่าจัดส่ง ฿${quote.shipping.toLocaleString()} ในยอดแล้ว`
+    : 'ค่าจัดส่งตามยอดที่ยืนยันกับร้าน';
   const shippingDuration = page.product?.shipping_duration || 'จัดส่งด่วน 1-3 วัน (มีบริการเก็บเงินปลายทาง)';
 
   // If the user has a custom template, substitute variables
@@ -45,6 +50,7 @@ export function buildCodSummaryText(page: Partial<PageConfig>, order: Partial<Or
       .replace(/\{shipping_address\}/g, address)
       .replace(/\{items\}/g, itemsStr)
       .replace(/\{total_amount\}/g, totalAmt)
+      .replace(/\{shipping_note\}/g, shippingNote)
       .replace(/\{shipping_duration\}/g, shippingDuration)
       .replace(/\{order_id\}/g, order.order_id || 'ORD-PREVIEW');
     return res;
@@ -81,7 +87,7 @@ export function buildCodSummaryText(page: Partial<PageConfig>, order: Partial<Or
     lines.push(`💰 ยอดเรียกเก็บปลายทาง: ฿${totalAmt}`);
   }
   if (fields.include_shipping_note) {
-    lines.push(`✨ หมายเหตุ: ส่งฟรีไม่มีบวกเพิ่ม เก็บเงินปลายทางพอดีเป๊ะ`);
+    lines.push(`✨ หมายเหตุ: ${shippingNote}`);
   }
   if (fields.include_inspection_note) {
     lines.push(`🔍 คำแนะนำ: เมื่อได้รับพัสดุโปรดตรวจสอบความสมบูรณ์ก่อนชำระเงิน`);

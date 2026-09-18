@@ -35,6 +35,8 @@ function extractConst(prefix) {
 
 // stub: scrubBannedProductContent ตัวจริงต้องอ่านไฟล์คำแบน — ในเทสต์ให้ผ่านข้อความสะอาด
 const stubScrub = `function scrubBannedProductContent(text: string): string | null { const t = String(text || '').trim(); return t || null; }`;
+// stub: buildRecipientFallback อยู่ใน src/utils/recipientFallback.ts (มีเทสต์ของตัวเองที่ scripts/recipient-fallback.test.ts)
+const stubRecipientFallback = `function buildRecipientFallback(text: string): string | null { return null; }`;
 
 const tsCode = [
   "type IntentHint = 'GREETING' | 'PRICE' | 'PROMOTION' | 'SHIPPING' | 'TRUST' | 'NEGOTIATION' | 'ORDER' | 'FOLLOWUP' | 'PURCHASE' | 'QUESTION';",
@@ -59,8 +61,24 @@ const tsCode = [
   extract('stripStartingPricePhrasing'),
   extract('splitLongOutgoingText'),
   extract('resolveProductPricing'),
+  extract('extractRequestedQty'),
+  // resolveRequestedPack มี {} ใน parameter list ทำให้ extract() นับ brace พลาด → slice ตาม marker แทน
+  (() => {
+    const start = src.indexOf('function resolveRequestedPack');
+    const end = src.indexOf('// (1c-add) Single Closer Rule', start);
+    if (start < 0 || end < 0) throw new Error('ไม่พบ resolveRequestedPack');
+    return src.slice(start, end).replace(/\r?\n\s*$/, '\n');
+  })(),
+  // Single Closer Rule state (pendingCloserState + setClosingSent/hasClosingBeenSent/...)
+  (() => {
+    const start = src.indexOf('// (1c-add) Single Closer Rule');
+    const end = src.indexOf('// M5: Image Dedup', start);
+    if (start < 0 || end < 0) throw new Error('ไม่พบ Single Closer Rule block');
+    return src.slice(start, end).replace(/\r?\n\s*$/, '\n');
+  })(),
   stubScrub,
-  'type InstantOutgoing = Array<{ text: string; imageUrl?: string; images?: string[] }>;',
+  stubRecipientFallback,
+  'type InstantOutgoing = Array<{ text: string; imageUrl?: string; images?: string[]; send_order?: \'TEXT_FIRST\' | \'IMAGE_FIRST\' }>;',
   extract('polishInstantText'),
   extractConst('const ALL_IMAGE_KEYS'),
   extract('resolveInstantImageMap'),
@@ -68,15 +86,16 @@ const tsCode = [
   'let instantAckRotation = 0;',
   extract('buildInstantAck'),
   extract('buildInstantSalesReply'),
+  extract('buildConfiguredSequenceReply'),
   extract('buildLocalClosingAsk'),
   extract('buildLocalOrderInfoRequest')
 ].join('\n');
 
 const jsCode = transformSync(tsCode, { loader: 'ts', format: 'cjs', target: 'node18' }).code;
 const {
-  buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyIntentInstant
+  buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyIntentInstant, buildConfiguredSequenceReply
 } = new Function(
-  `${jsCode}\nreturn { buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyIntentInstant };`
+  `${jsCode}\nreturn { buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyInstantIntent: classifyIntentInstant, classifyIntentInstant, buildConfiguredSequenceReply };`
 )();
 
 let pass = 0, fail = 0;
@@ -218,6 +237,49 @@ const stepOnlyPage = {
 const presStep = buildInstantSalesReply(stepOnlyPage, null, 'PURCHASE');
 const stepImages = presStep.flatMap(m => m.images || []);
 check('รูปจากสเต็ปถูกดึงมาใช้เมื่อช่องรูปหลักว่าง', stepImages.includes('https://img.example/step2.jpg') && stepImages.includes('https://img.example/step4.jpg'));
+
+// 🔧 Regression: เพจที่มีรูปเฉพาะสเต็ป 1, 3, 5, 7, 8 (สเต็ป 7-8 เกินช่องรูปหลัก 5 ช่อง)
+// → รูปจากสเต็ป 7 และ 8 ต้องถูกส่งด้วย ไม่ตกหล่น (เคสจริงที่ลูกค้ารายงาน "ไม่มีรูปส่งมาเลย")
+const step78Page = {
+  page_name: 'เพจมีรูปสเต็ป 7-8',
+  product: { product_name: 'ที่หั่นผัก', price_1: 99 },
+  sales_sequence_steps: [
+    { step_number: 1, text_content: 'เปิดการขาย', image_url: 'https://img.example/s1.jpg' },
+    { step_number: 3, text_content: 'โปรโมชั่น', image_url: 'https://img.example/s3.jpg' },
+    { step_number: 5, text_content: 'รีวิว', image_url: 'https://img.example/s5.jpg' },
+    { step_number: 7, text_content: 'โปรโมชั่นแถม', image_url: 'https://img.example/s7.jpg' },
+    { step_number: 8, text_content: 'ปิดการขาย', image_url: 'https://img.example/s8.jpg' }
+  ]
+};
+const pres78 = buildInstantSalesReply(step78Page, null, 'PURCHASE');
+const images78 = pres78.flatMap(m => m.images || []);
+check('รูปสเต็ป 7 (เกินช่องหลัก) ถูกส่งจริง', images78.includes('https://img.example/s7.jpg'));
+check('รูปสเต็ป 8 (เกินช่องหลัก) ถูกส่งจริง', images78.includes('https://img.example/s8.jpg'));
+check('รูปครบทั้ง 5 ใบจากสเต็ป 1,3,5,7,8', images78.length >= 5);
+check('ลำดับรูปเรียงตามสเต็ป (1→3→5→7→8)', JSON.stringify(images78.slice(0, 5)) === JSON.stringify(['https://img.example/s1.jpg','https://img.example/s3.jpg','https://img.example/s5.jpg','https://img.example/s7.jpg','https://img.example/s8.jpg']));
+
+// ⚡ Tier 0: สเต็ปที่เจ้าของตั้ง → ส่งตรงตัว 100% (ไม่ผ่าน AI เรียบเรียง)
+console.log('── buildConfiguredSequenceReply (สเต็ปตามตั้งค่า 100%) ──');
+const ownerPage = {
+  page_name: 'เพจสเต็ปเจ้าของตั้ง',
+  product: { product_name: 'ที่หั่นผัก', price_1: 99 },
+  sales_sequence_steps: [
+    { step_number: 1, text_content: 'สวัสดีค่ะ ที่หั่นผักกะทัดรัด พกพาสะดวกค่ะ', image_url: 'https://img.example/o1.jpg' },
+    { step_number: 2, text_content: 'โครงสร้าง ABS แข็งแรง ใบมีดสแตนเลสคมชัดค่ะ' },
+    { step_number: 3, image_url: 'https://img.example/o3.jpg' },
+    { step_number: 8, text_content: 'โปร 3 แถม 3 ฿290 ส่งฟรี สนใจรับไหมคะ 😊 แจ้งชื่อ-ที่อยู่-เบอร์โทร เดี๋ยวสรุปยอดให้ค่ะ', image_url: 'https://img.example/o8.jpg', send_order: 'IMAGE_FIRST' }
+  ]
+};
+const seqReply = buildConfiguredSequenceReply(ownerPage, 'PURCHASE');
+check('สเต็ปเรียงตาม step_number (1,2,3,8) ครบ 4 ชุด', seqReply.length === 4);
+check('ข้อความสเต็ปตรงตามตั้ง 100% (ตัวต่อตัวอักษร)', seqReply[0].text === 'สวัสดีค่ะ ที่หั่นผักกะทัดรัด พกพาสะดวกค่ะ');
+check('รูปยึดกับสเต็ปของมัน 1:1', seqReply[0].images?.[0] === 'https://img.example/o1.jpg' && seqReply[3].images?.[0] === 'https://img.example/o8.jpg');
+check('สเต็ปมีรูปอย่างเดียว → ส่งเป็นรูปเปล่าได้ (text ว่าง)', seqReply[2].text === '' && seqReply[2].images?.[0] === 'https://img.example/o3.jpg');
+check('send_order จากสเต็ปถูกส่งต่อ', seqReply[3].send_order === 'IMAGE_FIRST');
+const seqNoClosing = buildConfiguredSequenceReply({ ...ownerPage, sales_sequence_steps: ownerPage.sales_sequence_steps.slice(0, 2) }, 'PRICE');
+check('ไม่มีสเต็ปปิดการขาย → เติม closing ท้ายชุด (intent ไม่ใช่ GREETING)', /ชื่อ|เบอร์|ที่อยู่/.test(seqNoClosing.map(m => m.text).join(' ')));
+const seqGreet = buildConfiguredSequenceReply({ ...ownerPage, sales_sequence_steps: ownerPage.sales_sequence_steps.slice(0, 2) }, 'GREETING');
+check('GREETING → ไม่ยัดปิดการขาย (2 ชุดพอดี)', seqGreet.length === 2);
 
 console.log('── buildLocalClosingAsk (ชวนปิดการขาย) ──');
 const close = buildLocalClosingAsk(fullPage, null);

@@ -19,14 +19,16 @@ async function main() {
     console.log(`   server: ${h.status} • ai_configured: ${h.ai_configured}\n`);
   } catch {
     console.error(`❌ เชื่อมต่อเซิร์ฟเวอร์ที่ ${BASE_URL} ไม่ได้ — รัน "npm start" (หรือตั้ง PORT) ก่อน`);
-    process.exit(2);
+    process.exitCode = 2;
+    return;
   }
 
   const res = await fetch(`${BASE_URL}/api/selftest`, { method: 'POST' }).catch(() => null);
   if (!res || !res.ok) {
     const body = res ? await res.text().catch(() => '') : '';
     console.error(`❌ รันการทดสอบไม่สำเร็จ (HTTP ${res?.status}): ${body.slice(0, 300)}`);
-    process.exit(2);
+    process.exitCode = 2;
+    return;
   }
 
   const { report } = await res.json();
@@ -46,10 +48,10 @@ async function main() {
   console.log(`📄 รายงานฉบับเต็ม: ${report.reportPath}`);
   console.log(`📄 ฉบับล่าสุด: reports/selftest-latest.md`);
 
-  process.exit(report.summary.fail > 0 ? 1 : 0);
+  process.exitCode = report.summary.fail > 0 ? 1 : 0;
 }
 
 main().catch(err => {
   console.error('selftest error:', err);
-  process.exit(2);
+  process.exitCode = 2;
 });

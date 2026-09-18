@@ -36,6 +36,8 @@ export interface SalesSequenceStep {
   text_content?: string;
   image_url?: string;
   delay_seconds?: number;
+  /** ลำดับการส่งในขั้นตอนนี้: 'TEXT_FIRST' = ข้อความก่อน/รูปหลัง, 'IMAGE_FIRST' = รูปก่อน/ข้อความหลัง */
+  send_order?: 'TEXT_FIRST' | 'IMAGE_FIRST';
 }
 
 export interface ProductDetailedSpecs {

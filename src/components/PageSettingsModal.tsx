@@ -443,7 +443,8 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
         type: 'BOTH' as const,
         title: `Step ${newStepNumber}: ข้อความและรูปภาพปิดการขายเพิ่มเติม`,
         text_content: '',
-        image_url: ''
+        image_url: '',
+        send_order: 'TEXT_FIRST' as const
       };
       return {
         ...prev,
@@ -1021,6 +1022,32 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                               }`}
                             >
                               💬🖼️ ข้อความ & รูปภาพ
+                            </button>
+                          </div>
+
+                          {/* Send Order: Text-first vs Image-first */}
+                          <div className="flex items-center gap-1 bg-slate-100 dark:bg-[#181820] p-1 rounded-lg border border-slate-200 dark:border-zinc-800 text-[11px]">
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateSequenceStep(idx, 'send_order', 'TEXT_FIRST')}
+                              className={`px-2.5 py-1 rounded font-bold transition-all cursor-pointer ${
+                                (step.send_order || 'TEXT_FIRST') === 'TEXT_FIRST'
+                                  ? 'bg-emerald-600 text-white shadow-xs'
+                                  : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-zinc-200'
+                              }`}
+                            >
+                              📝 ข้อความก่อน
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateSequenceStep(idx, 'send_order', 'IMAGE_FIRST')}
+                              className={`px-2.5 py-1 rounded font-bold transition-all cursor-pointer ${
+                                step.send_order === 'IMAGE_FIRST'
+                                  ? 'bg-orange-600 text-white shadow-xs'
+                                  : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-zinc-200'
+                              }`}
+                            >
+                              🖼️ รูปก่อน
                             </button>
                           </div>
 

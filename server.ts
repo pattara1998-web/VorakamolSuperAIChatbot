@@ -1,3 +1,6 @@
+import { calculateOrderQuote } from './src/utils/orderQuote.ts';
+import { buildRecipientFallback, parseRecipientInfo } from './src/utils/recipientFallback.ts';
+
 ﻿import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
@@ -340,16 +343,19 @@ function classifyIntentInstant(rawText: string): IntentHint {
   return 'QUESTION';
 }
 
-// Regex safety-net: pull phone/address straight from the message so an order
-// is never lost just because the AI omitted a field in its JSON.
-function extractOrderInfo(rawText: string): { phone_number: string; address: string } {
+// Regex safety-net: pull phone/address/customer_name straight from the message
+// so an order is never lost just because the AI omitted a field in its JSON.
+function extractOrderInfo(rawText: string): { phone_number: string; address: string; customer_name: string } {
   const text = String(rawText || '');
   const compact = text.replace(/[-\s.]/g, '');
   const phoneMatch = compact.match(/(?<!\d)0\d{8,9}(?!\d)/);
   const addressMatch = text.match(/.{0,50}(?:\d{1,4}\/\d{1,5}|หมู่ที่?\s?\d|ม\.\s?\d|ซอย|ถนน|ต\.|อ\.|จังหวัด|แขวง|เขต|ตำบล|อำเภอ).{0,140}/);
+  // Extract customer name from raw text (reuse existing parser)
+  const parsedInfo = extractCustomerInfoFromText(text);
   return {
     phone_number: phoneMatch ? phoneMatch[0] : '',
-    address: addressMatch ? addressMatch[0].trim() : ''
+    address: addressMatch ? addressMatch[0].trim() : '',
+    customer_name: parsedInfo.name && parsedInfo.name !== 'ลูกค้า' ? parsedInfo.name : ''
   };
 }
 
@@ -571,16 +577,16 @@ function assessOrderData(phoneRaw: string, nameRaw: string, addressRaw: string):
 // answer — it sells. Strategies only ever use REAL product data (promotions,
 // free_shipping flags) already in the prompt; nothing here invents facts.
 const SALES_PLAYBOOK: Record<IntentHint, string> = {
-  GREETING: 'ลูกค้าเปิดแชท = โอกาสแรกของการขาย: ทักทายสั้น 1 ประโยค + ดึงดูดด้วยจุดขายหลักของสินค้า 1 ข้อ + โยนโปรเด่นที่สุดทันที แล้วถามว่า "สนใจดูราคา-โปรโมชั่นไหมคะ"',
-  PURCHASE: 'ลูกค้าบอก "สนใจ" ตรง ๆ = สัญญาณซื้อชัดที่สุด! พรีเซนเต็มชุด 4-5 ข้อความส่งไล่กัน: (1) จุดขายหลัก/ประโยชน์ที่ได้จริง (2) ราคาปกติ vs ราคาโปร โชว์ส่วนลดชัด (3) แพ็กที่คุ้มที่สุด + ของแถม/ส่งฟรีที่มีจริง (4) ปิดแบบให้เลือกแพ็ก "รับแพ็กเดี่ยวหรือแพ็กคุ้มสุดดีคะ" (5) ขอชื่อ-ที่อยู่-เบอร์โทรเพื่อสรุปยอด — ⛔ ห้ามพูดถึงขนส่ง/ระยะเวลาจัดส่งในรอบนี้ (เก็บไว้บอกตอนสรุปยอด)',
-  PRICE: 'ลูกค้าถามราคา = โอกาสปิดการขายสูงสุด! พรีเซนเต็มรูปแบบในข้อความเดียว: (1) จุดขายหลัก 1-2 ข้อ (2) ราคาปกติ ฿X ลดเหลือ ฿Y โชว์ส่วนลดชัดๆ (3) ของแถม/ส่งฟรีตามแพ็กจริง (4) ปิดแบบให้เลือก: "เอาแพ็กเดี่ยวหรือแพ็กคุ้มสุดดีคะ"',
-  PROMOTION: 'ลูกค้าถามโปร: เปรียบเทียบทุกแพ็กชัดเจน (ราคา/ของแถม/สิทธิ์) + ชี้ว่าแพ็กไหนคุ้มที่สุดและเพราะอะไร + ปิดแบบให้เลือกแพ็กทันที "แพ็ก X หรือ Y ดีคะ"',
-  SHIPPING: 'ลูกค้าถามส่งของ = เกือบปิดแล้ว! ตอบข้อมูลจริง (ส่งฟรีเฉพาะแพ็กที่ free_shipping=true) + ย้ำเก็บเงินปลายทางถ้ามี + ปิดทันที "แพ็กที่ส่งฟรีคือแพ็ก ... เอาแพ็กนี้เลยไหมคะ"',
-  TRUST: 'ลูกค้ากังวล = กำลังจะซื้อแต่ต้องการความมั่นใจ: การันตีด้วยข้อมูลจริง (ประกัน/เก็บเงินปลายทาง/รีวิว) + เล่าว่าทำไมซื้อแล้วไม่เสียใจ + ปิดแบบลดแรงกดดัน "เริ่มแพ็กเล็กก็ได้คะ สนใจไหม"',
-  NEGOTIATION: 'ลูกค้าต่อรอง = อยากซื้อแต่อยากได้ดีกว่านี้: ยึดราคาเด็ดขาด (ห้ามลดนอกโปร) แต่เพิ่มมูลค่าจากของแถม/ส่งฟรีที่มีจริง + เทียบมูลค่าที่ได้ + ปิดด้วยความเร่งด่วนจากโปรจริง "โปรนี้รอบนี้เท่านั้นนะคะ เอาเลยไหม"',
-  ORDER: 'ลูกค้าแสดงเจตนาซื้อ/ให้ข้อมูล: ขอบคุณ + ยืนยันรายการสั้นๆ + ถ้าข้อมูลไม่ครบ (ชื่อ/เบอร์/ที่อยู่) ถามเฉพาะชิ้นที่ขาดทีละอย่าง และบอกขั้นตอนถัดไป (ส่งของเมื่อไหร่) ให้ลูกค้าอุ่นใจ',
-  FOLLOWUP: 'ลูกค้าอ้างถึงบทสนทนาเดิม: ต่อประเด็นเดิมทันที ห้ามทักทายใหม่ + ย้ำข้อเสนอที่ค้างไว้อีกครั้งสั้นๆ',
-  QUESTION: 'คำถามทั่วไป: ตอบตรงจากข้อมูลจริง สั้นกระชับ + ต่อยอดเชื่อมสู่จุดขายทันที (โยงคำตอบไปสู่ประโยชน์ของสินค้า) + ปิดด้วยคำถามชวนซื้อ'
+  GREETING: 'ลูกค้าเปิดแชท = โอกาสแรกของการขาย: ทักทายสั้น 1 ประโยค + ดึงดูดด้วยจุดขายหลักของสินค้า 1 ข้อ + โยนโปรเด่นที่สุดทันที แล้วถามว่า "สนใจดูราคา-โปรโมชั่นไหมคะ" — พิมพ์สั้นๆ 1-2 ข้อความพอ',
+  PURCHASE: 'ลูกค้าบอก "สนใจ" ตรง ๆ = สัญญาณซื้อชัดที่สุด! พรีเซนเต็มชุด 4-5 ข้อความส่งไล่กัน: (1) จุดขายหลัก/ประโยชน์ที่ได้จริง (2) ราคาปกติ vs ราคาโปร โชว์ส่วนลดชัด (3) แพ็กที่คุ้มที่สุด + ของแถม/ส่งฟรีที่มีจริง (4) ปิดแบบให้เลือกแพ็ก "รับแพ็กเดี่ยวหรือแพ็กคุ้มสุดดีคะ" (5) ขอชื่อ-ที่อยู่-เบอร์โทรเพื่อสรุปยอด — ⛔ ห้ามพูดถึงขนส่ง/ระยะเวลาจัดส่งในรอบนี้ (เก็บไว้บอกตอนสรุปยอด) — ตอบให้สั้นได้ อย่าสเต็ปยาวเกินไป',
+  PRICE: 'ลูกค้าถามราคา = โอกาสปิดการขายสูงสุด! ตอบสั้นๆ 1-2 ข้อความ: (1) บอกราคาป้าย + ราคาที่ได้ 1 บรรทัด(2) แนะนำแพ็กเด่นที่สุด 1 บรรทัด — ถ้าลูกค้าถามแค่ราคา อย่าเพิ่งสเต็ปยาว ให้ตอบตรงคำถามก่อน แล้วค่อยปิดการขาย',
+  PROMOTION: 'ลูกค้าถามโปร: เฉลยโปรทันที 1-2 ข้อความ (แพ็กไหน/คุ้มยังไง/แถมอะไร) + ปิดสั้นๆ "สนใจแพ็กไหนไหมคะ" — อย่าสเต็ปยาวเกินไป',
+  SHIPPING: 'ลูกค้าถามส่งของ = ตอบสั้นๆ 1-2 ข้อความ: (1) ส่งฟรีหรือไม่ + ใช้ขนส่งอะไร + เร็วไหม (2) ปิดสั้นๆ "แพ็กไหนที่ส่งฟรี/เร็วที่สุดนะคะ" — อย่าสเต็ปยาว',
+  TRUST: 'ลูกค้ากังวล = ตอบสั้นๆ เน้นสร้างความมั่นใจ: (1) ข้อมูลจริง 1-2 บรรทัด (ประกัน/เก็บเงินปลายทาง/รีวิว) (2) ปิดสั้นๆ "มั่นใจได้ค่ะ ถ้ากังวลตรงไหนบอกมาได้เลย" — อย่าสเต็ปยาว',
+  NEGOTIATION: 'ลูกค้าต่อรอง = ตอบสั้นๆ ยึดราคาเด็ด แต่เพิ่มมูลค่า: (1) บอกว่าราคาเป็นราคาสุดท้าย + ของแถม/โปรที่ได้จริง 1 บรรทัด(2) ปิดสั้นๆ "แพ็กนี้คุ้มที่สุดแล้วนะคะ" — อย่าสเต็ปยาว',
+  ORDER: 'ลูกค้าแสดงเจตนาซื้อ/ให้ข้อมูล: ขอบคุณ + ยืนยันรายการสั้นๆ 1 ข้อความ + ถ้าข้อมูลไม่ครบ (ชื่อ/เบอร์/ที่อยู่) ถามเฉพาะชิ้นที่ขาดทีละอย่าง และบอกขั้นตอนถัดไป (ส่งของเมื่อไหร่) ให้ลูกค้าอุ่นใจ — ตอบสั้น กระชับ ไม่ยาว',
+  FOLLOWUP: 'ลูกค้าอ้างถึงบทสนทนาเดิม: ต่อประเด็นเดิมทันที 1-2 ข้อความสั้นๆ ห้ามทักทายใหม่ + ย้ำข้อเสนอที่ค้างไว้อีกครั้งสั้นๆ',
+  QUESTION: 'คำถามทั่วไป: ตอบสั้นๆ กระชับ จากข้อมูลจริง 1-2 ข้อความ + ต่อยอดเชื่อมสู่จุดขายทันที (โยงคำตอบไปสู่ประโยชน์ของสินค้า) — อย่าสเต็ปยาวเกินไป ไม่ต้องพรีเซนถ้าไม่เกี่ยวข้อง'
 };
 
 // Spec lines whose value is missing ("ไม่ระบุ") burn input tokens on every
@@ -986,8 +992,9 @@ function splitLongOutgoingText(text: string, maxChars = MAX_OUTGOING_SEGMENT_CHA
 }
 
 // (New) แตกทุกข้อความในคิวส่ง — รูปคงอยู่กับข้อความย่อยแรกสุดของข้อความนั้น
-function splitOutgoingMessages(list: Array<{ text: string; imageUrl?: string; images?: string[] }>): Array<{ text: string; imageUrl?: string; images?: string[] }> {
-  const out: Array<{ text: string; imageUrl?: string; images?: string[] }> = [];
+// 🔧 ใช้ InstantOutgoing เพื่อให้ send_order (TEXT_FIRST/IMAGE_FIRST) ไม่หายตอนแตกข้อความ
+function splitOutgoingMessages(list: InstantOutgoing): InstantOutgoing {
+  const out: InstantOutgoing = [];
   for (const o of list) {
     const parts = splitLongOutgoingText(o.text);
     if (parts.length <= 1) { out.push({ ...o, text: parts[0] ?? o.text }); continue; }
@@ -1009,7 +1016,7 @@ function splitOutgoingMessages(list: Array<{ text: string; imageUrl?: string; im
 // ทุกข้อความผ่าน sanitize + strip ราคาเริ่มต้น + scrub คำแบน + split เหมือน AI path
 // ใช้ได้กับ "ทุกเพจ" เพราะอ่านจากข้อมูล page/product จริงเท่านั้น ไม่ hardcode
 // ---------------------------------------------------------------------------
-type InstantOutgoing = Array<{ text: string; imageUrl?: string; images?: string[] }>;
+type InstantOutgoing = Array<{ text: string; imageUrl?: string; images?: string[]; send_order?: 'TEXT_FIRST' | 'IMAGE_FIRST' }>;
 
 // ทำความสะอาดข้อความ local engine ให้เหมือนข้อความที่ผ่าน pipeline ปกติทุกชั้น
 function polishInstantText(text: string): string[] {
@@ -1091,6 +1098,16 @@ function collectInstantImageUrls(page: any, matchedProduct?: any): string[] {
     seen.add(url);
     out.push(url);
   }
+  // 🔧 ครอบคลุมรูปจากทุกสเต็ป ไม่ใช่แค่ 1-6 — steps 7, 8, ... ก็ส่งได้
+  const allStepUrls = seqSteps
+    .slice()
+    .sort((a, b) => (Number(a?.step_number) || 0) - (Number(b?.step_number) || 0))
+    .map(s => (typeof s?.image_url === 'string' ? s.image_url.trim() : ''));
+  for (const url of allStepUrls) {
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
   return out;
 }
 
@@ -1132,14 +1149,483 @@ function buildInstantAck(page: any, intentHint: IntentHint, matchedProduct?: any
   return out;
 }
 
+// (1b) สรุปยอดลูกค้าตามฟอร์ม COD ที่ตั้งไว้ — ใช้เมื่อลูกค้าส่งข้อมูลมาแล้ว
+// ฟังก์ชันนี้ดึงข้อมูลจากข้อความดิบ แล้วจัดรูปแบบตาม cod_summary_fields config
+function parseCustomerOrderInfo(text: string): {
+  name?: string;
+  address?: string;
+  phone?: string;
+  items?: Array<{ name: string; qty: number; price?: number }>;
+} {
+  const t = String(text || '');
+  
+  // ดึงเบอร์โทรศัพท์ (ไทย 10 หลัก ขึ้นต้น 0)
+  const phoneMatch = t.match(/(?<!\d)0\d{8,9}(?!\d)/);
+  const phone = phoneMatch ? phoneMatch[0] : undefined;
+  
+  // ดึงชื่อผู้รับ (บรรทัดแรกที่ไม่ใช่ที่อยู่/เบอร์)
+  // ลองหารูปแบบ: ชื่อ-นามสกุล หรือ ชื่อ นามสกุล
+  const lines = t.split('\n').map(l => l.trim()).filter(l => l);
+  let name = undefined;
+  let address = undefined;
+  let phoneFound: string | undefined;
+  
+  for (const line of lines) {
+    if (!name && !/[\d/]/.test(line.replace(/\s/g, '')) && line.length > 3 && !line.includes('โทร')) {
+      name = line;
+    } else if (!address && /[\d/]/.test(line) && line.length > 10) {
+      address = line;
+    } else if (!phoneFound && /0\d{8,9}/.test(line)) {
+      phoneFound = phone || undefined;
+    }
+  }
+  
+  // ถ้าไม่พบตามบรรทัด ลองวิธีอื่น
+  if (!name && phone && lines.length > 1) {
+    // ชื่อคือบรรทัดแรก 2 บรรทัดแรก
+    name = lines.slice(0, 1).join('\n');
+  }
+  
+  if (!address && lines.length > 1) {
+    // ที่อยู่คือบรรทัดที่มีตัวเลข
+    for (const line of lines) {
+      if (/[\d/]/.test(line) && line.length > 10) {
+        address = line;
+        break;
+      }
+    }
+  }
+  
+  return {
+    name: name,
+    address: address,
+    phone: phone || phoneFound,
+    items: undefined // กรณีมีรายชื่อลูกค้าหลายคน จะต้อง parse เพิ่ม
+  };
+}
+
+// จัดรูปแบบสรุปยอดตาม cod_summary_fields config
+function formatCodSummary(
+  orderData: any,
+  page: any,
+  codConfig: any,
+  matchedProduct?: any
+): string {
+  const include = codConfig || {};
+  const prod = page?.product || matchedProduct || {};
+  const pricing = prod?.pricing ? prod.pricing : (matchedProduct ? { 
+    regular: Number(matchedProduct.price_1) || 0,
+    sale: Number(matchedProduct.price_2) || Number(matchedProduct.price_3) || 0,
+    packs: []
+  } : { regular: 0, sale: 0, packs: [] });
+  
+  const packName = pricing?.packs?.[0]?.name || 'แพ็กเดี่ยว';
+  const packPrice = pricing?.packs?.[0]?.price || pricing?.sale || 0;
+  
+  const lines: string[] = [];
+  
+  // หัวข้อ
+  if (include.include_header) {
+    lines.push('📦 สรุปยอดคำสั่งซื้อ (เก็บเงินปลายทาง):');
+  }
+  
+  // ชื่อเพจ
+  if (include.include_page_name) {
+    lines.push(`คุณ ${page?.page_name || ''}`);
+  }
+  
+  // ชื่อผู้รับ
+  if (include.include_customer_name && orderData?.customer_name) {
+    lines.push(orderData.customer_name);
+  }
+  
+  // ที่อยู่
+  if (include.include_address && orderData?.address) {
+    lines.push(orderData.address);
+  }
+  
+  // เบอร์โทร
+  if (include.include_phone && orderData?.phone_number) {
+    lines.push(orderData.phone_number);
+  }
+  
+  // รายการสินค้า
+  if (include.include_items) {
+    const qty = Number(orderData?.quantity) || 1;
+    lines.push(`***${packName} ${qty} ชุด 💊 ใช้งานสะดวก ${qty} ชุด`);
+  }
+  
+  // ยอดรวม
+  if (include.include_total_amount) {
+    const total = Number(orderData?.total_amount) || (packPrice * (Number(orderData?.quantity) || 1));
+    lines.push(`ยอดเรียกเก็บปลายทาง: ฿${total.toLocaleString()} (จัดส่งฟรี ไม่บวกเพิ่ม)`);
+  }
+  
+  // ระยะเวลาจัดส่ง
+  if (include.include_shipping_duration) {
+    lines.push('🚚 ระยะเวลาจัดส่ง: จัดส่งโดย Flash Express ถึงภายใน 1-3 วันทำการ (มีบริการเก็บเงินปลายทาง COD)');
+  }
+  
+  // หมายเหตุ
+  if (include.include_shipping_note) {
+    lines.push('หมายเหตุ: พนักงานจะโทรแจ้งก่อนจัดส่ง 1 วัน');
+  }
+  
+  // ข้อความปิดท้าย
+  if (include.include_closing_blessing) {
+    lines.push('ขอบคุณที่เลือกซื้อสินค้านี้ หวังว่าจะได้ใช้งานที่ดีค่ะ 🙏');
+  }
+  
+  return lines.join('\n');
+}
+
+// (1c) ตรวจสถานะลูกค้า — ถ้าลูกค้ามีดาวหรือซื้อแล้ว ให้ตอบแบบที่ปรึกษาแทน
+// ดาว (is_starred) มาจาก Inbox/Meta Business Suite = แอดมินปิดการขายรายนี้แล้ว
+async function getCustomerStatus(pageId: string, senderId: string): Promise<{
+  isStarred: boolean;
+  hasOrder: boolean;
+  shouldCrossSell: boolean; // ลูกค้าคนนี้ควรขายต่อไหม
+}> {
+  try {
+    const st: any = await dbService.getConversationState(pageId, senderId).catch(() => null);
+    const orderCount = await dbService.getCustomerOrderCount(senderId).catch(() => 0);
+    const isStarred = Number(st?.is_starred) === 1;
+    const hasOrder = Number(orderCount) > 0;
+    // ติดดาว/มีออเดอร์แล้ว → ไม่เร่งขายซ้ำ (แต่ลูกค้าเก่าทักมาสั่งใหม่ได้เสมอ
+    // — เจตนาซื้อใหม่ถูกจับแยกที่ intentHint PURCHASE/ORDER/NEGOTIATION)
+    return { isStarred, hasOrder, shouldCrossSell: !(isStarred || hasOrder) };
+  } catch {
+    return { isStarred: false, hasOrder: false, shouldCrossSell: true };
+  }
+}
+
+// (1c-add) ดึงปริมาณที่ลูกค้าขอจากข้อความ — M3 qty resolver
+function extractRequestedQty(text: string): number | null {
+  const normalized = String(text || '').replace(/[^\w\s]/g, ' ').toLowerCase();
+  
+  // เลขอารบิก + หน่วย (1ชุด, 2 แพ็ก, 3 อัน)
+  const arabicMatch = normalized.match(/(\d+)\s*(ชุด|แพ็ก|กล่อง|อัน|ชิ้น|ฉบับ|ใบ|套|件)/);
+  if (arabicMatch) {
+    const num = parseInt(arabicMatch[1], 10);
+    if (num > 0 && num <= 100) return num;
+  }
+  
+  // เลขไทย
+  const thaiNumbers: Record<string, number> = {
+    'หนึ่ง': 1, 'เอ็ด': 1, 'สอง': 2, 'สาม': 3, 'สี่': 4,
+    'ห้า': 5, 'หก': 6, 'เจ็ด': 7, 'แปด': 8, 'เก้า': 9,
+    'สิบ': 10, 'สิบเอ็ด': 11, 'สิบสอง': 12, 'สิบสาม': 13, 'สิบสี่': 14,
+    'สิบห้า': 15, 'สิบหก': 16, 'สิบเจ็ด': 17, 'สิบแปด': 18, 'สิบเก้า': 19,
+    'ยี่สิบ': 20, 'ยี่สิบเอ็ด': 21
+  };
+  for (const [word, num] of Object.entries(thaiNumbers)) {
+    if (normalized.includes(word)) return num;
+  }
+  
+  // จับ "เอา X" / "เอาเลย X"
+  const takeMatch = normalized.match(/(เอา|เอาเลย|อยาก|ต้องการ)\s*(\d+)/);
+  if (takeMatch) {
+    const num = parseInt(takeMatch[2], 10);
+    if (num > 0 && num <= 100) return num;
+  }
+  
+  return null;
+}
+
+// (1c-add) แก้แพ็กที่ลูกค้าขอจริง — M3: ถ้าลูกค้าระบุจำนวนชัด → ใช้แพ็กที่ตรงจำนวนนั้น
+function resolveRequestedPack(
+  pricing: { packs: Array<{ name: string; quantity: number; price: number; free_shipping: boolean }> },
+  requestedQty: number | null
+): { pack: any; qty: number } | null {
+  if (!pricing.packs || pricing.packs.length === 0) return null;
+  
+  if (requestedQty !== null) {
+    const exactMatch = pricing.packs.find(p => p.quantity === requestedQty);
+    if (exactMatch) return { pack: exactMatch, qty: requestedQty };
+    const closest = [...pricing.packs]
+      .filter(p => p.quantity <= requestedQty)
+      .sort((a, b) => b.quantity - a.quantity)[0];
+    if (closest) return { pack: closest, qty: closest.quantity };
+    return { pack: pricing.packs[0], qty: pricing.packs[0].quantity };
+  }
+  
+  return { pack: pricing.packs[0], qty: pricing.packs[0].quantity };
+}
+
+// (1c-add) Single Closer Rule: ตรวจสอบว่า AI เคยส่ง closing message ในรอบนี้แล้วหรือยัง
+interface PendingCloserState {
+  closingSent: boolean;
+  closingText: string;
+}
+const pendingCloserState: Map<string, PendingCloserState> = new Map();
+
+function getCloserKey(pageId: string, senderId: string): string {
+  return `${pageId}:${senderId}`;
+}
+
+function setClosingSent(pageId: string, senderId: string, text: string): void {
+  pendingCloserState.set(getCloserKey(pageId, senderId), { closingSent: true, closingText: text });
+}
+
+function hasClosingBeenSent(pageId: string, senderId: string): boolean {
+  return pendingCloserState.get(getCloserKey(pageId, senderId))?.closingSent || false;
+}
+
+function clearCloserState(pageId: string, senderId: string): void {
+  pendingCloserState.delete(getCloserKey(pageId, senderId));
+}
+
+// ⚡ Tier 0: จำว่าส่ง "สเต็ปตามที่เจ้าของตั้ง" เต็มชุดให้ลูกค้านี้เมื่อไหร่ — กันส่งซ้ำรัวในช่วงแชทเดียวกัน
+// (หมดอายุตาม TTL → ลูกค้ากลับมาใหม่ภายหลังได้พรีเซนครบชุดอีกครั้ง เหมือนแอดมินจริงต้อนรับใหม่)
+const configuredSequenceSentAt = new Map<string, number>();
+const CONFIGURED_SEQUENCE_TTL_MS = 90 * 60 * 1000; // 90 นาที
+function getSequenceSentKey(pageId: string, senderId: string): string {
+  return `${pageId}:${senderId}`;
+}
+
+// ⚡ Tier 0: สร้างชุดข้อความ+รูปจากสเต็ปที่เจ้าของร้านตั้งไว้ "ตรงตัว 100%"
+// ไม่เรียง/แก้ถ้อยคำของเจ้าของ (ผ่านแค่ BANNED_PRODUCT_GUARD) — รูปยึดกับสเต็ปของมัน 1:1
+// เดิมข้อความสเต็ปถูกส่งผ่าน AI (AI เรียบเรียงใหม่เสมอ) → ข้อความที่ตั้งไว้ไม่เคยถึงลูกค้าตรง ๆ
+function buildConfiguredSequenceReply(page: any, intentHint: IntentHint): InstantOutgoing {
+  const steps = ((page?.sales_sequence_steps || []) as any[])
+    .filter(s => s && (String(s?.text_content || '').trim() || String(s?.image_url || '').trim()))
+    .sort((a, b) => (Number(a?.step_number) || 0) - (Number(b?.step_number) || 0));
+  const out: InstantOutgoing = [];
+  for (const s of steps) {
+    const rawText = String(s?.text_content || '').trim();
+    const img = String(s?.image_url || '').trim();
+    // BANNED_PRODUCT_GUARD: ข้อความเจ้าของก็ต้องผ่านตาข่ายคำแบน (ตัดเฉพาะประโยคที่แบน ไม่ทิ้งทั้งข้อความ)
+    const text = rawText ? (scrubBannedProductContent(rawText) || '') : '';
+    const sendOrder = String((s as any)?.send_order || '').trim();
+    if (text) {
+      const m: any = { text };
+      if (img) m.images = [img];
+      if (sendOrder === 'IMAGE_FIRST' || sendOrder === 'TEXT_FIRST') m.send_order = sendOrder;
+      out.push(m);
+    } else if (img) {
+      out.push({ text: '', images: [img], ...(sendOrder === 'IMAGE_FIRST' ? { send_order: 'IMAGE_FIRST' as const } : {}) } as any);
+    }
+  }
+  // เจ้าของไม่ได้ตั้งสเต็ปปิดการขาย → เติมคำถามปิดการขายจาก local engine ท้ายชุด
+  // (GREETING แรกไม่ยัดปิดการขาย — ให้เป็นธรรมชาติเหมือนแอดมินตอบรับ)
+  const hasClosingStep = out.some(m => /ชื่อ|เบอร์|ที่อยู่|สั่งซื้อ|แจ้ง/.test(m.text || ''));
+  if (!hasClosingStep && intentHint !== 'GREETING') out.push(...buildLocalClosingAsk(page, null));
+  return out;
+}
+
+// M5: Image Dedup — ติดตามรูปที่ส่งไปแล้วในรอบนี้ (10 นาทีล่าสุด)
+// ป้องกันการส่งรูปซ้ำเมื่อลูกค้าพิมพ์ 2 บรรทัดติดกัน = webhook ทำงาน 2 รอบ
+interface SentImageRecord {
+  url: string;
+  at: number;
+}
+
+const sentImageUrls: Map<string, SentImageRecord[]> = new Map();
+const IMAGE_DEDUP_WINDOW_MS = 10 * 60 * 1000; // 10 นาที
+
+function getImageDedupKey(pageId: string, senderId: string): string {
+  return `${pageId}:${senderId}`;
+}
+
+function wasImageSentRecently(pageId: string, senderId: string, url: string): boolean {
+  if (!url) return false;
+  const key = getImageDedupKey(pageId, senderId);
+  const records = sentImageUrls.get(key) || [];
+  const now = Date.now();
+  
+  // ล้างข้อมูลเก่าออก
+  const fresh = records.filter(r => now - r.at < IMAGE_DEDUP_WINDOW_MS);
+  if (fresh.length !== records.length) {
+    sentImageUrls.set(key, fresh);
+  }
+  
+  return fresh.some(r => r.url === url);
+}
+
+function recordSentImage(pageId: string, senderId: string, url: string): void {
+  if (!url) return;
+  const key = getImageDedupKey(pageId, senderId);
+  const records = sentImageUrls.get(key) || [];
+  records.unshift({ url, at: Date.now() });
+  // เก็บไว้ไม่เกิน 20 รายการ
+  if (records.length > 20) records.pop();
+  sentImageUrls.set(key, records);
+}
+
+// M5: Text Dedup — ข้อความซ้ำ ≥70% ในหน้าต่างความจำ → ไม่ส่งซ้ำ
+// อัปเกรด isRepeatedReply ให้ครอบคลุมทุกเส้นทาง (รวม local engine และ closing)
+function isRepeatedReplyWithThreshold(
+  pageId: string,
+  senderId: string,
+  newText: string,
+  threshold: number = 0.7
+): boolean {
+  // ใช้ recentReplies ที่มีอยู่แล้ว
+  cleanRecentReplies();
+  const senderReplies = recentReplies.filter(r => r.pageId === pageId && r.senderId === senderId);
+  if (senderReplies.length === 0) return false;
+  
+  const normalize = (t: string) => t.replace(/[^\w\s\u0000-\u00FF]/g, '').trim().toLowerCase();
+  const normalizedNew = normalize(newText);
+  if (normalizedNew.length < 10) return false;
+  
+  for (const recent of senderReplies) {
+    const normalizedRecent = normalize(recent.replyText);
+    if (normalizedRecent.length < 10) continue;
+    
+    // Exact match
+    if (normalizedNew === normalizedRecent) return true;
+    
+    // Substring 80%+ overlap
+    if (normalizedNew.includes(normalizedRecent) || normalizedRecent.includes(normalizedNew)) {
+      const shorter = Math.min(normalizedNew.length, normalizedRecent.length);
+      const longer = Math.max(normalizedNew.length, normalizedRecent.length);
+      if (shorter / longer > 0.8) return true;
+    }
+    
+    // Word overlap 70%+
+    const newWords = normalizedNew.split(/\s+/).filter(w => w.length > 2);
+    const recentWords = normalizedRecent.split(/\s+/).filter(w => w.length > 2);
+    if (newWords.length >= 3 && recentWords.length >= 3) {
+      const commonWords = newWords.filter(w => recentWords.includes(w));
+      if (commonWords.length / Math.max(newWords.length, recentWords.length) > threshold) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// (1c-add) Extract customer info from raw address text — COD parsing
+// Input: "106/373 ม1 ตำบลแสนภูดาษ อำเภอบ้านโพธิ์ จังหวัดฉะเชิงเทรา24140 ทวีโชค ดวงแก้ว 0826529336"
+function extractCustomerInfoFromText(text: string): {
+  name: string;
+  address: string;
+  phone: string;
+  rawText: string;
+} {
+  const raw = String(text || '').trim();
+  
+  // Extract phone number (Thai mobile: 08x xxx xxx xxxx or 09x xxx xxx xxxx)
+  const phoneMatch = raw.match(/(0[89]\d{8})/);
+  const phone = phoneMatch ? phoneMatch[1] : '';
+  
+  const parts = raw.split(/\s+/);
+  // ⛔ ต้นเหตุเดิม: บ้านเลขที่ "106/373" (ไม่มีคีย์เวิร์ดที่อยู่) ถูกนับเป็น "คำในชื่อ"
+  // → ชื่อผู้รับกลายเป็น "106/373 ทวีโชค ดวงแก้ว" และที่อยู่เหลือแค่คำสุดท้าย "ดวงแก้ว"
+  // วิธีแก้: token ที่มีตัวเลข/ขีด (/) หรือคีย์เวิร์ดที่อยู่ = ที่อยู่เสมอ แล้วแยกชื่อจาก
+  // ตำแหน่ง "หลัง token ที่อยู่สุดท้าย" (รองรับทั้งแบบชื่ออยู่หน้าและชื่ออยู่หลังที่อยู่)
+  const phoneTokenIdx = parts.findIndex(p => /^0[89]\d{8}$/.test(p.replace(/[^0-9]/g, '')));
+  const bodyParts = phoneTokenIdx >= 0 ? parts.filter((_, i) => i !== phoneTokenIdx) : parts;
+
+  const isAddrToken = (p: string): boolean => {
+    // บ้านเลขที่ 106/373, หมู่ที่ ม1/ม.5, รหัสไปรษณีย์ 24140 → ที่อยู่
+    if (/\d/.test(p) || p.includes('/')) return true;
+    if (/^ม[.]?\d/.test(p) || /^หมู่/.test(p)) return true;
+    const addrKeywords = ['ตำบล', 'ต.', 'อำเภอ', 'อ.', 'จังหวัด', 'จ.', 'ซอย', 'ซ.', 'ถนน', 'ถ.', 'แขวง', 'เขต', 'เมือง', 'นิคม', 'ฟอร์ม'];
+    return addrKeywords.some(k => p.includes(k));
+  };
+
+  let name = '';
+  let address = '';
+  const addrIdxs = bodyParts.map((p, i) => (isAddrToken(p) ? i : -1)).filter(i => i >= 0);
+  if (addrIdxs.length > 0) {
+    const lastAddrIdx = addrIdxs[addrIdxs.length - 1];
+    // ชื่อ = คำที่ไม่ใช่ที่อยู่ "หลัง" token ที่อยู่สุดท้าย (รูปแบบ "ที่อยู่... ชื่อ-นามสกุล เบอร์")
+    // ถ้าไม่มี → ใช้คำที่ไม่ใช่ที่อยู่ "ก่อน" token ที่อยู่แรก (รูปแบบ "ชื่อ-นามสกุล ที่อยู่ เบอร์")
+    const after = bodyParts.slice(lastAddrIdx + 1).filter(p => !isAddrToken(p));
+    const before = bodyParts.slice(0, addrIdxs[0]).filter(p => !isAddrToken(p));
+    name = (after.length > 0 ? after : before).slice(0, 4).join(' ').trim();
+    address = bodyParts.slice(addrIdxs[0], lastAddrIdx + 1).join(' ').trim();
+    if (name && address.includes(name)) address = address.replace(name, '').trim();
+  } else if (phoneTokenIdx >= 0) {
+    // มีเบอร์อย่างเดียว → ชื่อ = คำที่ไม่ใช่ที่อยู่ก่อนเบอร์
+    name = bodyParts.filter(p => !isAddrToken(p)).slice(0, 4).join(' ').trim();
+    address = '';
+  } else {
+    name = bodyParts.slice(0, Math.min(3, bodyParts.length)).join(' ').trim();
+    address = raw;
+  }
+
+  if (phone) {
+    address = address.replace(phone, '').trim();
+  }
+  
+  address = address.replace(/\s+/g, ' ').replace(/\s+([.,])/g, '$1').trim();
+  
+  return { name: name || 'ลูกค้า', address: address || 'รอส่งที่อยู่', phone, rawText: raw };
+}
+
+// (1c-add) Build COD summary from extracted customer info + page settings
+function buildCustomerSummaryText(
+  page: any,
+  customerInfo: { name: string; address: string; phone: string },
+  orderData?: { items?: string; totalAmount?: number; quantity?: number }
+): string {
+  try {
+    const order: any = {
+      customer_name: customerInfo.name,
+      phone_number: customerInfo.phone,
+      shipping_address: customerInfo.address,
+      items: orderData?.items || page.product?.product_name || 'สินค้า',
+      total_amount: orderData?.totalAmount || page.product?.display_price || 0,
+      quantity: orderData?.quantity || 1,
+      order_id: `ORD-${Date.now().toString(36).toUpperCase()}`
+    };
+    return buildCodSummaryText(page, order);
+  } catch {
+    return `📦 สรุปยอดคำสั่งซื้อ:\n👤 ${customerInfo.name}\n📞 ${customerInfo.phone}\n📍 ${customerInfo.address}\n฿${page.product?.display_price || 0}`;
+  }
+}
+
+// (1d) ตรวจสอบว่าลูกค้าควรได้รับการพรีเซนครบชุดไหม
+// ถ้าลูกค้าเคยได้รับพรีเซนแล้ว → ตอบสั้นๆ แทน
+function shouldPresentFullSequence(
+  pageId: string,
+  senderId: string,
+  intentHint: IntentHint
+): boolean {
+  // กรณี:
+  // 1. ลูกค้าเปิดแชทใหม่ (GREETING) → พรีเซนครบ
+  // 2. ลูกค้าถามเรื่องทั่วไป (QUESTION) → ตอบสั้นไม่ต้องพรีเซน
+  // 3. ลูกค้าถามราคา/โปร/ส่ง → ตอบสั้นก่อน แล้วค่อยปิด
+  // 4. ลูกค้าถามเรื่องที่ไม่เกี่ยวข้อง (วิธีใช้งาน/ติดตั้ง) → ตอบสั้น ไม่ต้องพรีเซน
+  
+  if (intentHint === 'GREETING') {
+    return true; // พรีเซนครบสำหรับลูกค้าใหม่
+  }
+  
+  if (intentHint === 'QUESTION' || 
+      intentHint === 'FOLLOWUP' ||
+      intentHint === 'TRUST' && Math.random() > 0.5) {
+    return false; // ตอบสั้นๆ ไม่ต้องพรีเซน
+  }
+  
+  // ถามราคา/โปร/ส่ง → ตอบสั้นๆ ก่อน
+  if (intentHint === 'PRICE' || intentHint === 'PROMOTION' || intentHint === 'SHIPPING') {
+    return false;
+  }
+  
+  // ถามเรื่องการใช้งาน/ติดตั้ง/เก็บรักษา → ตอบสั้น ไม่ต้องพรีเซน
+  const usageKeywords = ['วิธีใช้', 'วิธีติดตั้ง', 'วิธีการใช้', 'วิธีเก็บ', 'วิธีดูแล', 'ขับเคลื่อน', 'ติดตั้ง', 'ตั้งค่า'];
+  // ตรวจสอบในข้อความล่าสุด (ต้องส่งจาก function caller)
+  
+  return false;
+}
+
 // (2) พรีเซนเต็มชุดจากข้อมูลจริงใน DB — ใช้เมื่อ AI ล้มเหลว/ตอบว่าง
 // แทนข้อความถ่วงเวลา "กำลังตรวจสอบรายละเอียดให้ค่ะ รอสักครู่นะคะ" ทั้งหมด
+// M3: รับ messageText เพิ่มเพื่อใช้ extractRequestedQty, รับ senderId เพื่อ Single Closer Rule
 function buildInstantSalesReply(
   page: any,
   matchedProduct: any,
   intentHint: IntentHint,
   imgMap?: Record<string, string | undefined>,
+  messageText?: string,
+  senderId?: string
 ): InstantOutgoing {
+  const recipientReply = buildRecipientFallback(messageText || '');
+  if (recipientReply) return [{ text: recipientReply }];
   const prod: any = page?.product || matchedProduct || {};
   const specs: any = prod.specs || {};
   const productName = String(prod.product_name || matchedProduct?.product_name || page?.page_name || 'สินค้าของเรา').trim();
@@ -1182,13 +1668,26 @@ function buildInstantSalesReply(
     }
   }
 
+  // ── สร้าง map: image_url → send_order จาก sales_sequence_steps (สำหรับควบคุมลำดับส่ง) ──
+  const stepSendOrderByUrl: Record<string, 'TEXT_FIRST' | 'IMAGE_FIRST'> = {};
+  const steps = (page?.sales_sequence_steps || []) as Array<{ image_url?: string; send_order?: 'TEXT_FIRST' | 'IMAGE_FIRST' }>;
+  for (const s of steps) {
+    if (s.image_url && s.send_order) stepSendOrderByUrl[s.image_url] = s.send_order;
+  }
+
   const out: InstantOutgoing = [];
   let imgIdx = 0;
   const pushMsg = (text: string, withImage: boolean) => {
     const parts = polishInstantText(text);
     parts.forEach((t, i) => {
-      const msg: { text: string; images?: string[] } = { text: t };
-      if (withImage && i === 0 && imgIdx < imageOrder.length) msg.images = [imageOrder[imgIdx++]];
+      const msg: { text: string; images?: string[]; send_order?: 'TEXT_FIRST' | 'IMAGE_FIRST' } = { text: t };
+      if (withImage && i === 0 && imgIdx < imageOrder.length) {
+        msg.images = [imageOrder[imgIdx]];
+        // ✅ attach send_order จาก step ที่ตรงกับรูปนี้ (ถ้ามีการตั้งค่า)
+        const imgUrl = imageOrder[imgIdx];
+        if (stepSendOrderByUrl[imgUrl]) msg.send_order = stepSendOrderByUrl[imgUrl];
+        imgIdx++;
+      }
       out.push(msg);
     });
   };
@@ -1247,6 +1746,18 @@ function buildInstantSalesReply(
     if (shipBits.length) pushMsg(shipBits.join(' | '), true);
   }
 
+  // เพิ่มรูปจากทุกสเต็ปที่มีรูป (ไม่ใช่แค่ช่อง main/detail/promotion/review/closing)
+  // เพื่อให้รูปที่ admin อัปโหลดไว้ในสเต็ปใดก็ตามถูกส่งจริง
+  const seqSteps = (page?.sales_sequence_steps || []) as Array<{ step_number?: number; image_url?: string; send_order?: 'TEXT_FIRST' | 'IMAGE_FIRST' }>;
+  for (const s of seqSteps) {
+    const url = typeof s?.image_url === 'string' ? s.image_url.trim() : '';
+    if (url && !seenUrls.has(url)) {
+      seenUrls.add(url);
+      imageOrder.push(url);
+      imageKeyOrder.push(`step${s?.step_number ?? '?'}`);
+    }
+  }
+
   // ── ข้อความเสริม: รูปที่ยังไม่ได้ส่ง ต้องถูกส่งให้ครบทุกใบที่มีใน DB ──
   // 🔧 แก้ตามฟีดแบ็กเจ้าของร้าน "ไม่ได้ส่งรูปภาพมาเลยแม้แต่รูปเดียว":
   // เดิมรูปถูกแนบเฉพาะข้อความที่มีอยู่ (3 ข้อความ) → DB มีรูป 5 ใบก็ได้ส่งแค่ 3
@@ -1264,28 +1775,50 @@ function buildInstantSalesReply(
   const reserveForClosing = 1;
   while (imgIdx < imageOrder.length - reserveForClosing && out.length < 7) {
     const capKey = imageKeyOrder[imgIdx] || 'extra';
-    out.push({ text: IMAGE_CAPTIONS[capKey] || IMAGE_CAPTIONS.extra, images: [imageOrder[imgIdx]] });
+    const imgUrl = imageOrder[imgIdx];
+    const msg: { text: string; images?: string[]; send_order?: 'TEXT_FIRST' | 'IMAGE_FIRST' } = {
+      text: IMAGE_CAPTIONS[capKey] || IMAGE_CAPTIONS.extra,
+      images: [imgUrl]
+    };
+    if (stepSendOrderByUrl[imgUrl]) msg.send_order = stepSendOrderByUrl[imgUrl];
+    out.push(msg);
     imgIdx++;
   }
 
   // ── ข้อความ 4: ปิดการขายแบบให้เลือก (นักขายตัวจริงต้องปิดทุกครั้งที่พรีเซนจบ) ──
-  const bestPack = pricing.packs.length
-    ? [...pricing.packs].sort((a, b) => (b.free_shipping ? 1 : 0) - (a.free_shipping ? 1 : 0) || b.quantity - a.quantity)[0]
-    : null;
-  pushMsg(
-    bestPack
-      ? `สนใจรับเป็น "${bestPack.name}" ฿${bestPack.price.toLocaleString()}${bestPack.free_shipping ? ' ส่งฟรี' : ''} เลยไหมคะ 😊 แจ้งชื่อ-ที่อยู่-เบอร์โทร เดี๋ยวแอดมินสรุปยอดให้ค่ะ`
-      : 'สนใจรับกี่ชุดดีคะ 😊 แจ้งชื่อ-ที่อยู่-เบอร์โทรผู้รับมาได้เลย เดี๋ยวแอดมินสรุปยอดให้ค่ะ',
-    true
-  );
+  // M3: ใช้ requestedQty ถ้ามี → แพ็กที่ตรงจำนวนนั้น ไม่ใช่ bestPack = แพ็กส่งฟรี+เยอะสุด
+  const requestedQty = extractRequestedQty(messageText || '');
+  const requestedPackInfo = resolveRequestedPack(pricing, requestedQty);
+  const closePack = requestedPackInfo?.pack || 
+    (pricing.packs.length
+      ? [...pricing.packs].sort((a, b) => (b.free_shipping ? 1 : 0) - (a.free_shipping ? 1 : 0) || b.quantity - a.quantity)[0]
+      : null);
+  
+  const closeMsg = closePack
+    ? `สนใจรับเป็น "${closePack.name}" ฿${closePack.price.toLocaleString()}${closePack.free_shipping ? ' ส่งฟรี' : ''} เลยไหมคะ 😊 แจ้งชื่อ-ที่อยู่-เบอร์โทร เดี๋ยวแอดมินสรุปยอดให้ค่ะ`
+    : 'สนใจรับกี่ชุดดีคะ 😊 แจ้งชื่อ-ที่อยู่-เบอร์โทรผู้รับมาได้เลย เดี๋ยวแอดมินสรุปยอดให้ค่ะ';
+  
+  pushMsg(closeMsg, true);
 
   // กันกรณีข้อมูลน้อยมากจนเหลือข้อความเดียว — อย่างน้อยต้องมีคำถามปิดการขายเสมอ
   if (!out.length) pushMsg(`${productName} ค่ะ 😊 สนใจรับกี่ชุดดีคะ แจ้งชื่อ-ที่อยู่-เบอร์โทร เดี๋ยวแอดมินสรุปยอดให้ค่ะ`, true);
+  
+  // M3: Single Closer Rule - จดจำว่าเราส่ง closing message ไปแล้ว
+  // (ใช้ในจุดเรียกใช้ buildInstantSalesReply เพื่อป้องกันการ send ซ้ำ)
+  setClosingSent(page.page_id || 'unknown', senderId || 'unknown', closeMsg);
+  
   return out.slice(0, 8);
 }
 
 // (3) ชวนปิดการขายหลังพรีเซนจบ — แทน generateAiClosingMessage (ไม่ต้องเรียก AI)
-function buildLocalClosingAsk(page: any, matchedProduct: any): InstantOutgoing {
+// M3: รับ pageId, senderId เพื่อตรวจสอบว่าส่ง closing ไปแล้วหรือยัง (Single Closer Rule)
+function buildLocalClosingAsk(page: any, matchedProduct: any, pageId?: string, senderId?: string): InstantOutgoing {
+  // M3: Single Closer — ถ้าส่ง closing ไปแล้วในรอบนี้ → ไม่ส่งซ้ำ
+  if (pageId && senderId && hasClosingBeenSent(pageId, senderId)) {
+    addLog('AI_REPLY', senderId, pageId, `⛔ M3 Single Closer: ตรวจพบว่าส่ง closing message ไปแล้วในรอบนี้ → ไม่ส่งซ้ำ`, 'INFO');
+    return [];
+  }
+  
   const pricing = resolveProductPricing(page, matchedProduct);
   const images = resolveInstantImageMap(page, matchedProduct);
   const out: InstantOutgoing = [];
@@ -1302,6 +1835,12 @@ function buildLocalClosingAsk(page: any, matchedProduct: any): InstantOutgoing {
   for (const t of polishInstantText('สนใจสั่งซื้อ แจ้งชื่อ-นามสกุล ที่อยู่ และเบอร์โทรผู้รับให้หน่อยนะคะ เดี๋ยวแอดมินสรุปยอดให้เลยค่ะ 🙏')) {
     out.push({ text: t });
   }
+
+  // M3: บันทึกว่าส่ง closing ไปแล้ว
+  if (pageId && senderId && out.length > 0) {
+    setClosingSent(pageId, senderId, out[0]?.text || '');
+  }
+
   return out;
 }
 
@@ -3934,9 +4473,16 @@ async function startServer() {
   const reusableAttachmentCache = new Map<string, string>(); // key: pageId|dataUrl-hash -> attachment_id
   async function sendFacebookImageSmart(accessToken: string, recipientId: string, imageUrl: string, pageId?: string) {
     if (!imageUrl) return { success: false, error: 'IMAGE_EMPTY' };
+    // M5: Image dedup — ถ้าส่งรูปนี้ไปแล้วในหน้าต่าง 10 นาที → ข้ามทันที
+    if (pageId && wasImageSentRecently(pageId, recipientId, imageUrl)) {
+      addLog('INFO', 'FACEBOOK_API', recipientId, `⛔ M5 ข้ามรูปซ้ำ (10 นาที): ${imageUrl.length > 100 ? imageUrl.slice(0, 100) + '...' : imageUrl}`, 'INFO');
+      return { success: true, skipped: true, messageId: 'DEDUP_IMAGE', error: undefined };
+    }
     // Public URL -> send directly (เหมือนเดิม)
     if (/^https?:\/\//i.test(imageUrl.trim())) {
-      return sendFacebookImage(accessToken, recipientId, imageUrl);
+      const direct = await sendFacebookImage(accessToken, recipientId, imageUrl);
+      if (direct.success && pageId) recordSentImage(pageId, recipientId, imageUrl);
+      return direct;
     }
     // Data URL (รูปอัปโหลดจากไฟล์เครื่อง) หรือ path -> ต้องแปลงเป็น public URL / attachment
     const decoded = decodeDataUrl(imageUrl);
@@ -3951,7 +4497,10 @@ async function startServer() {
       const ext = (mimeMatch?.[1] || 'jpeg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
       const publicUrl = `${base}/api/media/${hash}.${ext}`;
       const viaUrl = await sendFacebookImage(accessToken, recipientId, publicUrl);
-      if (viaUrl.success) return viaUrl;
+      if (viaUrl.success) {
+        if (pageId) recordSentImage(pageId, recipientId, imageUrl);
+        return viaUrl;
+      }
       addLog('INFO', 'FACEBOOK_API', recipientId, `⚠️ ส่งรูปผ่าน public URL ยังไม่สำเร็จ (${viaUrl.error}) — ลองวิธีอัปโหลด attachment แทน`, 'WARNING');
     }
 
@@ -3966,6 +4515,10 @@ async function startServer() {
       }
       attachmentId = uploaded.attachment_id;
       reusableAttachmentCache.set(cacheKey, attachmentId);
+    }
+    // M5: บันทึกภาพที่ส่งสำเร็จสำหรับ dedup
+    if (pageId) {
+      recordSentImage(pageId, recipientId, imageUrl);
     }
     return sendFacebookAttachmentById(accessToken, recipientId, attachmentId);
   }
@@ -5171,6 +5724,12 @@ async function startServer() {
         return;
       }
 
+      // M3: Single Closer — ข้อความใหม่จากลูกค้า = เริ่มรอบใหม่ เคลียร์สถานะ
+      // "ส่ง closing แล้ว" ของรอบก่อน เพื่อให้รอบนี้ส่ง closing ได้ 1 ครั้งตามปกติ
+      clearCloserState(pageId, senderId);
+      // ⭐ สถานะดาวจาก Inbox (Meta Business Suite): แอดมินติดดาว = ปิดการขายรายนี้แล้ว
+      const isStarredCustomer = Number(blockedState?.is_starred) === 1;
+
       // ตัดรอบ command: Admin resets order counter
       if (messageText.trim() === 'ตัดรอบ' || messageText.trim().toLowerCase() === '/cutround') {
         const prevCounter = await dbService.getDispatchCounter(pageId);
@@ -5547,6 +6106,13 @@ async function startServer() {
       // "เจ้าของร้านใส่แค่ข้อมูล / AI เป็นสมองที่คุยกับลูกค้าเหมือนมนุษย์"
       const ownerScriptData = buildOwnerPreparedData(page);
 
+      // 🎭 โหมดการตอบ: ที่ปรึกษา vs ขาย
+      // - ลูกค้าติดดาว (ปิดการขายแล้วใน Inbox) หรือลูกค้าเก่าที่ไม่ได้แสดงเจตนาซื้อใหม่
+      //   → โหมดที่ปรึกษา: ตอบคำถาม/ช่วยเหลือการใช้งาน อย่างดีที่สุด ไม่เร่งขาย
+      // - ลูกค้าแสดงเจตนาซื้อใหม่ (PURCHASE/ORDER/NEGOTIATION) → โหมดขายตามปกติ
+      const hasPurchaseIntentNow = ['PURCHASE', 'ORDER', 'NEGOTIATION'].includes(intentHint);
+      const consultantMode = (isStarredCustomer || isReturningCustomer) && !hasPurchaseIntentNow;
+
       let promptContext = `
 คุณคือ "${adminName}" ซึ่งเป็นแอดมินร้านค้าเพจ Facebook: "${page.page_name}"
 ลักษณะการตอบและบุคลิก:
@@ -5563,6 +6129,10 @@ async function startServer() {
 - ชื่อ: ${customer?.customer_name || 'ไม่ทราบ'}
 - สถานะลูกค้า: ${customer?.status || 'NEW_CUSTOMER'}
 ${isReturningCustomer ? '- ⚡ ลูกค้าเคยสั่งซื้อแล้ว ให้ต้อนรับเป็นพิเศษ เช่น "ยินดีกลับมาอีกครั้งค่ะ!" และอาจเสนอโปรโมชั่นพิเศษสำหรับลูกค้าเก่า' : ''}
+${isStarredCustomer ? '- ⭐ ลูกค้ารายนี้แอดมินติดดาวไว้ใน Inbox = ปิดการขายเรียบร้อยแล้ว' : ''}
+🎯 โหมดการตอบรอบนี้: ${consultantMode
+  ? '🤝 โหมดที่ปรึกษา — ลูกค้ารายนี้ปิดการขายแล้วหรือเป็นลูกค้าเก่าที่ไม่ได้แสดงเจตนาสั่งซื้อ: ตอบคำถามทุกเรื่องอย่างละเอียดจริงใจ (การใช้งาน วิธีติดตั้ง การเก็บรักษา แก้ปัญหา) ให้ความรู้เหมือนผู้เชี่ยวชาญ ⛔ ห้ามเร่งปิดการขาย ห้ามพรีเซนสเต็ป — แต่ถ้าลูกค้าแสดงเจตนาสั่งซื้อใหม่เอง ให้เดินการขายตามปกติทันที'
+  : '🔥 โหมดขาย — ลูกค้ายังไม่ได้สั่งซื้อ: ตอบคำถามที่ลูกค้าถามให้ตรงจุดก่อนเสมอ (สั้น 1-2 ข้อความ) ห้ามส่งสเต็ปยาวถ้าลูกค้าถามเฉพาะเรื่อง แล้วค่อยชวนปิดการขายแบบธรรมชาติท้ายคำตอบ — พรีเซนสเต็มชุดเฉพาะเมื่อลูกค้าสนใจซื้อชัดเจนหรือเป็นการทักครั้งแรกเท่านั้น'}
 
 📜 ประวัติบทสนทนาล่าสุดกับลูกค้าคนนี้ (ข้อความล่าสุดอยู่ท้ายสุด ให้ตอบต่อเนื่องจากนี้):
 ${historyText}
@@ -5640,6 +6210,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
 6. เรื่องของแถม: บอกของแถมเฉพาะแพ็กเกจที่ gift_quantity > 0 หรือมี free_gifts ระบุเท่านั้น
 6.1. ⭐ ลำดับความสำคัญของราคา (รีเซ็ตให้ AI ใช้ราคาที่ถูกต้องเท่านั้น): ใช้ราคาจากแพ็กเกจโปรโมชั่น (price_1/price_2/price_3 หรือ promotions[].price) เป็นหลัก → หากไม่มี ใช้ display_price → หากไม่มี ใช้ base_price — ห้ามใช้ display_price=0 หรือว่างถ้ามี price_1 อยู่ในระบบแล้ว — นี่คือเหตุผลที่ทำให้ AI ตอบผิดราคา
 6.2. ⛔ ร้านนี้ไม่มีระบบ "ราคาเริ่มต้น" อีกต่อไป: ห้ามใช้คำหรือความหมายว่า "ราคาเริ่มต้น", "เริ่มต้นที่", "เริ่มต้น ฿", "ตั้งแต่ ~ ขึ้นไป" เด็ดขาด — ให้บอกราคาเป็นรายแพ็กเท่านั้น (เช่น "1 ชิ้น ฿299 / 2 ชิ้น ฿550") ด้วยตัวเลขจากรายการแพ็กเกจด้านบนเท่านั้น
+6.3. 🧠 คำถามความรู้ทั่วไป (วิธีใช้งาน / วิธีติดตั้ง / การเก็บรักษา / แก้ปัญหาการใช้งานทั่วไป): ให้ตอบจากความรู้ทั่วไปของคุณได้เหมือน AI ผู้ช่วยจริง อธิบายเป็นขั้นตอนสั้น ๆ ชัดเจน จริงใจเหมือนแอดมินที่เชี่ยวชาญสินค้า ⛔ แต่ห้ามดึงสเปก/ราคา/โปรโมชั่น/ข้อมูลการขายของร้านหรือแบรนด์อื่นมาตอบเป็นของร้านเราเด็ดขาด — ถ้าเป็นสเปกเฉพาะของสินค้าเราที่ไม่มีในข้อมูลระบบ ให้ตอบว่า "ขอตรวจสอบกับแอดมินก่อนนะคะ" (ต่างจากความรู้ทั่วไปที่ตอบได้)
 7. ทุกคำตอบต้องต่างจากคำตอบก่อนหน้า (ดูรายการ 🚫 ด้านบน) — ปรับคำพูดใหม่เสมอ
 
 ข้อความล่าสุดของลูกค้าที่ต้องตอบ:
@@ -5652,6 +6223,73 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
       let instantAckMainImage: string | undefined;
       // คำตอบหลักถูกส่งถึงลูกค้าแล้วหรือยัง — ถ้าส่งแล้ว catch block จะไม่ส่งพรีเซนสำรองซ้ำ
       let mainReplyDelivered = false;
+
+      // ── 🧾 สร้างออเดอร์ + สรุปยอดจากข้อความดิบ (local 0ms — single source) ──
+      // ประกาศไว้ "ก่อน try" เพื่อให้ทั้ง try (Fast Path) และ catch (fallback AI) ใช้ร่วมกันได้
+      // ลูกค้าพิมพ์ชื่อ/ที่อยู่/เบอร์มา → สร้างออเดอร์ + ส่งสรุปยอดทันที ไม่ต้องรอ AI คิด
+      const tryCreateLocalOrderFromMessage = async (): Promise<boolean> => {
+        if (consultantMode) return false;
+        const orderProbe = extractOrderInfo(messageText);
+        if (!orderProbe.phone_number && !orderProbe.address) return false;
+        const info = parseRecipientInfo(messageText);
+        const phone = info.phone || orderProbe.phone_number || '';
+        const custName = (info.name && info.name !== 'ลูกค้า') ? info.name : (customer.customer_name || '').trim();
+        const address = info.address || orderProbe.address || (customer.address || '').trim();
+        const assessment = assessOrderData(phone, custName, address);
+        if (!assessment.ok) return false;
+        const qty = 1;
+        const pricing = resolveProductPricing(page, matchedProduct);
+        const shippingFee = page.product?.shipping_fee ?? page.product?.specs?.shipping_fee ?? matchedProduct.shipping_fee;
+        const quote = calculateOrderQuote(pricing, qty, shippingFee);
+        const newOrder: Order = {
+          order_id: `ORD-${Date.now()}`,
+          psid: senderId,
+          customer_name: custName,
+          phone_number: assessment.phone,
+          shipping_address: address,
+          items: `${page.product?.product_name || matchedProduct.product_name} ${qty} ชุด`,
+          quantity: qty,
+          total_amount: quote ? quote.total : 0,
+          payment_status: 'PENDING',
+          created_at: new Date().toISOString(),
+          tracking_number: '',
+          page_id: pageId
+        };
+        db.orders.unshift(newOrder);
+        // Update customer record
+        customer.customer_name = custName;
+        customer.phone_number = assessment.phone;
+        customer.address = address;
+        customer.status = 'ORDER_COMPLETED';
+        customer.order_count = (customer.order_count || 0) + 1;
+        customer.last_product_id = page.product?.product_id || matchedProduct.product_id;
+        addLog('ORDER', senderId, pageId, `🎉 บันทึกคำสั่งซื้อใหม่ (local ทันที ไม่รอ AI) รหัส ${newOrder.order_id} ยอดรวม ฿${newOrder.total_amount.toLocaleString()}`, 'SUCCESS', newOrder);
+        // Send COD summary
+        try {
+          const summaryTotal = newOrder.total_amount;
+          const summaryText =
+            `✅ บันทึกคำสั่งซื้อเรียบร้อยค่ะ\n` +
+            buildCodSummaryText(page, {
+              ...newOrder,
+              items: `${page.product?.product_name || matchedProduct.product_name} ${qty} ชุด`,
+              total_amount: summaryTotal
+            }, quote) +
+            (newOrder.tracking_number ? `\n📮 เลขพัสดุ: ${newOrder.tracking_number}` : '') +
+            `\nขอบคุณที่อุดหนุนนะคะ 🙏`;
+          const sumRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, summaryText);
+          if (!sumRes.blocked) {
+            recordSimulatedSend(pageId, senderId, summaryText);
+            try { dbService.addChatMessage(pageId, senderId, 'admin', summaryText); } catch { /* non-critical */ }
+            pushHistory(pageId, senderId, 'admin', summaryText);
+          }
+          addLog('ORDER', senderId, pageId, `🧾 สรุปยอด ฿${summaryTotal.toLocaleString()} — ${sumRes.success ? 'ส่งสำเร็จ' : 'ส่งไม่สำเร็จ'}`, sumRes.success ? 'SUCCESS' : 'WARNING');
+        } catch (summaryErr: any) {
+          addLog('ORDER', senderId, pageId, `⚠️ ส่งสรุปยอดให้ลูกค้าไม่สำเร็จ (ข้ามไปก่อน): ${summaryErr?.message || summaryErr}`, 'WARNING');
+        }
+        dbBridge.broadcastSSE('new_order', { order_id: newOrder.order_id, page_id: pageId, dispatch_number: 0, customer_name: custName, total_amount: newOrder.total_amount });
+        persistData();
+        return true;
+      };
 
       try {
         // ลูกค้าส่งสื่อมา? ดาวน์โหลดเป็น base64 เพื่อส่งเข้า Gemini Vision/Audio
@@ -5714,6 +6352,52 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // (New) แสดง "กำลังพิมพ์..." ระหว่าง AI คิด — ลูกค้าเห็นว่าแอดมินอยู่ ลดโอกาสหนี
         void sendTypingIndicator(page.page_access_token || '', senderId, true);
 
+        // ── ⚡⚡ FAST SEQUENCE (Tier 0): ลำดับการขายจากสเต็ปที่เจ้าของตั้งไว้ ──
+        // เจตนาขาย (สนใจ/ถามราคา/โปร/ค่าส่ง) → ส่งข้อความ+รูป "ตรงตามที่ตั้ง 100%" ทันที
+        // ไม่รอ AI เลย — AI เหลือหน้าที่ตอบคำถามทั่วไป (QUESTION) เท่านั้น
+        if (await tryCreateLocalOrderFromMessage()) return;
+
+        const SALES_SEQ_INTENTS: string[] = ['GREETING', 'PURCHASE', 'PRICE', 'PROMOTION', 'NEGOTIATION', 'SHIPPING', 'TRUST'];
+        const seqStateKey = getSequenceSentKey(pageId, senderId);
+        const lastSeqSentAt = configuredSequenceSentAt.get(seqStateKey) || 0;
+        const seqStepsConfigured = ((page.sales_sequence_steps || []) as any[]).filter(s => s && (String(s?.text_content || '').trim() || String(s?.image_url || '').trim()));
+        if (!consultantMode && SALES_SEQ_INTENTS.includes(intentHint) && seqStepsConfigured.length > 0 && Date.now() - lastSeqSentAt > CONFIGURED_SEQUENCE_TTL_MS) {
+          try {
+            const seqOut = buildConfiguredSequenceReply(page, intentHint);
+            if (seqOut.length > 0) {
+              const seqJoined = seqOut.map(m => m.text).filter(Boolean).join('\n•\n');
+              for (let si = 0; si < seqOut.length; si++) {
+                const seqMsg: any = seqOut[si];
+                const seqImages: string[] = Array.isArray(seqMsg.images) ? seqMsg.images : [];
+                if (seqMsg.send_order === 'IMAGE_FIRST' && seqImages.length > 0) {
+                  for (const seqImg of seqImages) { try { await sendFacebookImageSmart(page.page_access_token || '', senderId, seqImg, pageId); } catch { /* รูปไม่ทำให้ชุดล้ม */ } }
+                  if (seqMsg.text) await sendFacebookMessage(page.page_access_token || '', senderId, seqMsg.text);
+                } else {
+                  if (seqMsg.text) await sendFacebookMessage(page.page_access_token || '', senderId, seqMsg.text);
+                  for (const seqImg of seqImages) { try { await sendFacebookImageSmart(page.page_access_token || '', senderId, seqImg, pageId); } catch { /* รูปไม่ทำให้ชุดล้ม */ } }
+                }
+                if (seqMsg.text) {
+                  recordSimulatedSend(pageId, senderId, seqMsg.text, seqImages);
+                  try { dbService.addChatMessage(pageId, senderId, 'admin', seqMsg.text); } catch { /* non-critical */ }
+                  pushHistory(pageId, senderId, 'admin', seqMsg.text);
+                } else if (seqImages.length > 0) {
+                  recordSimulatedSend(pageId, senderId, '', seqImages);
+                }
+                // (Speed) 150ms ระหว่างสเต็ป — ทั้งชุด 5-8 ข้อความ+รูป จบใน ~1-2 วิ
+                if (si < seqOut.length - 1) await sleep(150);
+              }
+              configuredSequenceSentAt.set(seqStateKey, Date.now());
+              addRecentReply(pageId, senderId, seqJoined);
+              addLog('AI_REPLY', senderId, pageId, `⚡ Fast Sequence: ส่งสเต็ปตามที่เจ้าของตั้งไว้ครบ ${seqOut.length} ชุด (ข้อความ+รูปตรงตามตั้งค่า 100% ไม่รอ AI)`, 'SUCCESS');
+              void sendTypingIndicator(page.page_access_token || '', senderId, false);
+              persistData();
+              return;
+            }
+          } catch (seqErr: any) {
+            addLog('AI_REPLY', senderId, pageId, `⚠️ Fast Sequence ส่งไม่สำเร็จ → กลับไป flow AI ตามปกติ: ${seqErr?.message || seqErr}`, 'WARNING');
+          }
+        }
+
         // ── ⚡ INSTANT ACK (Tier 1): ลูกค้าต้องเห็นข้อความแรก <2 วิเสมอ ──────────
         // เดิมข้อความแรกถูกส่งหลัง AI คิดเสร็จ (8-35 วิ) = ต้นเหตุ "ตอบช้าเกือบ 30 วิ"
         // ตอนนี้ทักทายสั้น + รูปหลักจาก DB ทันที แล้วค่อยให้ AI (Tier 2) พรีเซนต่อ
@@ -5765,9 +6449,22 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // "กำลังตรวจสอบรายละเอียดสินค้าให้ค่ะ รอสักครู่นะคะ" ที่ทำให้ลูกค้ารอเก้อ
         let localOutgoing: InstantOutgoing = [];
         if (!replyText) {
-          localOutgoing = buildInstantSalesReply(page, matchedProduct, intentHint, resolveInstantImageMap(page, matchedProduct));
+          if (consultantMode) {
+            // 🤝 โหมดที่ปรึกษา + AI ตอบว่าง: ห้ามยัดพรีเซนสเต็ปใส่ลูกค้าที่ปิดการขายแล้ว —
+            // ตอบสั้นจากข้อมูลจริง จบด้วยคำเชิญถามต่อ (ไม่มีการเร่งขาย)
+            const aPricing = resolveProductPricing(page, matchedProduct);
+            const aPackLine = aPricing.packs.length
+              ? aPricing.packs.map(p => `${p.name} ฿${p.price.toLocaleString()}`).join(' / ')
+              : (aPricing.sale > 0 ? `ราคา ฿${aPricing.sale.toLocaleString()}` : '');
+            localOutgoing = polishInstantText(
+              `มีอะไรให้ช่วยเพิ่มเติมไหมคะ 😊 ${page.product?.product_name || matchedProduct.product_name}${aPackLine ? ` (${aPackLine})` : ''} — ถามเรื่องการใช้งาน วิธีดูแล หรือสเปกได้เลยนะคะ ยินดีตอบทุกคำถามค่ะ`
+            ).map(t => ({ text: t } as InstantOutgoing[number]));
+            addLog('AI_REPLY', senderId, pageId, `🤝 โหมดที่ปรึกษา + AI ตอบว่าง → ตอบสั้นแบบที่ปรึกษาจากข้อมูลจริง (ไม่พรีเซนสเต็ป)`, 'WARNING');
+          } else {
+            localOutgoing = buildInstantSalesReply(page, matchedProduct, intentHint, resolveInstantImageMap(page, matchedProduct), messageText, senderId);
+            addLog('AI_REPLY', senderId, pageId, `⚡ AI ตอบว่าง → Instant Engine พรีเซนเต็มชุดจากข้อมูลจริงใน DB ${localOutgoing.length} ข้อความ (ไม่เรียก AI ซ้ำ ไม่ให้ลูกค้ารอ)`, 'WARNING');
+          }
           replyText = localOutgoing.map(o => o.text).join('\n•\n');
-          addLog('AI_REPLY', senderId, pageId, `⚡ AI ตอบว่าง → Instant Engine พรีเซนเต็มชุดจากข้อมูลจริงใน DB ${localOutgoing.length} ข้อความ (ไม่เรียก AI ซ้ำ ไม่ให้ลูกค้ารอ)`, 'WARNING');
         }
 
         // ── สร้างรายการข้อความที่จะส่ง — รูปอ่านจาก "จุดเดียว" resolveInstantImageMap ──
@@ -5794,8 +6491,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         const missingImageKeys = ALL_IMAGE_KEYS.filter(k => !imgMap[k]);
         const extraReady = queueKeys.filter(k => k.startsWith('extra')).length;
         addLog('INFO', senderId, pageId, `📸 รูปพร้อมส่ง ${readyAllKeys.length}/5: ${ALL_IMAGE_KEYS.map(k => (readyAllKeys.includes(k) ? `${k}✓` : `${k}✗`)).join(' ')}${extraReady ? ` + รูปเสริมจากสเต็ป ${extraReady} ใบ` : ''} | คิวรูปจริง ${queueKeys.filter(k => imgMap[k]).length} ใบ${missingImageKeys.length ? ` — ขาดช่อง: ${missingImageKeys.join(', ')}` : ''}${queueKeys.every(k => !imgMap[k]) ? ' ⛔ ไม่พบรูปสินค้าเลยในระบบ → ลูกค้าจะไม่ได้รับรูป (อัปโหลดรูปในหน้าตั้งค่าสินค้า/สเต็ป)' : ''}`, 'INFO');
-                const buildOutgoing = (p: any): Array<{ text: string; imageUrl?: string; images?: string[] }> => {
-                    const out: Array<{ text: string; imageUrl?: string; images?: string[] }> = [];
+                const buildOutgoing = (p: any): InstantOutgoing => {
+                    const out: InstantOutgoing = [];
           if (Array.isArray(p.messages)) {
             // (Upgraded) รับได้ถึง 6 ข้อความ — ตรงกับรูป 5 ใบ + ข้อความปิดการขาย
             for (const m of p.messages.slice(0, 6)) {
@@ -5810,7 +6507,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           }
           return out;
         };
-        let outgoing = localOutgoing.length ? localOutgoing : buildOutgoing(parsed);
+        let outgoing: InstantOutgoing = localOutgoing.length ? localOutgoing : buildOutgoing(parsed);
         // AUTO-ATTACH: ถ้า AI ไม่ระบุรูปเลย ให้กระจาย "รูปที่ตั้งไว้" ลงทุกข้อความอัตโนมัติ
         // ตามเจตนา (เช่น PRICE: บรรทัด1=main, 2=promotion …) วนได้เรื่อย ๆ เพื่อให้ได้
         // ชุด "ข้อความ→รูป→ข้อความ→รูป" ครบหลายใบ ไม่ใช่ส่งแค่รูปเดียวใบสุดท้าย
@@ -5851,7 +6548,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         for (const k of queueKeys) {
           if (imgMap[k] && !imageQueue.includes(k) && !(skipAckedMain && k === 'main')) imageQueue.push(k);
         }
-                                const autoAttachImages = (list: Array<{ text: string; imageUrl?: string; images?: string[] }>): Array<{ text: string; imageUrl?: string; images?: string[] }> => {
+                                const autoAttachImages = (list: InstantOutgoing): InstantOutgoing => {
           if (imageQueue.length === 0) return list;
           if (list.length === 0) {
             return replyText.trim() ? [{ text: replyText.trim(), imageUrl: imgMap[imageQueue[0]] }] : [];
@@ -5900,7 +6597,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
                 // ✅ (Upgraded) รวม auto-attach + padding เป็นฟังก์ชันเดียว — เรียกใหม่ได้ทุกครั้ง
         // ที่ outgoing ถูก rebuild (PRICE GUARD / anti-repeat regeneration) เพื่อกัน
         // "ตอบได้แค่ 2 ข้อความ 2 รูป" เมื่อ AI ตอบสั้นหรือคำตอบถูกสร้างใหม่
-        const applyImageSpread = (list: Array<{ text: string; imageUrl?: string; images?: string[] }>): Array<{ text: string; imageUrl?: string; images?: string[] }> => {
+        const applyImageSpread = (list: InstantOutgoing): InstantOutgoing => {
           let spread = autoAttachImages(list);
           const salesIntents = ['PRICE', 'PROMOTION', 'NEGOTIATION', 'ORDER', 'TRUST', 'FOLLOWUP', 'PURCHASE'];
           const minOutgoing = salesIntents.includes(intentHint) || salesIntents.includes(String(parsed.intent || '').toUpperCase())
@@ -5980,22 +6677,24 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // address but the customer clearly typed one, fill it in here so a
         // valid order is never lost to an AI oversight. (Only overwrite when
         // the regex actually found something — never blank AI-provided data.)
-        const regexOrder = extractOrderInfo(messageText);
-        parsed.orderData = { ...(parsed.orderData || {}) };
-        if (regexOrder.phone_number) parsed.orderData.phone_number = regexOrder.phone_number;
-        if (regexOrder.address) parsed.orderData.address = regexOrder.address;
+          const regexOrder = extractOrderInfo(messageText);
+          parsed.orderData = { ...(parsed.orderData || {}) };
+          if (regexOrder.phone_number) parsed.orderData.phone_number = regexOrder.phone_number;
+          if (regexOrder.address) parsed.orderData.address = regexOrder.address;
+          // (สรุปยอด COD) ถ้า AI ไม่ได้แยกชื่อ-นามสกุลออกจากข้อความดิบที่ลูกค้าพิมพ์
+          // (เช่น "106/373 ม1 ตำบล... ทวีโชค ดวงแก้ว 0826529336") → ดึงชื่อด้วย parser
+          if (!parsed.orderData.customer_name) {
+            const parsedInfo = extractCustomerInfoFromText(messageText);
+            if (parsedInfo.name && parsedInfo.name !== 'ลูกค้า') parsed.orderData.customer_name = parsedInfo.name;
+          }
 
-        // Check if AI generated a repeated reply - regenerate ONCE with
-        // different wording (more retries would double the reply latency).
+        // M5: Text dedup — ใช้ isRepeatedReplyWithThreshold แทน isRepeatedReply เดิม
+        // เปิดกันซ้ำเสมอ แม้ local engine จะตอบ (ครอบคลุมทุกเส้นทาง)
         let regenerationCount = 0;
-        // (Speed v2) 2 → 1 รอบ: แต่ละรอบคือการเรียก AI ใหม่ทั้งก้อน (6-9 วิ)
-        // การกันตอบซ้ำไม่คุ้มกับเวลาที่ลูกค้าต้องรอเพิ่ม — รอบเดียวพอ
-        const maxRegenerations = localOutgoing.length ? 0 : 1;
-        while (isRepeatedReply(pageId, senderId, replyText) && regenerationCount < maxRegenerations) {
-          addLog('INFO', senderId, pageId, `⚠️ ตรวจพบ AI ตอบข้อความซ้ำ กำลังสร้างคำตอบใหม่... (ครั้งที่ ${regenerationCount + 1})`, 'INFO');
+        const maxRegenerations = 1; // มากสุด 1 รอบเพื่อไม่ให้ลูกค้ารอ
+        while (isRepeatedReplyWithThreshold(pageId, senderId, replyText) && regenerationCount < maxRegenerations) {
+          addLog('INFO', senderId, pageId, `⚠️ M5 ตรวจพบ AI ตอบข้อความซ้ำ กำลังสร้างคำตอบใหม่... (ครั้งที่ ${regenerationCount + 1})`, 'INFO');
 
-          // Re-run AI with the EXACT repeated text quoted back so the model can
-          // concretely avoid it, plus the customer's question to stay on topic.
           const freshPrompt = promptContext + `\n\n⚠️ สำคัญมาก: คำตอบล่าสุดของคุณซ้ำกับที่เคยส่งไปแล้ว: "${replyText.slice(0, 300)}" — ห้ามใช้ประโยคนี้หรือโครงสร้างเดิมเด็ดขาด ให้ตอบคำถาม "${messageText.slice(0, 120)}" ด้วยมุมใหม่หรือข้อมูลอื่นที่มีจริงในระบบ`;
 
           try {
@@ -6006,7 +6705,6 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             });
             const regenParsed: any = regenResult.parsed;
             const regenOut = buildOutgoing(regenParsed);
-            // (Upgraded) applyImageSpread ซ้ำ — กันชุดรูป/ข้อความเติมหายเมื่อคำตอบถูก regenerate
             if (regenOut.length) outgoing = applyImageSpread(regenOut);
             replyText = regenOut.map(o => o.text).join('\n•\n') || (regenParsed.replyText || replyText);
             intent = regenParsed.intent === 'ORDER' || regenParsed.isOrderDetected ? 'ORDER' : intent;
@@ -6017,8 +6715,9 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           }
         }
 
-        if (isRepeatedReply(pageId, senderId, replyText)) {
-          addLog('AI_REPLY', senderId, pageId, `⚠️ ยังตรวจพบการตอบซ้ำหลังจากพยายาม ${regenerationCount} ครั้ง ใช้ fallback reply`, 'WARNING');
+        // M5: ถ้ายังตรวจพบการตอบซ้ำหลังจากพยายาม → ใช้ fallback reply
+        if (isRepeatedReplyWithThreshold(pageId, senderId, replyText)) {
+          addLog('AI_REPLY', senderId, pageId, `⚠️ M5 ยังตรวจพบการตอบซ้ำหลังจากพยายาม ${regenerationCount} ครั้ง ใช้ fallback reply`, 'WARNING');
           replyText = `รบกวนสอบถามเพิ่มเติมหน่อยนะคะ ${adminName} ยินดีช่วยเหลือเรื่อง ${page.product?.product_name || 'สินค้า'} เต็มที่ค่ะ พิมพ์สิ่งที่อยากทราบมาได้เลยค่า 🙏`;
         }
 
@@ -6166,25 +6865,58 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
                 addLog('AI_REPLY', senderId, pageId, `⛔ ข้อความตอบกลับ (${i + 1}/${outgoing.length}) ถูก BANNED_PRODUCT_GUARD บล็อก — ไม่ส่งถึงลูกค้า`, 'WARNING');
               }
             }
-            // รูปตามหลังข้อความเหมือนสเต็ปที่ตั้งไว้
-            // ✅ ใหม่: ถ้า msg.images มี (base64 data URLs) — ส่งแต่ละรูปแยกกันในลำดับเดียวกัน
-            // แต่บันทึกเป็น images array รวมใน recordSimulatedSend ของข้อความแล้ว
-            // (ภาพที่ส่งไปแล้วถูกบันทึกใน records ของข้อความอยู่แล้ว ไม่ต้องบันทึกซ้ำ)
-            // ในขณะที่ msg.imageUrl (URL จริงจาก DB) เท่านั้น — ส่งปกติ + บันทึก each
+            // ✅ ใหม่: buildInstantSalesReply ได้ inject send_order ลงใน msg แล้ว
+            // ถ้า msg.send_order === 'IMAGE_FIRST' ให้ส่งรูปก่อนแล้วค่อยข้อความ
             const imageList: string[] = msg.images && msg.images.length > 0 ? msg.images : (msg.imageUrl ? [msg.imageUrl] : []);
-            const recordPerImage = !msg.images || msg.images.length === 0;
-            for (let j = 0; j < imageList.length; j++) {
-              const imgUrl = imageList[j];
-              const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
-              // บันทึกลง simulator เฉพาะกรณี backward compat (imageUrl เดียว ไม่มี images array)
-              // — กรณี images array แล้ว บันทึกไว้ใน recordSimulatedSend ของข้อความแล้ว
-              if (recordPerImage) {
-                recordSimulatedSend(pageId, senderId, '', [imgUrl]);
+            const sendImagesFirst = msg.send_order === 'IMAGE_FIRST' && imageList.length > 0;
+
+            if (sendImagesFirst) {
+              // ── IMAGE_FIRST: ส่งรูปทั้งหมดก่อน ──
+              for (let j = 0; j < imageList.length; j++) {
+                const imgUrl = imageList[j];
+                const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
+                // backward compat: บันทึก分離画像ใน record แบบ per-image เฉพาะกรณีที่ไม่มี images array รวม
+                if (!msg.images || msg.images.length === 0) {
+                  recordSimulatedSend(pageId, senderId, '', [imgUrl]);
+                }
+                if (imgRes.success) {
+                  addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปก่อนข้อความ (${i + 1}/${outgoing.length}) ภาพ ${j + 1}/${imageList.length} สำเร็จ`, 'SUCCESS');
+                } else {
+                  addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปก่อนข้อความ (${i + 1}/${outgoing.length}) ภาพ ${j + 1}/${imageList.length} ล้มเหลว: ${imgRes.error}`, 'ERROR');
+                }
               }
-              if (imgRes.success) {
-                addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}) สำเร็จ`, 'SUCCESS');
+            }
+
+            // ── ส่งข้อความ ──
+            if (isLast && shouldSendQuickReplies) {
+              const qrRes: any = await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
+              if (!qrRes?.blocked) {
+                recordSimulatedSend(pageId, senderId, msg.text, msg.images);
+              }
+              addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})${qrRes?.blocked ? ' — ⛔ ถูก BANNED_PRODUCT_GUARD บล็อก' : ''}`, qrRes?.blocked ? 'WARNING' : 'SUCCESS');
+            } else {
+              const msgRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
+              if (!msgRes.blocked) {
+                recordSimulatedSend(pageId, senderId, msg.text, msg.images);
               } else {
-                addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบ ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}) ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+                addLog('AI_REPLY', senderId, pageId, `⛔ ข้อความตอบกลับ (${i + 1}/${outgoing.length}) ถูก BANNED_PRODUCT_GUARD บล็อก — ไม่ส่งถึงลูกค้า`, 'WARNING');
+              }
+            }
+
+            // ── หากเป็น TEXT_FIRST (ค่าเริ่มต้น) ให้ส่งรูปตามหลังข้อความเหมือนเดิม ──
+            if (!sendImagesFirst) {
+              const recordPerImage = !msg.images || msg.images.length === 0;
+              for (let j = 0; j < imageList.length; j++) {
+                const imgUrl = imageList[j];
+                const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
+                if (recordPerImage) {
+                  recordSimulatedSend(pageId, senderId, '', [imgUrl]);
+                }
+                if (imgRes.success) {
+                  addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}) สำเร็จ`, 'SUCCESS');
+                } else {
+                  addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบ ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}) ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+                }
               }
             }
           } catch (sendErr: any) {
@@ -6206,10 +6938,10 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           // การถามจำนวนชุดแต่ยังไม่ได้ขอชื่อ/ที่อยู่/เบอร์ → ทำให้ closing message ถูกข้ามไปผิด)
           const askedForOrderInfo = /ชื่อ|นามสกุล|ที่อยู่|เบอร์โทร|เบอร์มือถือ|เบอร์|จัดส่ง|ที่อยู่จัดส่ง/.test(replyText);
           const sentReviewImage = outgoing.some(o => Boolean(o.imageUrl) && o.imageUrl === imgMap.review);
-          if (!askedForOrderInfo && (sentReviewImage || includeClosingAsk || intent === 'ORDER')) {
+          if (!askedForOrderInfo && !consultantMode && (sentReviewImage || includeClosingAsk || intent === 'ORDER')) {
             // (Instant Engine) ข้อความปิดการขายสร้างจาก local engine (ราคา/แพ็กจริงจาก DB
             // + รูป closing) — แทน generateAiClosingMessage: ไม่ต้องรอ AI อีก 1 round-trip
-            const closingParts = buildLocalClosingAsk(page, matchedProduct);
+            const closingParts = buildLocalClosingAsk(page, matchedProduct, pageId, senderId);
             for (let ci = 0; ci < closingParts.length; ci++) {
               const part = closingParts[ci];
               // (Speed v2) 700/400ms → 250/150ms: ข้อความปิดการขายต้องตามมาให้เร็ว
@@ -6238,8 +6970,9 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         if (intent === 'ORDER' || (parsed.orderData && (parsed.orderData.phone_number || parsed.orderData.address))) {
           const od = parsed.orderData || {};
           const qty = Number(od.quantity) || 1;
-          const unitPrice = Number(od.unit_price) || Number(page.product?.display_price || matchedProduct.display_price) || 0;
-          const totalAmount = od.total_amount || qty * unitPrice;
+          // Pack prices are totals. Never trust AI-generated monetary values.
+          const quote = calculateOrderQuote(resolveProductPricing(page, matchedProduct), qty,
+            page.product?.shipping_fee ?? page.product?.specs?.shipping_fee ?? matchedProduct.shipping_fee);
           const custName = (od.customer_name || customer.customer_name || '').trim();
           // ใช้ข้อมูล "ที่ลูกค้าพิมพ์ในรอบนี้" ก่อนเสมอ แล้วค่อยใช้ของที่จดไว้ในโปรไฟล์ลูกค้า
           const typedPhone = String(od.phone_number || '').trim();
@@ -6274,6 +7007,19 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             return;
           }
           const phoneValid = assessment.phone;
+          if (!quote) {
+            const pendingText = 'ได้รับข้อมูลผู้รับแล้วค่ะ แต่ยังยืนยันยอดไม่ได้ ขอให้แอดมินตรวจสอบแพ็ก จำนวน และค่าจัดส่งก่อนนะคะ ยังไม่ได้บันทึกคำสั่งซื้อค่ะ';
+            const pendingRes = await sendFacebookMessage(page.page_access_token || '', senderId, pendingText);
+            recordSimulatedSend(pageId, senderId, pendingText);
+            if (pendingRes.success) {
+              await dbService.addChatMessage(pageId, senderId, 'admin', pendingText);
+              pushHistory(pageId, senderId, 'admin', pendingText);
+            }
+            addLog('ORDER', senderId, pageId, 'ยังไม่สร้างออเดอร์: ราคาแพ็กหรือค่าส่งไม่ชัดเจน', 'WARNING');
+            persistData();
+            return;
+          }
+          const totalAmount = quote.total;
 
           const newOrder: Order = {
             order_id: `ORD-${Date.now()}`,
@@ -6286,7 +7032,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             total_amount: totalAmount,
             payment_status: 'PENDING',
             created_at: new Date().toISOString(),
-            tracking_number: `TH${Math.floor(1000000000 + Math.random() * 9000000000)}FL`,
+            tracking_number: '', // Assigned by the carrier/admin after dispatch, never fabricated.
             page_id: pageId
           };
 
@@ -6319,27 +7065,28 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
 
           dbBridge.broadcastSSE('new_order', { order_id: newOrder.order_id, page_id: pageId, dispatch_number: dispatchNumber, customer_name: custName, total_amount: totalAmount });
           // ── ส่ง "สรุปยอด" ให้ลูกค้า (ยืนยันคำสั่งซื้อ) ──────────────────────
-          // คำนวณจากราคาจริงใน DB เท่านั้น (จำนวนชุด × ราคาแพ็กที่ตรงจำนวน)
+          // Use exactly the same validated total as the stored order.
           try {
-            const summaryPricing = resolveProductPricing(page, matchedProduct);
-            const packForQty = summaryPricing.packs.find(p => p.quantity === qty);
-            const unit = packForQty?.price || unitPrice;
-            const summaryTotal = qty * unit;
+            const summaryTotal = newOrder.total_amount;
             const summaryText =
               `✅ บันทึกคำสั่งซื้อเรียบร้อยค่ะ\n` +
-              `📦 ${page.product?.product_name || matchedProduct.product_name} ${qty} ชุด\n` +
-              `💰 ยอดรวม ฿${summaryTotal.toLocaleString()}\n` +
-              `👤 ${custName}\n☎️ ${phoneValid}\n🏠 ${address}\n` +
-              `🚚 จัดส่ง ${page.product?.courier_brand || 'Flash Express'} ถึงภายใน ${page.product?.delivery_days || '1-3 วัน'}\n` +
-              `🔖 รหัสออเดอร์: ${newOrder.order_id}${newOrder.tracking_number ? `\n📮 เลขพัสดุ: ${newOrder.tracking_number}` : ''}\n` +
-              `ขอบคุณที่อุดหนุนนะคะ 🙏`;
+              // 🧾 สรุปยอดให้ลูกค้า "ตามแบบฟอร์ม COD ที่เจ้าของร้านตั้งไว้" (TAB 7 —
+              // ระบบสรุปยอดลูกค้า): ใช้ template/ฟิลด์ cod_summary_* ของเพจโดยตรง
+              // (สินค้า/ยอดคำนวณจากราคาจริงใน DB เท่านั้น — ฟอร์มกำหนดแค่รูปแบบ)
+              buildCodSummaryText(page, {
+                ...newOrder,
+                items: `${page.product?.product_name || matchedProduct.product_name} ${qty} ชุด`,
+                total_amount: summaryTotal
+              }, quote) +
+              (newOrder.tracking_number ? `\n📮 เลขพัสดุ: ${newOrder.tracking_number}` : '') +
+              `\nขอบคุณที่อุดหนุนนะคะ 🙏`;
             const sumRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, summaryText);
             if (!sumRes.blocked) {
               recordSimulatedSend(pageId, senderId, summaryText);
               try { dbService.addChatMessage(pageId, senderId, 'admin', summaryText); } catch { /* non-critical */ }
               pushHistory(pageId, senderId, 'admin', summaryText);
             }
-            addLog('ORDER', senderId, pageId, `🧾 ส่งสรุปยอดให้ลูกค้าแล้ว ฿${summaryTotal.toLocaleString()} (${qty} ชุด × ฿${unit.toLocaleString()})`, 'SUCCESS');
+            addLog('ORDER', senderId, pageId, `🧾 สรุปยอด ฿${summaryTotal.toLocaleString()} (สินค้า ฿${quote.subtotal.toLocaleString()} + ค่าส่ง ฿${quote.shipping.toLocaleString()}) — ${sumRes.success ? 'ส่งสำเร็จ' : 'ส่งไม่สำเร็จ'}`, sumRes.success ? 'SUCCESS' : 'WARNING');
           } catch (summaryErr: any) {
             addLog('ORDER', senderId, pageId, `⚠️ ส่งสรุปยอดให้ลูกค้าไม่สำเร็จ (ข้ามไปก่อน): ${summaryErr?.message || summaryErr}`, 'WARNING');
           }
@@ -6358,8 +7105,24 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // ข้อความทุกชิ้นผ่าน polishInstantText (sanitize + strip ราคาเริ่มต้น + scrub คำแบน + split)
         if (!mainReplyDelivered) {
           const fbImgMap = resolveInstantImageMap(page, matchedProduct);
-          const fbParts = buildInstantSalesReply(page, matchedProduct, intentHint, fbImgMap);
-          addLog('AI_REPLY', senderId, pageId, `⚡ AI ล้มเหลว → Instant Engine พรีเซนเต็มชุดจากข้อมูลจริง ${fbParts.length} ข้อความ (ไม่เรียก AI ซ้ำ ไม่ให้ลูกค้ารอ)`, 'WARNING');
+          // 🤝 โหมดที่ปรึกษา: ห้ามพรีเซนสเต็ปใส่ลูกค้าที่ปิดการขายแล้ว — ตอบสั้นเชิญถามต่อ
+          // แต่ถ้าข้อความมีข้อมูลสั่งซื้อครบ (ชื่อ/ที่อยู่/เบอร์) → สร้างออเดอร์เลย ไม่ต้องรอ AI
+          const recipientFallback = buildRecipientFallback(messageText);
+          // 🔧 refactor: ใช้ tryCreateLocalOrderFromMessage (helper เดียวกับ Fast Path ก่อนเรียก AI)
+          // แทนโค้ดสร้างออเดอร์+สรุปยอดที่เคยซ้ำ 70 บรรทัดตรงนี้ — ทำงานเหมือนเดิมทุกอย่าง
+          if (await tryCreateLocalOrderFromMessage()) return;
+
+          // 🤝 โหมดที่ปรึกษา: ห้ามพรีเซนสเต็ปใส่ลูกค้าที่ปิดการขายแล้ว — ตอบสั้นเชิญถามต่อ
+          const fbParts: InstantOutgoing = recipientFallback
+            ? [{ text: recipientFallback }]
+            : consultantMode
+            ? polishInstantText(
+                `มีอะไรให้ช่วยเพิ่มเติมไหมคะ 😊 ${page.product?.product_name || matchedProduct.product_name} — ถามเรื่องการใช้งาน วิธีดูแล หรือสเปกได้เลยนะคะ ยินดีตอบทุกคำถามค่ะ`
+              ).map(t => ({ text: t } as InstantOutgoing[number]))
+            : buildInstantSalesReply(page, matchedProduct, intentHint, fbImgMap, messageText, senderId);
+          addLog('AI_REPLY', senderId, pageId, consultantMode
+            ? `🤝 AI ล้มเหลว + โหมดที่ปรึกษา → ตอบสั้นแบบที่ปรึกษา (ไม่พรีเซนสเต็ป)`
+            : `⚡ AI ล้มเหลว → Instant Engine พรีเซนเต็มชุดจากข้อมูลจริง ${fbParts.length} ข้อความ (ไม่เรียก AI ซ้ำ ไม่ให้ลูกค้ารอ)`, 'WARNING');
           for (let fi = 0; fi < fbParts.length; fi++) {
             const fbMsg = fbParts[fi];
             // กันส่ง "รูปหลัก" ซ้ำ — instant ack แนบรูปหลักไปให้ลูกค้าแล้ว
@@ -8841,9 +9604,9 @@ ${convo}
       console.log(`=======================================================`);
     });
 
-    // 🤝 Smart Follow-up Engine: auto tick ทุก 10 นาที (+ ครั้งแรกหลังเปิด 90 วิ)
+    // 🤝 Smart Follow-up Engine: auto tick ทุก 60 วินาที (รองรับติดตาม 5 นาที) (+ ครั้งแรกหลังเปิด 90 วิ)
     setTimeout(() => { runSmartFollowupTick().catch(() => {}); }, 90 * 1000);
-    setInterval(() => { runSmartFollowupTick().catch(() => {}); }, 10 * 60 * 1000);
+    setInterval(() => { runSmartFollowupTick().catch(() => {}); }, 60 * 1000);
   }
 }
 

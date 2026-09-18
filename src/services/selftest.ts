@@ -915,8 +915,16 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
       // tick
       const tick = await fetchJson(baseUrl, '/api/followup/smart-tick', { method: 'POST' }, 120000);
       if (tick.status !== 200 || !tick.data?.success) throw new Error(`tick HTTP ${tick.status}`);
-      if (Number(tick.data.sent) < 1) throw new Error(`ส่ง follow-up ${tick.data.sent} คน — ${JSON.stringify((tick.data.details || []).slice(0, 3))}`);
       const st = await dbService.getConversationState(pageId, sender);
+      const ownDetails = (tick.data.details || []).filter((d: string) => d.startsWith(`ข้าม ${sender.slice(-8)}:`) || d.startsWith(`L1 → ${sender.slice(-6)}:`));
+      if (ownDetails.some((d: string) => d.includes('PAGE_ACCESS_TOKEN_NOT_CONFIGURED'))) {
+        if (Number(st?.followup_level || 0) !== 0 || st?.followup_at) {
+          throw new Error('ส่งไม่ได้เพราะไม่มี token แต่กลับเลื่อนระดับ/บันทึกเวลาส่งสำเร็จ');
+        }
+        return { status: 'WARN' as TestStatus, detail: 'ถึงเวลาติดตามแล้ว แต่เพจทดสอบไม่มี Page Access Token: ยืนยันว่าไม่เลื่อนสถานะส่งสำเร็จ; ยังไม่ได้ยืนยันการส่งจริงหรือเงื่อนไขบล็อก' };
+      }
+      if (!ownDetails.some((d: string) => d.startsWith('L1 →'))) throw new Error(`ไม่พบการส่งให้ลูกค้าทดสอบ — ${JSON.stringify(ownDetails)}`);
+      if (Number(tick.data.sent) < 1) throw new Error(`ส่ง follow-up ${tick.data.sent} คน — ${JSON.stringify((tick.data.details || []).slice(0, 3))}`);
       if (Number(st?.followup_level) < 1) throw new Error(`followup_level=${st?.followup_level} (ควร 1)`);
       // blocked customer ต้องถูกข้ามเสมอ
       await dbService.addChatMessage(pageId, `${PREFIX}fu_blocked`, 'customer', 'สนใจค่ะ');
@@ -933,6 +941,119 @@ export async function runSelfTests(deps: SelfTestDeps): Promise<SelfTestReport> 
         await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [s]).catch(() => {});
         await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [s]).catch(() => {});
       }
+    }
+  });
+
+  // ===================== E+1. ฟีเจอร์ใหม่: ติดตาม 5 นาที + COD Form + Closing Guard =====================
+  await run('followup-minute-interval', 'Follow-up', 'ติดตามลูกค้าเงียบ 5 นาที (หน่วยนาที) ทำงานได้จริง', async () => {
+    const pageId = addTestPage();
+    const sender = `${PREFIX}fumin_${Date.now()}`;
+    try {
+      // เปิด follow-up + ตั้งสเต็ปแรกเป็น "5 นาที" (ข้อความที่แอดมินตั้งไว้)
+      const page = db.pages.find(p => p.page_id === pageId);
+      if (page) {
+        (page as any).followup_enabled = true;
+        (page as any).followup_messages = [{ interval: '5 นาที', message: 'ลูกค้ายังสนใจสินค้าของเราอยู่ไหมคะ 😊' }];
+      }
+      persistData();
+      // ลูกค้าถาม 12 นาทีก่อน → แอดมินตอบ 10 นาทีก่อน → เงียบมา 10 นาที (> 5 นาที)
+      await dbService.addChatMessage(pageId, sender, 'customer', 'ราคาเท่าไหร่คะ');
+      await dbService.addChatMessage(pageId, sender, 'admin', 'แพ็กเดี่ยว 1490 ค่ะ สนใจไหมคะ');
+      await dbService.executeRaw("UPDATE chat_history SET created_at = ? WHERE sender_id = ? AND role = 'customer'", [new Date(Date.now() - 12 * 60000).toISOString(), sender]);
+      await dbService.executeRaw("UPDATE chat_history SET created_at = ? WHERE sender_id = ? AND role = 'admin'", [new Date(Date.now() - 10 * 60000).toISOString(), sender]);
+      const tick = await fetchJson(baseUrl, '/api/followup/smart-tick', { method: 'POST' }, 120000);
+      if (tick.status !== 200 || !tick.data?.success) throw new Error(`tick HTTP ${tick.status}`);
+      const st = await dbService.getConversationState(pageId, sender);
+      const skippedDetail = (tick.data.details || []).find((d: string) => d.startsWith(`ข้าม ${sender.slice(-8)}:`));
+      if (skippedDetail?.includes('PAGE_ACCESS_TOKEN_NOT_CONFIGURED')) {
+        if (Number(st?.followup_level || 0) !== 0 || st?.followup_at) throw new Error('ไม่มี token แต่เลื่อนสถานะติดตามสำเร็จ');
+        return { status: 'WARN' as TestStatus, detail: 'สเต็ป 5 นาทีถึงกำหนดแล้ว; ไม่มี token จึงไม่ส่งและไม่เลื่อนระดับ — ยังไม่ยืนยันการส่งผ่าน Meta จริง' };
+      }
+      const sentDetail = (tick.data.details || []).find((d: string) => d.startsWith(`L1 → ${sender.slice(-6)}:`));
+      if (Number(tick.data.sent) < 1 || !sentDetail) throw new Error(`ไม่ส่งติดตาม 5 นาที — details: ${JSON.stringify((tick.data.details || []).slice(0, 3))}`);
+      if (Number(st?.followup_level) < 1) throw new Error(`followup_level=${st?.followup_level} (ควรเลื่อนเป็น 1)`);
+      return { detail: `เงียบ 10 นาที > สเต็ป "5 นาที" → ส่งข้อความที่แอดมินตั้งไว้ + level เลื่อนเป็น 1 สำเร็จ` };
+    } finally {
+      removeTestPage(pageId);
+      await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [sender]).catch(() => {});
+    }
+  });
+
+  await run('cod-summary-form', 'Webhook E2E', 'สรุปยอด COD ตามแบบฟอร์มที่เจ้าของร้านตั้ง (TAB 7) พร้อมชื่อจากข้อความดิบ', async () => {
+    const pageId = addTestPage();
+    // ตั้งแบบฟอร์ม COD เฉพาะของเพจ (เหมือนหน้าตั้งค่า TAB 7)
+    const page = db.pages.find(p => p.page_id === pageId);
+    if (page) {
+      (page as any).cod_summary_fields = JSON.stringify({ include_header: true, include_customer_name: true, include_phone: true, include_address: true, include_items: true, include_total_amount: true });
+    }
+    persistData();
+    const sender = `${PREFIX}cod_${Date.now()}`;
+    try {
+      // ลูกค้าพิมพ์ข้อมูลดิบรวมก้อนเดียว (เหมือนส่งของจริงมา) — ระบบต้องแยก
+      // ชื่อ/ที่อยู่/เบอร์ เอง แล้วสร้างออเดอร์ + สรุปยอดตามฟอร์ม
+      const raw = 'สั่งซื้อค่ะ 106/373 ม1 ตำบลแสนสุข อำเภอบ้านโพธิ์ จังหวัดฉะเชิงเทรา 24140 สมชาย ใจดี 0826529336';
+      const sim = await fetchJson(baseUrl, '/api/simulate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event_type: 'MESSAGE', page_id: pageId, sender_id: sender, message_text: raw }) }, 150000);
+      if (sim.status !== 200 || !sim.data?.success) throw new Error(`simulate HTTP ${sim.status}`);
+      const replies = (sim.data.sentReplies || []).map((r: any) => String(r.text || ''));
+      const allText = replies.join('\n');
+      if (!allText.includes('0826529336')) throw new Error(`สรุปยอดไม่มีเบอร์โทรที่ลูกค้าพิมพ์ — replies: ${allText.slice(0, 200)}`);
+      // ออเดอร์ต้องถูกสร้างจริงด้วยชื่อ+เบอร์ที่แยกได้
+      const order = db.orders.find(o => o.psid === sender);
+      if (!order) throw new Error('ไม่สร้างออเดอร์จากข้อความดิบ');
+      if (!order.customer_name || order.customer_name.length < 2) throw new Error(`ชื่อลูกค้าว่าง/สั้น: "${order.customer_name}"`);
+      if (!String(order.phone_number).includes('0826529336')) throw new Error(`เบอร์ไม่ตรง: ${order.phone_number}`);
+      return { detail: `แยก "สมชาย ใจดี"/เบอร์/ที่อยู่ จากข้อความดิบ → ออเดอร์ ${order.order_id} + สรุปยอดตามฟอร์ม (${replies.length} ข้อความ) สำเร็จ` };
+    } finally {
+      removeTestPage(pageId);
+      db.orders = db.orders.filter(o => o.psid !== sender);
+      persistData();
+      await dbService.executeRaw('DELETE FROM orders WHERE psid = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [sender]).catch(() => {});
+    }
+  });
+
+  await run('advisor-mode-starred', 'Webhook E2E', 'ลูกค้าติดดาว (ปิดการขายแล้ว) ถามเรื่องใช้งาน → ตอบเป็นที่ปรึกษา ไม่เร่งขาย', async () => {
+    const pageId = addTestPage();
+    const sender = `${PREFIX}adv_${Date.now()}`;
+    try {
+      // ⭐ ติดดาวลูกค้าคนนี้ใน Inbox = แอดมินปิดการขายรายนี้ไปแล้ว
+      await dbService.updateConversationState(pageId, sender, { is_starred: 1 });
+      const sim = await fetchJson(baseUrl, '/api/simulate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event_type: 'MESSAGE', page_id: pageId, sender_id: sender, message_text: 'สินค้านี้เก็บรักษายังไงคะ ต้องเก็บในที่แสงไหม' }) }, 150000);
+      if (sim.status !== 200 || !sim.data?.success) throw new Error(`simulate HTTP ${sim.status}`);
+      const replies = (sim.data.sentReplies || []).map((r: any) => String(r.text || '')).filter(t => t.trim());
+      if (replies.length === 0) throw new Error('ไม่มีข้อความตอบกลับเลย');
+      const closingAsk = replies.filter(t => /แจ้งชื่อ|ชื่อ[- ]?ที่อยู่|ที่อยู่จัดส่ง|เบอร์โทรผู้รับ|ขอที่อยู่|สั่งซื้อ.*ชื่อ/.test(t));
+      if (closingAsk.length > 0) throw new Error(`ลูกค้าติดดาวแล้วยังเร่งขาย/ขอข้อมูลสั่งซื้อ: ${closingAsk.map(t => t.slice(0, 50)).join(' | ')}`);
+      return { detail: `ลูกค้าติดดาวถามวิธีเก็บรักษา → ตอบ ${replies.length} ข้อความแบบที่ปรึกษา ไม่มีการเร่งขาย ถูกต้อง` };
+    } finally {
+      removeTestPage(pageId);
+      await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [sender]).catch(() => {});
+    }
+  });
+
+  await run('closing-ask-guard', 'Webhook E2E', 'ข้อความปิดการขายส่ง 1 ครั้ง/รอบ (ไม่ซ้ำซ้อน 2 จุด)', async () => {
+    const pageId = addTestPage();
+    const sender = `${PREFIX}close_${Date.now()}`;
+    try {
+      // ลูกค้าแสดงเจตนาซื้อชัด → ระบบตอบ (AI หรือ instant engine) + closing ครั้งเดียว
+      const sim = await fetchJson(baseUrl, '/api/simulate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event_type: 'MESSAGE', page_id: pageId, sender_id: sender, message_text: 'สนใจ เอา 1 ชุด ราคาเท่าไหร่คะ' }) }, 150000);
+      if (sim.status !== 200 || !sim.data?.success) throw new Error(`simulate HTTP ${sim.status}`);
+      const replies = (sim.data.sentReplies || []).map((r: any) => String(r.text || '')).filter(t => t.trim());
+      const closingLike = replies.filter(t => /ชื่อ[- ]?ที่อยู่[- ]?เบอร์|แจ้งชื่อ|ที่อยู่จัดส่ง|เบอร์โทรผู้รับ/.test(t));
+      if (closingLike.length > 1) throw new Error(`ข้อความปิดการขายถูกส่งซ้ำ ${closingLike.length} ครั้งในรอบเดียว: ${closingLike.map(t => t.slice(0, 40)).join(' | ')}`);
+      if (replies.length === 0) throw new Error('ไม่มีข้อความตอบกลับเลย');
+      return { detail: `ตอบกลับ ${replies.length} ข้อความ ปิดการขายขอชื่อ-ที่อยู่-เบอร์เพียง 1 ครั้ง/รอบ ถูกต้อง` };
+    } finally {
+      removeTestPage(pageId);
+      await dbService.executeRaw('DELETE FROM chat_history WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM conversation_state WHERE sender_id = ?', [sender]).catch(() => {});
+      await dbService.executeRaw('DELETE FROM activity_logs WHERE sender_id = ?', [sender]).catch(() => {});
     }
   });
 
