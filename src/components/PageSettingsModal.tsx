@@ -36,7 +36,7 @@ import {
   Search,
   Filter
 } from 'lucide-react';
-import { PageConfig, PromotionTier, ProductCategory, ProductDetailedSpecs, CustomSpecItem } from '../types';
+import { PageConfig, PromotionTier, ProductCategory, ProductDetailedSpecs, CustomSpecItem, KeywordTrigger } from '../types';
 import { parseTextToSpecs } from '../utils/aiSpecParser';
 import { buildCodSummaryText } from '../utils/codSummary';
 import {
@@ -50,6 +50,98 @@ import {
 import { chatWithLocalAi, isLocalAiModel } from '../utils/localAi';
 import { getStoredLocalAiModel } from './AiApiSettingsModal';
 import { CustomButtonsManager } from './CustomButtonsManager';
+
+interface KeywordTriggerCardProps {
+  rule: KeywordTrigger;
+  index: number;
+  steps: NonNullable<PageConfig['sales_sequence_steps']>;
+  onUpdate: (index: number, patch: Partial<KeywordTrigger>) => void;
+  onToggleStep: (index: number, stepNumber: number) => void;
+  onRemove: (index: number) => void;
+}
+
+/** 🔑 การ์ดตั้งกฎคีย์เวิร์ด 1 ใบ — คำที่จับ + สเต็ปที่จะส่ง */
+const KeywordTriggerCard: React.FC<KeywordTriggerCardProps> = ({
+  rule,
+  index,
+  steps,
+  onUpdate,
+  onToggleStep,
+  onRemove
+}) => (
+  <div className="bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg p-3.5 space-y-3">
+    <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
+      <div className="md:col-span-4 space-y-1.5">
+        <label className="text-[11px] text-slate-500 dark:text-zinc-400 font-medium block">ชื่อกฎ:</label>
+        <input
+          type="text"
+          value={rule.label || ''}
+          onChange={e => onUpdate(index, { label: e.target.value })}
+          placeholder="เช่น รายละเอียดสินค้า"
+          className="w-full bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none"
+        />
+      </div>
+      <div className="md:col-span-8 space-y-1.5">
+        <label className="text-[11px] text-slate-500 dark:text-zinc-400 font-medium block">
+          คำที่ใช้จับ (คั่นด้วยเครื่องหมายจุลภาค ,):
+        </label>
+        <input
+          type="text"
+          value={(rule.keywords || []).join(', ')}
+          onChange={e =>
+            onUpdate(index, { keywords: e.target.value.split(',').map(k => k.trim()).filter(Boolean) })
+          }
+          placeholder="ขอรายละเอียด, รายละเอียด, สเปค, ข้อมูลสินค้า"
+          className="w-full bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none"
+        />
+      </div>
+    </div>
+
+    <div className="space-y-1.5">
+      <label className="text-[11px] text-slate-500 dark:text-zinc-400 font-medium block">
+        เลือกสเต็ปที่จะส่งเมื่อจับคีย์เวิร์ดได้:
+      </label>
+      <div className="flex flex-wrap gap-2">
+        {steps.map(st => {
+          const num = Number(st.step_number);
+          const checked = (rule.step_numbers || []).includes(num);
+          const shortTitle = st.title ? String(st.title).replace(/^Step\s*\d+\s*:?\s*/, '').slice(0, 24) : '';
+          return (
+            <button
+              key={`${rule.id}-${num}`}
+              type="button"
+              onClick={() => onToggleStep(index, num)}
+              className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border transition-all cursor-pointer ${
+                checked
+                  ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                  : 'bg-white dark:bg-[#121216] text-slate-600 dark:text-zinc-300 border-slate-200 dark:border-zinc-800 hover:border-indigo-400'
+              }`}
+            >
+              {checked ? '✓ ' : ''}สเต็ป {num}
+              {shortTitle ? ` — ${shortTitle}` : ''}
+            </button>
+          );
+        })}
+      </div>
+      {(rule.step_numbers || []).length === 0 && (
+        <p className="text-[11px] text-amber-600 dark:text-amber-400">
+          ️ ยังไม่ได้เลือกสเต็ป — กฎนี้จะยังไม่ทำงาน (ระบบจะส่งสเต็ปครบชุดตามปกติ)
+        </p>
+      )}
+    </div>
+
+    <div className="flex justify-end">
+      <button
+        type="button"
+        onClick={() => onRemove(index)}
+        className="px-3 py-1.5 text-[11px] font-bold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30 rounded-lg transition-all cursor-pointer inline-flex items-center gap-1"
+      >
+        <Trash2 className="w-3.5 h-3.5" />
+        <span>ลบกฎนี้</span>
+      </button>
+    </div>
+  </div>
+);
 
 interface PageSettingsModalProps {
   isOpen: boolean;
@@ -207,6 +299,8 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
           { id: 'step-5', step_number: 5, type: 'BOTH', title: 'Step 5: ภาพสรุปโปรโมชั่นเร่งปิดการขาย', text_content: page?.product?.closing_text || 'สนใจรับสิทธิ์โปรโมชั่น พิมพ์แจ้งชื่อ ที่อยู่ เบอร์โทรศัพท์ ไว้ในแชทได้เลยนะคะ', image_url: page?.product?.image_closing || page?.product?.images?.closing || '' },
           { id: 'step-6', step_number: 6, type: 'BOTH', title: 'Step 6: ภาพขอบพระคุณ & บริการหลังการขาย', text_content: page?.product?.step6_text || 'ขอบพระคุณลูกค้ามากๆ ค่ะ ทางร้านจะจัดส่งสินค้าและแจ้งเลขพัสดุให้นะคะ', image_url: page?.product?.image_step6 || '' }
         ],
+    // 🔑 คีย์เวิร์ดส่งสเต็ปอัตโนมัติ — ว่าง = ใช้ค่าเริ่มต้นในตัว (จับจากชื่อสเต็ป)
+    keyword_triggers: Array.isArray(page?.keyword_triggers) ? page.keyword_triggers : [],
     notification_channel: page?.notification_channel || 'BOTH',
     telegram_bot_token: page?.telegram_bot_token || '',
     telegram_chat_id: page?.telegram_chat_id || '',
@@ -477,6 +571,50 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
     });
   };
 
+  // 🔑 Keyword Trigger handlers — ลูกค้าพิมพ์คีย์เวิร์ด → ส่งเฉพาะสเต็ปที่ผูกไว้ทันที
+  const handleAddKeywordTrigger = () => {
+    setFormData(prev => {
+      const current = prev.keyword_triggers || [];
+      const newRule: KeywordTrigger = {
+        id: `kw-${Date.now()}`,
+        label: '',
+        keywords: [],
+        step_numbers: []
+      };
+      return { ...prev, keyword_triggers: [...current, newRule] };
+    });
+  };
+
+  const handleUpdateKeywordTrigger = (index: number, patch: Partial<KeywordTrigger>) => {
+    setFormData(prev => {
+      const current = [...(prev.keyword_triggers || [])];
+      if (!current[index]) return prev;
+      current[index] = { ...current[index], ...patch };
+      return { ...prev, keyword_triggers: current };
+    });
+  };
+
+  const handleRemoveKeywordTrigger = (index: number) => {
+    setFormData(prev => ({
+      ...prev,
+      keyword_triggers: (prev.keyword_triggers || []).filter((_, i) => i !== index)
+    }));
+  };
+
+  const handleToggleKeywordStep = (index: number, stepNumber: number) => {
+    setFormData(prev => {
+      const current = [...(prev.keyword_triggers || [])];
+      const rule = current[index];
+      if (!rule) return prev;
+      const has = (rule.step_numbers || []).includes(stepNumber);
+      const next = has
+        ? (rule.step_numbers || []).filter(n => n !== stepNumber)
+        : [...(rule.step_numbers || []), stepNumber].sort((a, b) => a - b);
+      current[index] = { ...rule, step_numbers: next };
+      return { ...prev, keyword_triggers: current };
+    });
+  };
+
   const handleRemoveSequenceStep = (index: number) => {
     setFormData(prev => {
       const currentSteps = prev.sales_sequence_steps || [];
@@ -491,9 +629,16 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
           step_number: i + 1,
           title: st.title ? st.title.replace(/Step \d+/, `Step ${i + 1}`) : `Step ${i + 1}: ข้อความปิดการขาย`
         }));
+      // 🔑 กฎคีย์เวิร์ดที่ผูกสเต็ปที่ถูกลบไปแล้ว → ตัดออก เพื่อไม่ให้ชี้สเต็ปผิด
+      const validNumbers = new Set(updated.map(st => Number(st.step_number)));
+      const prunedTriggers = (prev.keyword_triggers || []).map(rule => ({
+        ...rule,
+        step_numbers: (rule.step_numbers || []).filter(n => validNumbers.has(Number(n)))
+      }));
       return {
         ...prev,
-        sales_sequence_steps: updated
+        sales_sequence_steps: updated,
+        keyword_triggers: prunedTriggers
       };
     });
   };
@@ -1167,6 +1312,55 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                   <Plus className="w-4 h-4" />
                   <span>+ เพิ่มชุดข้อมูลให้ AI (ชุดที่ {(formData.sales_sequence_steps || []).length + 1})</span>
                 </button>
+              </div>
+
+              {/* 🔑 KEYWORD TRIGGERS — ลูกค้าพิมพ์คีย์เวิร์ด → ส่งเฉพาะสเต็ปที่ผูกไว้ทันที */}
+              <div className="bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-xl p-5 space-y-4 shadow-xs">
+                <div className="flex items-start justify-between gap-3 flex-wrap">
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-amber-500" />
+                       คีย์เวิร์ดส่งสเต็ปอัตโนมัติ (ไม่รอ AI)
+                    </h4>
+                    <p className="text-xs text-slate-500 dark:text-zinc-400 mt-1 leading-relaxed">
+                      ลูกค้าพิมพ์คำที่กำหนดไว้ → ระบบส่ง <strong>เฉพาะสเต็ปที่เลือก</strong> ทันที (ข้อความ+รูปตรงตามที่ตั้ง 100%)
+                      เช่น พิมพ์ "ขอรายละเอียด" → ส่งเฉพาะสเต็ป 2
+                    </p>
+                    <p className="text-[11px] text-slate-500 dark:text-zinc-400 mt-0.5">
+                      ถ้าไม่ตั้งกฎเลย ระบบมีค่าเริ่มต้นให้ใช้ทันที (จับจากชื่อสเต็ปที่มีคำว่า รายละเอียด / โปรโมชั่น / ปิดการขาย)
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleAddKeywordTrigger}
+                    className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md cursor-pointer shrink-0 transition-all"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>+ เพิ่มกฎคีย์เวิร์ด</span>
+                  </button>
+                </div>
+
+                {(formData.keyword_triggers || []).length === 0 && (
+                  <div className="text-[11px] text-slate-500 dark:text-zinc-400 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg p-3">
+                    ยังไม่มีกฎคีย์เวิร์ด — ระบบใช้ค่าเริ่มต้นในตัวอยู่ (รายละเอียดสินค้า / โปรโมชั่น / ปิดการขาย)
+                  </div>
+                )}
+
+                {(formData.keyword_triggers || []).length > 0 && (
+                  <div className="space-y-3">
+                    {(formData.keyword_triggers || []).map((rule, index) => (
+                      <KeywordTriggerCard
+                        key={rule.id || index}
+                        rule={rule}
+                        index={index}
+                        steps={formData.sales_sequence_steps || []}
+                        onUpdate={handleUpdateKeywordTrigger}
+                        onToggleStep={handleToggleKeywordStep}
+                        onRemove={handleRemoveKeywordTrigger}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}

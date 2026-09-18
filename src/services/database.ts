@@ -129,6 +129,7 @@ async function initTables() {
       product TEXT DEFAULT '{}',
       sequence TEXT DEFAULT '{}',
       sales_sequence_steps TEXT DEFAULT '[]',
+      keyword_triggers TEXT DEFAULT '[]',
       is_connected INTEGER DEFAULT 0,
       connected_at TEXT,
       last_active_at TEXT,
@@ -483,6 +484,7 @@ export interface DbPage {
   product: string;
   sequence: string;
   sales_sequence_steps: string;
+  keyword_triggers: string;
   is_connected: number;
   connected_at: string | null;
   last_active_at: string | null;
@@ -490,7 +492,7 @@ export interface DbPage {
   updated_at: string;
 }
 
-const PAGE_JSON_FIELDS = ['toxic_keywords', 'purchase_keywords', 'comment_reply_images', 'followup_messages', 'quick_replies', 'product', 'sequence', 'sales_sequence_steps', 'cod_summary_fields'];
+const PAGE_JSON_FIELDS = ['toxic_keywords', 'purchase_keywords', 'comment_reply_images', 'followup_messages', 'quick_replies', 'product', 'sequence', 'sales_sequence_steps', 'keyword_triggers', 'cod_summary_fields'];
 const PAGE_BOOL_FIELDS = ['is_active', 'auto_reply', 'auto_close_ai', 'ai_brevity_mode', 'scrape_comments_enabled', 'auto_inbox_with_comment_context', 'hide_toxic_comments', 'comment_auto_tag_customer', 'followup_enabled', 'bot_stopped', 'sales_sequence_auto_trigger', 'is_connected'];
 
 export async function getAllPages(): Promise<DbPage[]> {
@@ -1194,6 +1196,7 @@ export function dbPageToPageConfig(row: DbPage): any {
     product: parseJson(row.product, {}),
     sequence: parseJson(row.sequence, {}),
     sales_sequence_steps: parseJson(row.sales_sequence_steps, []),
+    keyword_triggers: parseJson(row.keyword_triggers, []),
     is_connected: Boolean(row.is_connected),
     connected_at: row.connected_at,
     last_active_at: row.last_active_at

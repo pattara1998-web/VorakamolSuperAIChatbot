@@ -70,9 +70,12 @@ const tsCode = [
     return src.slice(start, end).replace(/\r?\n\s*$/, '\n');
   })(),
   // Single Closer Rule state (pendingCloserState + setClosingSent/hasClosingBeenSent/...)
+  // ⚠️ จบที่ "⚡ Tier 0: จำว่าส่ง" เท่านั้น — ห้ามใช้ '// M5: Image Dedup' เป็น marker จบ
+  // เพราะระหว่างกลางมีบล็อก 🔑 KEYWORD TRIGGERS + buildConfiguredSequenceReply อยู่
+  // (เคยทำให้ DEFAULT_KEYWORD_TRIGGERS ถูกดึงมาซ้ำ 2 รอบ → esbuild error "already been declared")
   (() => {
     const start = src.indexOf('// (1c-add) Single Closer Rule');
-    const end = src.indexOf('// M5: Image Dedup', start);
+    const end = src.indexOf('// ⚡ Tier 0: จำว่าส่ง', start);
     if (start < 0 || end < 0) throw new Error('ไม่พบ Single Closer Rule block');
     return src.slice(start, end).replace(/\r?\n\s*$/, '\n');
   })(),
@@ -86,16 +89,30 @@ const tsCode = [
   'let instantAckRotation = 0;',
   extract('buildInstantAck'),
   extract('buildInstantSalesReply'),
-  extract('buildConfiguredSequenceReply'),
+  // ⚡ buildConfiguredSequenceReply + 🔑 KEYWORD TRIGGERS block
+  // ⚠️ ห้ามใช้ extract('buildConfiguredSequenceReply') เพราะ signature มี `opts?: { closingImages?: boolean }`
+  // → ตัวนับ brace เจอ `{` ของ type ก่อน แล้วปิดที่ `}` ของ type = ฟังก์ชันขาดกลาง
+  // → DEFAULT_KEYWORD_TRIGGERS ที่ตามมาหลุดเป็น "Expected ) but found const" (esbuild error)
+  // ใช้ marker slice เดียวจนถึง '// M5: Image Dedup' (รวม KeywordTriggerRule + consts + matchKeywordTrigger)
+  (() => {
+    const start = src.indexOf('function buildConfiguredSequenceReply');
+    const end = src.indexOf('// M5: Image Dedup', start);
+    if (start < 0 || end < 0) throw new Error('ไม่พบ buildConfiguredSequenceReply / M5 marker');
+    return src.slice(start, end).replace(/\r?\n\s*$/, '\n');
+  })(),
   extract('buildLocalClosingAsk'),
   extract('buildLocalOrderInfoRequest')
 ].join('\n');
 
 const jsCode = transformSync(tsCode, { loader: 'ts', format: 'cjs', target: 'node18' }).code;
+if (process.env.DEBUG_TSCODE) {
+  const hits = [...tsCode.matchAll(/const DEFAULT_KEYWORD_TRIGGERS/g)].map(m => tsCode.slice(0, m.index).split('\n').length);
+  console.log('[DEBUG] DEFAULT_KEYWORD_TRIGGERS at tsCode lines:', hits, '| total chars', tsCode.length);
+}
 const {
-  buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyIntentInstant, buildConfiguredSequenceReply
+  buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger
 } = new Function(
-  `${jsCode}\nreturn { buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyInstantIntent: classifyIntentInstant, classifyIntentInstant, buildConfiguredSequenceReply };`
+  `${jsCode}\nreturn { buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyInstantIntent: classifyIntentInstant, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger };`
 )();
 
 let pass = 0, fail = 0;
@@ -301,6 +318,52 @@ check('บอกปัญหาที่อยู่ไม่ครบ', fixText
 check('ทุกข้อความ ≤120 ตัวอักษร', fix.every(m => m.text.length <= 120));
 const fixEmpty = buildLocalOrderInfoRequest([]);
 check('problems ว่าง → ยังขอข้อมูลครบชุดได้ ไม่พัง', fixEmpty.length >= 1 && fixEmpty.map(m => m.text).join('').includes('ชื่อ-นามสกุล'));
+
+console.log('── 🔑 matchKeywordTrigger (คีย์เวิร์ด → ส่งเฉพาะสเต็ปที่ผูกไว้) ──');
+const kwPage = {
+  page_name: 'เพจคีย์เวิร์ด',
+  product: { product_name: 'ที่หั่นผัก', price_1: 99 },
+  sales_sequence_steps: [
+    { step_number: 1, title: 'เปิดการขาย', text_content: 'สวัสดีค่ะ ที่หั่นผัก พกพาสะดวกค่ะ', image_url: 'https://img.example/k1.jpg' },
+    { step_number: 2, title: 'รายละเอียดสินค้า', text_content: 'โครงสร้าง ABS แข็งแรง ใบมีดสแตนเลสคมค่ะ', image_url: 'https://img.example/k2.jpg' },
+    { step_number: 3, title: 'โปรโมชั่น', text_content: 'โปร 3 แถม 3 ฿290 ส่งฟรีค่ะ', image_url: 'https://img.example/k3.jpg' },
+    { step_number: 5, title: 'รีวิวลูกค้า', text_content: 'ลูกค้าจริงรีวิวเยอะค่ะ', image_url: 'https://img.example/k5.jpg' }
+  ]
+};
+
+const kwDetail = matchKeywordTrigger(kwPage, 'ขอรายละเอียดหน่อยค่ะ');
+check('"ขอรายละเอียด" → จับกฎรายละเอียดสินค้า (สเต็ป 2)', kwDetail && kwDetail.stepNumbers.includes(2));
+const kwSpec = matchKeywordTrigger(kwPage, 'ขอดูสเปคได้ไหมคะ');
+check('คำพ้อง "สเปค" → จับกฎรายละเอียดด้วย', kwSpec && kwSpec.stepNumbers.includes(2));
+const kwPromo = matchKeywordTrigger(kwPage, 'โปรโมชั่นตอนนี้มีอะไรบ้าง');
+check('"โปรโมชั่น" → จับกฎโปรโมชั่น (สเต็ป 3)', kwPromo && kwPromo.stepNumbers.includes(3));
+const kwPromoShort = matchKeywordTrigger(kwPage, 'มีโปรอะไรบ้าง');
+check('คำสั้น "โปร" → จับกฎโปรโมชั่นด้วย', kwPromoShort && kwPromoShort.stepNumbers.includes(3));
+const kwReview = matchKeywordTrigger(kwPage, 'ขอดูรีวิวหน่อยค่ะ');
+check('"รีวิว" → จับกฎรีวิว/ผลลัพธ์ (สเต็ป 5)', kwReview && kwReview.stepNumbers.includes(5));
+check('ไม่มีคีย์เวิร์ด → null (ปล่อยให้ AI ตอบ)', matchKeywordTrigger(kwPage, 'สวัสดีตอนเช้าค่ะ') === null);
+check('เพจไม่มีสเต็ป → null (ไม่ทำให้ลูกค้าเงียบ)', matchKeywordTrigger({ sales_sequence_steps: [] }, 'ขอรายละเอียด') === null);
+
+const kwReply = buildConfiguredSequenceReply(kwPage, 'PURCHASE', kwDetail.stepNumbers, { closingImages: false });
+check('ส่งเฉพาะสเต็ปที่ผูก (2) — รูปสเต็ป 2 มาแน่นอน', kwReply.some(m => m.images?.[0] === 'https://img.example/k2.jpg'));
+check('ไม่ยิงรูปสเต็ปอื่นปนมา (1/3/5)', !kwReply.some(m => ['https://img.example/k1.jpg', 'https://img.example/k3.jpg', 'https://img.example/k5.jpg'].includes(m.images?.[0])));
+check('ยังมีคำถามปิดการขายท้ายชุด (แต่เป็นข้อความล้วน ไม่มีรูปปน)', /ชื่อ|เบอร์|ที่อยู่/.test(kwReply.map(m => m.text).join(' ')) && !kwReply.some(m => m.images?.includes('https://img.example/k5.jpg')));
+// ไม่ส่ง opts → พฤติกรรมเดิม (สเต็ปครบชุดยังแนบรูป closing ปกติ) — กันรีเกรสชันของ Fast Sequence
+const kwNoOpts = buildConfiguredSequenceReply(kwPage, 'PURCHASE', kwDetail.stepNumbers);
+check('ไม่ส่ง opts → ปิดการขายแนบรูป closing ตามเดิม', kwNoOpts.some(m => m.images?.includes('https://img.example/k5.jpg')));
+
+const kwCustomPage = {
+  ...kwPage,
+  keyword_triggers: [
+    { id: 'r1', label: 'ขอรูปเพิ่ม', keywords: ['ขอดูรูป', 'รูปเพิ่ม'], step_numbers: [1, 5] }
+  ]
+};
+const kwCustom = matchKeywordTrigger(kwCustomPage, 'ขอดูรูปเพิ่มเติมค่ะ');
+check('กฎที่เจ้าของตั้งเอง → ใช้ step_numbers ที่ตั้งไว้ (1,5)', kwCustom && kwCustom.stepNumbers.join(',') === '1,5');
+const kwCustomMiss = matchKeywordTrigger(kwCustomPage, 'มีโปรอะไรบ้าง');
+check('กฎเจ้าของไม่แมตช์ → ตกไปใช้ค่าเริ่มต้นได้ปกติ', kwCustomMiss && kwCustomMiss.stepNumbers.includes(3));
+const kwBlankRule = matchKeywordTrigger({ ...kwPage, keyword_triggers: [{ id: 'x', label: 'ว่าง', keywords: ['ทดสอบ'], step_numbers: [] }] }, 'ทดสอบค่ะ');
+check('กฎตั้งไว้แต่ไม่เลือกสเต็ป → ข้ามไปใช้ค่าเริ่มต้น (ไม่ค้าง)', kwBlankRule === null);
 
 console.log(`\nสรุป: ผ่าน ${pass} / ไม่ผ่าน ${fail}`);
 process.exit(fail > 0 ? 1 : 0);

@@ -1386,9 +1386,21 @@ function getSequenceSentKey(pageId: string, senderId: string): string {
 // ⚡ Tier 0: สร้างชุดข้อความ+รูปจากสเต็ปที่เจ้าของร้านตั้งไว้ "ตรงตัว 100%"
 // ไม่เรียง/แก้ถ้อยคำของเจ้าของ (ผ่านแค่ BANNED_PRODUCT_GUARD) — รูปยึดกับสเต็ปของมัน 1:1
 // เดิมข้อความสเต็ปถูกส่งผ่าน AI (AI เรียบเรียงใหม่เสมอ) → ข้อความที่ตั้งไว้ไม่เคยถึงลูกค้าตรง ๆ
-function buildConfiguredSequenceReply(page: any, intentHint: IntentHint): InstantOutgoing {
+// stepNumbers: ถ้าระบุ → ส่งเฉพาะสเต็ปเหล่านั้น (ใช้กับ 🔑 Keyword Trigger)
+// opts.closingImages: false = คำถามปิดการขายที่เติมท้ายเป็น "ข้อความล้วน" (ไม่แนบรูปช่องอื่นปน)
+//   ใช้กับคีย์เวิร์ด เพราะลูกค้าขอเฉพาะเรื่อง (เช่น รายละเอียด) → ห้ามยิงรูปสเต็ปอื่นปนไปด้วย
+function buildConfiguredSequenceReply(
+  page: any,
+  intentHint: IntentHint,
+  stepNumbers?: number[],
+  opts?: { closingImages?: boolean }
+): InstantOutgoing {
+  const wanted = Array.isArray(stepNumbers) && stepNumbers.length > 0
+    ? new Set(stepNumbers.map(n => Number(n)).filter(n => Number.isFinite(n)))
+    : null;
   const steps = ((page?.sales_sequence_steps || []) as any[])
     .filter(s => s && (String(s?.text_content || '').trim() || String(s?.image_url || '').trim()))
+    .filter(s => !wanted || wanted.has(Number(s?.step_number)))
     .sort((a, b) => (Number(a?.step_number) || 0) - (Number(b?.step_number) || 0));
   const out: InstantOutgoing = [];
   for (const s of steps) {
@@ -1409,9 +1421,120 @@ function buildConfiguredSequenceReply(page: any, intentHint: IntentHint): Instan
   // เจ้าของไม่ได้ตั้งสเต็ปปิดการขาย → เติมคำถามปิดการขายจาก local engine ท้ายชุด
   // (GREETING แรกไม่ยัดปิดการขาย — ให้เป็นธรรมชาติเหมือนแอดมินตอบรับ)
   const hasClosingStep = out.some(m => /ชื่อ|เบอร์|ที่อยู่|สั่งซื้อ|แจ้ง/.test(m.text || ''));
-  if (!hasClosingStep && intentHint !== 'GREETING') out.push(...buildLocalClosingAsk(page, null));
+  if (!hasClosingStep && intentHint !== 'GREETING') {
+    const closing = buildLocalClosingAsk(page, null);
+    out.push(...(opts?.closingImages === false ? closing.map(m => ({ text: m.text })) : closing));
+  }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// 🔑 KEYWORD TRIGGERS (Tier 0.5) — ลูกค้าพิมพ์คีย์เวิร์ด → ส่ง "เฉพาะสเต็ปที่ผูกไว้" ทันที
+//   • กฎที่เจ้าของตั้งในหน้าตั้งค่า (page.keyword_triggers) มี priority สูงสุด
+//   • ถ้าไม่ได้ตั้งกฎเลย → ใช้ค่าเริ่มต้นในตัว โดยจับสเต็ปจาก title ที่เจ้าของตั้งไว้
+//     (เช่น สเต็ปชื่อ "รายละเอียดสินค้า" → 'ขอรายละเอียด/รายละเอียด/สเปค' ยิงสเต็ปนั้น)
+//   • จับคีย์เวิร์ดได้แต่หาสเต็ปไม่เจอ → คืน null ให้ caller ส่งทั้งชุดตามปกติ (ไม่ทำให้ลูกค้าเงียบ)
+//   • กันสแปม: TTL 30 นาที ต่อ (กฎ + เพจ + ลูกค้า) — ถามซ้ำหลังพ้น TTL ได้ตามปกติ
+// ---------------------------------------------------------------------------
+interface KeywordTriggerRule {
+  ruleKey: string;
+  label: string;
+  stepNumbers: number[];
+}
+
+const DEFAULT_KEYWORD_TRIGGERS: Array<{ key: string; label: string; keywords: string[]; titleMatch: RegExp; fallbackNumbers: number[] }> = [
+  {
+    key: 'detail',
+    label: 'รายละเอียดสินค้า',
+    keywords: ['ขอรายละเอียด', 'รายละเอียด', 'สเปค', 'สเปก', 'คุณสมบัติ', 'ข้อมูลสินค้า', 'วิธีใช้', 'วิธีใช้งาน'],
+    titleMatch: /รายละเอียด|สเปค|สเปก|คุณสมบัติ|ข้อมูลสินค้า|วิธีใช้/,
+    fallbackNumbers: [2]
+  },
+  {
+    key: 'promotion',
+    label: 'โปรโมชั่น',
+    keywords: ['โปรโมชั่น', 'โปรโมชัน', 'โปร ', 'ส่งฟรี', 'แถม', 'ส่วนลด', 'ราคาพิเศษ', 'โปรตอนนี้'],
+    titleMatch: /โปร|ส่งฟรี|แถม|ส่วนลด|ราคา/,
+    fallbackNumbers: [3, 4]
+  },
+  {
+    key: 'review',
+    label: 'รีวิว/ผลลัพธ์',
+    keywords: ['รีวิว', 'ผลลัพธ์', 'ลูกค้าจริง', 'ความคิดเห็น'],
+    titleMatch: /รีวิว|ผลลัพธ์/,
+    fallbackNumbers: [5]
+  },
+  {
+    key: 'closing',
+    label: 'ปิดการขาย/สั่งซื้อ',
+    keywords: ['ปิดการขาย', 'สั่งยังไง', 'วิธีสั่ง', 'โอนเงิน', 'เก็บเงินปลายทาง'],
+    titleMatch: /ปิดการขาย|สั่งซื้อ|โอนเงิน/,
+    fallbackNumbers: [6]
+  }
+];
+
+function matchKeywordTrigger(page: any, messageText: string): KeywordTriggerRule | null {
+  const text = normalizeThaiText(messageText);
+  if (!text) return null;
+  const steps = ((page?.sales_sequence_steps || []) as any[])
+    .filter(s => s && (String(s?.text_content || '').trim() || String(s?.image_url || '').trim()));
+  if (steps.length === 0) return null;
+
+  // (1) กฎที่เจ้าของตั้งใน UI — priority สูงสุด
+  const configured = Array.isArray(page?.keyword_triggers) ? page.keyword_triggers : [];
+  for (const rule of configured) {
+    const kws = (Array.isArray(rule?.keywords) ? rule.keywords : [])
+      .map((k: any) => normalizeThaiText(String(k || '').trim()))
+      .filter(Boolean);
+    if (kws.length === 0) continue;
+    if (!kws.some((k: string) => text.includes(k))) continue;
+    const nums = (Array.isArray(rule?.step_numbers) ? rule.step_numbers : [])
+      .map((n: any) => Number(n))
+      .filter((n: number) => Number.isFinite(n));
+    if (nums.length === 0) continue;
+    return {
+      ruleKey: `cfg:${String(rule?.id || rule?.label || nums.join('-'))}`,
+      label: String(rule?.label || 'คีย์เวิร์ด'),
+      stepNumbers: nums
+    };
+  }
+
+  // (2) ค่าเริ่มต้นในตัว — ใช้ได้ทันทีโดยไม่ต้องตั้งค่า
+  //     ขั้นที่ 1: จับสเต็ปจาก title ที่เจ้าของตั้งไว้ (แม่นสุด)
+  //     ขั้นที่ 2: ถ้าไม่ได้ตั้งชื่อสเต็ป → ใช้ convention เดิมของระบบ
+  //               (2=รายละเอียด, 3-4=โปรโมชั่น, 5=รีวิว, 6=ปิดการขาย)
+  for (const def of DEFAULT_KEYWORD_TRIGGERS) {
+    if (!def.keywords.some(k => text.includes(normalizeThaiText(k)))) continue;
+    let nums = steps
+      .filter(s => def.titleMatch.test(String(s?.title || '')))
+      .map(s => Number(s?.step_number))
+      .filter((n: number) => Number.isFinite(n));
+    if (nums.length === 0) {
+      nums = steps
+        .filter(s => def.fallbackNumbers.includes(Number(s?.step_number)))
+        .map(s => Number(s?.step_number))
+        .filter((n: number) => Number.isFinite(n));
+    }
+    if (nums.length === 0) continue; // คีย์เวิร์ดตรงแต่ไม่มีสเต็ปที่ผูก → ลองกฎถัดไป
+    return { ruleKey: `def:${def.key}`, label: def.label, stepNumbers: nums };
+  }
+  return null;
+}
+
+// สรุป error ที่ Meta ตอบกลับให้อ่านออกเป็นข้อความสั้น ๆ (ใช้ใน log วินิจฉัย)
+function describeSendError(res: any): string {
+  const e = res?.error;
+  if (typeof e === 'string') return e;
+  if (e?.message) return `${e.code || ''} ${e.message}`.trim();
+  return String(res?.blocked || (e ? JSON.stringify(e) : 'SEND_FAILED'));
+}
+
+// TTL กันสแปมของ Keyword Trigger — 30 นาที ต่อ (กฎ + เพจ + ลูกค้า)
+const keywordTriggerSentAt = new Map<string, number>();
+const KEYWORD_TRIGGER_TTL_MS = 30 * 60 * 1000;
+
+// ⚡ deliverSequenceMessages: ย้ายไปประกาศใน webhook scope (ใกล้จุดใช้งาน) เพราะต้องเรียก
+// sendFacebookMessage/sendFacebookImageSmart ที่ถูกประกาศภายใน startServer ไม่ใช่ module scope
 
 // M5: Image Dedup — ติดตามรูปที่ส่งไปแล้วในรอบนี้ (10 นาทีล่าสุด)
 // ป้องกันการส่งรูปซ้ำเมื่อลูกค้าพิมพ์ 2 บรรทัดติดกัน = webhook ทำงาน 2 รอบ
@@ -4616,6 +4739,64 @@ async function startServer() {
     }
   }
 
+// ⚡ deliverSequenceMessages — ส่งชุดสเต็ป (ข้อความ+รูป) ตามที่เจ้าของตั้งไว้
+  // อยู่ใน startServer scope จึงเรียก sendFacebookMessage/sendFacebookImageSmart ได้
+  // รูปส่งไม่สำเร็จ = log ERROR พร้อมเหตุผลจาก Meta (ไม่กลืนเงียบ) แล้วส่งข้อความต่อไป
+  async function deliverSequenceMessages(
+    page: any,
+    pageId: string,
+    senderId: string,
+    seqOut: InstantOutgoing
+  ): Promise<{ delivered: number; firstError: string }> {
+    let delivered = 0;
+    let firstError = '';
+    for (let si = 0; si < seqOut.length; si++) {
+      const seqMsg: any = seqOut[si];
+      const seqImages: string[] = Array.isArray(seqMsg.images) ? seqMsg.images.filter(Boolean) : [];
+      const sendText = async (): Promise<boolean> => {
+        if (!seqMsg.text) return false;
+        const res: any = await sendFacebookMessage(page.page_access_token || '', senderId, seqMsg.text);
+        // simulated = เพจทดสอบไม่มี token จริง (Live Simulator) → นับเป็นสำเร็จเพื่อให้เห็นผลในเครื่องมือจำลอง
+        if (res && res.success === false && !res.simulated) {
+          if (!firstError) firstError = describeSendError(res);
+          return false;
+        }
+        return true;
+      };
+      const sendImg = async (imgUrl: string): Promise<void> => {
+        try {
+          const r: any = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
+          if (r && r.success === false && !r.skipped) {
+            // 🔧 ไม่กลืน error เงียบ ๆ — log เหตุผลจาก Meta เพื่อวินิจฉัย "ตอบรูปไม่ได้"
+            if (!firstError) firstError = String(r.error || 'IMAGE_SEND_FAILED');
+            addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปสเต็ปไม่สำเร็จ (${String(r.error || 'SEND_FAILED').slice(0, 200)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
+          }
+        } catch (imgErr: any) {
+          if (!firstError) firstError = String(imgErr?.message || imgErr);
+          addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปสเต็ป error (${String(imgErr?.message || imgErr).slice(0, 200)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
+        }
+      };
+      let deliveredThis = false;
+      if (seqMsg.send_order === 'IMAGE_FIRST' && seqImages.length > 0) {
+        for (const img of seqImages) await sendImg(img);
+        deliveredThis = await sendText();
+      } else {
+        deliveredThis = await sendText();
+        for (const img of seqImages) await sendImg(img);
+      }
+      if (deliveredThis) delivered++;
+      if (seqMsg.text) {
+        recordSimulatedSend(pageId, senderId, seqMsg.text, seqImages);
+        try { dbService.addChatMessage(pageId, senderId, 'admin', seqMsg.text); } catch { /* non-critical */ }
+        pushHistory(pageId, senderId, 'admin', seqMsg.text);
+      } else if (seqImages.length > 0) {
+        recordSimulatedSend(pageId, senderId, '', seqImages);
+      }
+      // (Speed) 150ms ระหว่างสเต็ป — ทั้งชุด 5-8 ข้อความ+รูป จบใน ~1-2 วิ
+      if (si < seqOut.length - 1) await sleep(150);
+    }
+    return { delivered, firstError };
+  }
   // Send Facebook Messenger message with Quick Reply buttons.
   // Limits enforced by the Send API: max 13 buttons per message, 20-char
   // titles, 1000-char payloads. Empty/broken entries are filtered out so a
@@ -6396,81 +6577,58 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
 
         const SALES_SEQ_INTENTS: string[] = ['GREETING', 'PURCHASE', 'PRICE', 'PROMOTION', 'NEGOTIATION', 'SHIPPING', 'TRUST'];
         const seqStateKey = getSequenceSentKey(pageId, senderId);
-        const lastSeqSentAt = configuredSequenceSentAt.get(seqStateKey) || 0;
-        const seqStepsConfigured = ((page.sales_sequence_steps || []) as any[]).filter(s => s && (String(s?.text_content || '').trim() || String(s?.image_url || '').trim()));
-        if (!consultantMode && SALES_SEQ_INTENTS.includes(intentHint) && seqStepsConfigured.length > 0 && Date.now() - lastSeqSentAt > CONFIGURED_SEQUENCE_TTL_MS) {
-          try {
-            const seqOut = buildConfiguredSequenceReply(page, intentHint);
-            if (seqOut.length > 0) {
-              const seqJoined = seqOut.map(m => m.text).filter(Boolean).join('\n•\n');
-              let seqDelivered = 0;
-              let seqFirstError = '';
-              for (let si = 0; si < seqOut.length; si++) {
-                const seqMsg: any = seqOut[si];
-                const seqImages: string[] = Array.isArray(seqMsg.images) ? seqMsg.images : [];
-                const sendText = async (): Promise<boolean> => {
-                  if (!seqMsg.text) return false;
-                  const res: any = await sendFacebookMessage(page.page_access_token || '', senderId, seqMsg.text);
-                  // simulated = เพจทดสอบไม่มี token จริง (Live Simulator) → นับเป็นส่งสำเร็จเพื่อให้เห็นผลในเครื่องมือจำลอง
-                  if (res && res.success === false && !res.simulated) {
-                    if (!seqFirstError) {
-                      const e = res.error;
-                      seqFirstError = typeof e === 'string'
-                        ? e
-                        : (e?.message ? `${e.code || ''} ${e.message}`.trim() : String(res.blocked || JSON.stringify(e) || 'SEND_FAILED'));
-                    }
-                    return false;
-                  }
-                  return true;
-                };
-                let deliveredThis = false;
-                const sendSeqImage = async (imgUrl: string): Promise<void> => {
-                  try {
-                    const r: any = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
-                    if (r && r.success === false && !r.skipped) {
-                      // 🔧 ไม่กลืน error เงียบ ๆ — log เหตุผลจาก Meta เพื่อวินิจฉัย "ตอบรูปไม่ได้"
-                      addLog('AI_REPLY', senderId, pageId, `❌ Fast Sequence: รูปสเต็ปส่งไม่สำเร็จ (${String(r.error || 'SEND_FAILED').slice(0, 200)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
-                    }
-                  } catch (imgErr: any) {
-                    addLog('AI_REPLY', senderId, pageId, `❌ Fast Sequence: รูปสเต็ป error (${String(imgErr?.message || imgErr).slice(0, 200)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
-                  }
-                };
-                if (seqMsg.send_order === 'IMAGE_FIRST' && seqImages.length > 0) {
-                  for (const seqImg of seqImages) { await sendSeqImage(seqImg); }
-                  deliveredThis = await sendText();
-                } else {
-                  deliveredThis = await sendText();
-                  for (const seqImg of seqImages) { await sendSeqImage(seqImg); }
-                }
-                if (deliveredThis) seqDelivered++;
-                if (seqMsg.text) {
-                  recordSimulatedSend(pageId, senderId, seqMsg.text, seqImages);
-                  try { dbService.addChatMessage(pageId, senderId, 'admin', seqMsg.text); } catch { /* non-critical */ }
-                  pushHistory(pageId, senderId, 'admin', seqMsg.text);
-                } else if (seqImages.length > 0) {
-                  recordSimulatedSend(pageId, senderId, '', seqImages);
-                }
-                // (Speed) 150ms ระหว่างสเต็ป — ทั้งชุด 5-8 ข้อความ+รูป จบใน ~1-2 วิ
-                if (si < seqOut.length - 1) await sleep(150);
-              }
-              // 🔧 กันลูกค้าโดนเงียบ: ถ้า Meta ปฏิเสธการส่งทั้งหมด (token หมดอายุ/เลยหน้าต่าง 24 ชม./ถูกบล็อก)
-              // → ห้าม return ทิ้ง ให้บันทึก error ของ Meta แล้วสลับกลับไป flow AI ตามปกติ
-              if (seqDelivered === 0) {
-                addLog('AI_REPLY', senderId, pageId, `⛔ Fast Sequence: Meta ปฏิเสธการส่งทุกข้อความ (${seqFirstError || 'SEND_FAILED'}) → สลับไป flow AI/สำรอง — เช็ค Page Access Token หรือหน้าต่าง 24 ชม.`, 'ERROR');
-              } else {
-                configuredSequenceSentAt.set(seqStateKey, Date.now());
-                addRecentReply(pageId, senderId, seqJoined);
-                addLog('AI_REPLY', senderId, pageId, `⚡ Fast Sequence: ส่งสเต็ปตามที่เจ้าของตั้งไว้ครบ ${seqOut.length} ชุด (ข้อความ+รูปตรงตามตั้งค่า 100% ไม่รอ AI)`, 'SUCCESS');
-                void sendTypingIndicator(page.page_access_token || '', senderId, false);
-                persistData();
-                return;
-              }
-            }
-          } catch (seqErr: any) {
-            addLog('AI_REPLY', senderId, pageId, `⚠️ Fast Sequence ส่งไม่สำเร็จ → กลับไป flow AI ตามปกติ: ${seqErr?.message || seqErr}`, 'WARNING');
+        const seqStepsConfigured = ((page.sales_sequence_steps || []) as any[])
+          .filter(s => s && (String(s?.text_content || '').trim() || String(s?.image_url || '').trim()));
+
+        let seqOut: InstantOutgoing = [];
+        let seqLogTag = 'Fast Sequence';
+        let seqTtlKey = seqStateKey;
+
+        // (2) 🔑 Keyword Trigger — คีย์เวิร์ดที่เจ้าของตั้ง (หรือค่าเริ่มต้น) → ส่งเฉพาะสเต็ปที่ผูกไว้ทันที
+        const kwRule = (!consultantMode && seqStepsConfigured.length > 0)
+          ? matchKeywordTrigger(page, messageText)
+          : null;
+        if (kwRule) {
+          const kwKey = `${pageId}:${senderId}:${kwRule.ruleKey}`;
+          if (Date.now() - (keywordTriggerSentAt.get(kwKey) || 0) > KEYWORD_TRIGGER_TTL_MS) {
+            // closingImages: false → ลูกค้าขอเฉพาะเรื่อง ห้ามยิงรูปสเต็ปอื่นปน (ปิดการขายเป็นข้อความล้วน)
+            seqOut = buildConfiguredSequenceReply(page, intentHint, kwRule.stepNumbers, { closingImages: false });
+            seqLogTag = `Keyword Trigger "${kwRule.label}" (สเต็ป ${kwRule.stepNumbers.join(',')})`;
+            seqTtlKey = kwKey;
           }
         }
 
+        // (3) เจตนาขาย → สเต็ปครบชุด (ใช้เมื่อคีย์เวิร์ดไม่แมตช์ หรือกฎนั้นเพิ่งส่งไปไม่นาน)
+        if (seqOut.length === 0 && !consultantMode && seqStepsConfigured.length > 0
+          && SALES_SEQ_INTENTS.includes(intentHint)
+          && Date.now() - (configuredSequenceSentAt.get(seqStateKey) || 0) > CONFIGURED_SEQUENCE_TTL_MS) {
+          seqOut = buildConfiguredSequenceReply(page, intentHint);
+          seqLogTag = 'Fast Sequence';
+          seqTtlKey = seqStateKey;
+        }
+
+        if (seqOut.length > 0) {
+          try {
+            const seqJoined = seqOut.map(m => m.text).filter(Boolean).join('\n•\n');
+            const seqSend = await deliverSequenceMessages(page, pageId, senderId, seqOut);
+            const seqDelivered = seqSend.delivered;
+            // 🔧 กันลูกค้าโดนเงียบ: ถ้า Meta ปฏิเสธการส่งทั้งหมด (token หมดอายุ/เลยหน้าต่าง 24 ชม./ถูกบล็อก)
+            // → ห้าม return ทิ้ง ให้บันทึก error ของ Meta แล้วสลับกลับไป flow AI ตามปกติ
+            if (seqDelivered === 0) {
+              addLog('AI_REPLY', senderId, pageId, `⛔ ${seqLogTag}: Meta ปฏิเสธการส่งทุกข้อความ (${seqSend.firstError || 'SEND_FAILED'}) → สลับไป flow AI/สำรอง — เช็ค Page Access Token หรือหน้าต่าง 24 ชม.`, 'ERROR');
+            } else {
+              if (seqTtlKey === seqStateKey) configuredSequenceSentAt.set(seqTtlKey, Date.now());
+              else keywordTriggerSentAt.set(seqTtlKey, Date.now());
+              addRecentReply(pageId, senderId, seqJoined);
+              addLog('AI_REPLY', senderId, pageId, `⚡ ${seqLogTag}: ส่งสเต็ปตามที่เจ้าของตั้งไว้ครบ ${seqOut.length} ชุด (ข้อความ+รูปตรงตามตั้งค่า 100% ไม่รอ AI)`, 'SUCCESS');
+              void sendTypingIndicator(page.page_access_token || '', senderId, false);
+              persistData();
+              return;
+            }
+          } catch (seqErr: any) {
+            addLog('AI_REPLY', senderId, pageId, `⚠️ ${seqLogTag} ส่งไม่สำเร็จ → กลับไป flow AI ตามปกติ: ${seqErr?.message || seqErr}`, 'WARNING');
+          }
+        }
         // ── ⚡ INSTANT ACK (Tier 1): ลูกค้าต้องเห็นข้อความแรก <2 วิเสมอ ──────────
         // เดิมข้อความแรกถูกส่งหลัง AI คิดเสร็จ (8-35 วิ) = ต้นเหตุ "ตอบช้าเกือบ 30 วิ"
         // ตอนนี้ทักทายสั้น + รูปหลักจาก DB ทันที แล้วค่อยให้ AI (Tier 2) พรีเซนต่อ

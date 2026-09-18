@@ -40,6 +40,21 @@ export interface SalesSequenceStep {
   send_order?: 'TEXT_FIRST' | 'IMAGE_FIRST';
 }
 
+/**
+ * 🔑 Keyword Trigger — เมื่อลูกค้าพิมพ์คีย์เวิร์ดนี้ ระบบจะส่ง "เฉพาะสเต็ปที่ผูกไว้" ทันที
+ * ตัวอย่าง: keywords ['ขอรายละเอียด','รายละเอียด'] + step_numbers [2,3]
+ * ถ้าไม่ได้ตั้งกฎเลย ระบบมีค่าเริ่มต้นในตัว (จับจาก title ของสเต็ป) ให้ใช้งานได้ทันที
+ */
+export interface KeywordTrigger {
+  id: string;
+  /** ป้ายชื่อกฎ เช่น 'รายละเอียดสินค้า', 'โปรโมชั่น' */
+  label: string;
+  /** คำที่ใช้จับ (เทียบแบบ contains หลัง normalize ข้อความไทย) */
+  keywords: string[];
+  /** เลขสเต็ปที่จะส่งเมื่อจับคีย์เวิร์ดได้ */
+  step_numbers: number[];
+}
+
 export interface ProductDetailedSpecs {
   material?: string; // มวลสาร / วัสดุการผลิต
   dimensions?: string; // ขนาด กว้าง x ยาว x หนา
@@ -267,6 +282,9 @@ export interface PageConfig {
   // 6-Step Pattern Sequence
   sequence: SalesSequenceConfig;
   sales_sequence_steps?: SalesSequenceStep[];
+
+  /** 🔑 คีย์เวิร์ด → ส่งสเต็ปที่ผูกไว้ทันที (ไม่รอ AI) เช่น 'ขอรายละเอียด' → สเต็ป 2,3 */
+  keyword_triggers?: KeywordTrigger[];
 
   // Comment Scraper, Moderation & Auto-Reply with up to 6 images & customer tag
   scrape_comments_enabled: boolean;

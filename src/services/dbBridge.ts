@@ -251,6 +251,7 @@ export function flattenPage(page: PageConfig): Record<string, any> {
     product: JSON.stringify(page.product || {}),
     sequence: JSON.stringify(page.sequence || {}),
     sales_sequence_steps: JSON.stringify(page.sales_sequence_steps || []),
+    keyword_triggers: JSON.stringify(page.keyword_triggers || []),
     is_connected: (page as any).is_connected ? 1 : 0,
     connected_at: (page as any).connected_at || null,
     last_active_at: (page as any).last_active_at || null
