@@ -4489,7 +4489,44 @@ async function startServer() {
     if (!decoded) return { success: false, error: 'IMAGE_DECODE_FAILED' };
     const hash = crypto.createHash('md5').update(imageUrl).digest('hex');
 
-    // วิธี 1: ส่งผ่าน public URL /api/media/:hash ที่ Messenger ดึงได้เอง
+    // (Fixed) บีบอัดรูปใหญ่ก่อนอัปโหลด — รูปจากกล้องมือถือ 2-8MB ทำให้ทั้ง attachment upload
+    // และ /api/media (Messenger ดึงกลับ) ช้า/พลาด = ต้นเหตุ "ตอบรูปไม่ได้" บน Render
+    let uploadBuffer = decoded.buffer;
+    let uploadMime = decoded.mimeType;
+    if (uploadBuffer.length > 800 * 1024) {
+      const compressed = await compressImageBuffer(uploadBuffer);
+      if (compressed) {
+        uploadBuffer = compressed.buffer;
+        uploadMime = compressed.mimeType;
+        addLog('INFO', 'FACEBOOK_API', recipientId, `🗜️ บีบอัดรูปก่อนส่ง: ${(decoded.buffer.length / 1024).toFixed(0)}KB → ${(uploadBuffer.length / 1024).toFixed(0)}KB`, 'INFO');
+      }
+    }
+
+    // (Fixed) วิธีหลัก: reusable attachment — ยิง server→Meta ตรง ไม่พึ่งให้ Messenger
+    // กลับมาดึง URL จากเราเอง (Render free tier มี cold start ทำให้วิธี URL พลาดบ่อย)
+    const cacheKey = `${pageId || 'pg'}|${hash}`;
+    let attachmentId = reusableAttachmentCache.get(cacheKey);
+    if (!attachmentId) {
+      const uploaded = await uploadReusableAttachment(accessToken, uploadBuffer, 'product-image.jpg', uploadMime);
+      if (uploaded.success && uploaded.attachment_id) {
+        attachmentId = uploaded.attachment_id;
+        reusableAttachmentCache.set(cacheKey, attachmentId);
+      } else {
+        addLog('INFO', 'FACEBOOK_API', recipientId, `⚠️ อัปโหลด attachment ไม่สำเร็จ (${uploaded.error}) — ลองวิธี public URL แทน`, 'WARNING');
+      }
+    }
+    if (attachmentId) {
+      const byAttachment = await sendFacebookAttachmentById(accessToken, recipientId, attachmentId);
+      // 🔧 M5: บันทึก dedup เฉพาะเมื่อ "ส่งสำเร็จจริง" (เดิมบันทึกก่อนส่ง → ส่งพลาดแล้วโดน
+      // dedup ข้าม 10 นาที คืน success ปลอม ไม่มี retry = ต้นเหตุ "ตอบรูปไม่ได้")
+      if (byAttachment.success) {
+        if (pageId) recordSentImage(pageId, recipientId, imageUrl);
+        return byAttachment;
+      }
+      addLog('INFO', 'FACEBOOK_API', recipientId, `⚠️ ส่งด้วย attachment_id ไม่สำเร็จ (${String(JSON.stringify(byAttachment.error) || 'SEND_FAILED').slice(0, 200)}) — ลองวิธี public URL แทน`, 'WARNING');
+    }
+
+    // วิธีสำรอง: public URL /api/media/:hash (Messenger ดึงกลับเอง)
     mediaImageCache.set(hash, imageUrl);
     const base = getPublicBaseUrl();
     if (base) {
@@ -4501,26 +4538,9 @@ async function startServer() {
         if (pageId) recordSentImage(pageId, recipientId, imageUrl);
         return viaUrl;
       }
-      addLog('INFO', 'FACEBOOK_API', recipientId, `⚠️ ส่งรูปผ่าน public URL ยังไม่สำเร็จ (${viaUrl.error}) — ลองวิธีอัปโหลด attachment แทน`, 'WARNING');
     }
-
-    // วิธี 2: reusable attachment (ยิงจาก server ไปหา Messenger — ใช้ได้แม้ localhost)
-    const cacheKey = `${pageId || 'pg'}|${hash}`;
-    let attachmentId = reusableAttachmentCache.get(cacheKey);
-    if (!attachmentId) {
-      const uploaded = await uploadReusableAttachment(accessToken, decoded.buffer, 'product-image.jpg', decoded.mimeType);
-      if (!uploaded.success || !uploaded.attachment_id) {
-        addLog('INFO', 'FACEBOOK_API', recipientId, `❌ ส่งรูปไม่สำเร็จทั้ง 2 วิธี (URL + attachment): ${uploaded.error}`, 'ERROR');
-        return { success: false, error: uploaded.error };
-      }
-      attachmentId = uploaded.attachment_id;
-      reusableAttachmentCache.set(cacheKey, attachmentId);
-    }
-    // M5: บันทึกภาพที่ส่งสำเร็จสำหรับ dedup
-    if (pageId) {
-      recordSentImage(pageId, recipientId, imageUrl);
-    }
-    return sendFacebookAttachmentById(accessToken, recipientId, attachmentId);
+    addLog('INFO', 'FACEBOOK_API', recipientId, `❌ ส่งรูปไม่สำเร็จทั้ง 2 วิธี (attachment + URL) — ขนาดต้นฉบับ ${(decoded.buffer.length / 1024).toFixed(0)}KB hash:${hash.slice(0, 8)}`, 'ERROR');
+    return { success: false, error: attachmentId ? 'ATTACHMENT_SEND_FAILED' : 'ATTACHMENT_UPLOAD_FAILED' };
   }
 
   // Send an already-uploaded reusable attachment (from /me/message_attachments).
@@ -4577,6 +4597,23 @@ async function startServer() {
     }
     const buffer = Buffer.from(input, 'base64');
     return buffer.length ? { buffer, mimeType: 'image/jpeg' } : null;
+  }
+
+  // (Fixed) บีบอัด/ย่อรูปก่อนอัปโหลด — dynamic import กันพังถ้า lib ไม่พร้อม (fallback ใช้ไฟล์เดิม)
+  async function compressImageBuffer(buffer: Buffer): Promise<{ buffer: Buffer; mimeType: string } | null> {
+    try {
+      const mod: any = await import('sharp');
+      const sharp = mod.default || mod;
+      const out = await sharp(buffer)
+        .rotate()
+        .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 82 })
+        .toBuffer();
+      if (out && out.length > 0 && out.length < buffer.length) return { buffer: out, mimeType: 'image/jpeg' };
+      return null;
+    } catch {
+      return null; // sharp ไม่มี/พัง → ใช้ไฟล์เดิม (ไม่ block การส่ง)
+    }
   }
 
   // Send Facebook Messenger message with Quick Reply buttons.
@@ -6387,12 +6424,23 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
                   return true;
                 };
                 let deliveredThis = false;
+                const sendSeqImage = async (imgUrl: string): Promise<void> => {
+                  try {
+                    const r: any = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
+                    if (r && r.success === false && !r.skipped) {
+                      // 🔧 ไม่กลืน error เงียบ ๆ — log เหตุผลจาก Meta เพื่อวินิจฉัย "ตอบรูปไม่ได้"
+                      addLog('AI_REPLY', senderId, pageId, `❌ Fast Sequence: รูปสเต็ปส่งไม่สำเร็จ (${String(r.error || 'SEND_FAILED').slice(0, 200)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
+                    }
+                  } catch (imgErr: any) {
+                    addLog('AI_REPLY', senderId, pageId, `❌ Fast Sequence: รูปสเต็ป error (${String(imgErr?.message || imgErr).slice(0, 200)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
+                  }
+                };
                 if (seqMsg.send_order === 'IMAGE_FIRST' && seqImages.length > 0) {
-                  for (const seqImg of seqImages) { try { await sendFacebookImageSmart(page.page_access_token || '', senderId, seqImg, pageId); } catch { /* รูปไม่ทำให้ชุดล้ม */ } }
+                  for (const seqImg of seqImages) { await sendSeqImage(seqImg); }
                   deliveredThis = await sendText();
                 } else {
                   deliveredThis = await sendText();
-                  for (const seqImg of seqImages) { try { await sendFacebookImageSmart(page.page_access_token || '', senderId, seqImg, pageId); } catch { /* รูปไม่ทำให้ชุดล้ม */ } }
+                  for (const seqImg of seqImages) { await sendSeqImage(seqImg); }
                 }
                 if (deliveredThis) seqDelivered++;
                 if (seqMsg.text) {

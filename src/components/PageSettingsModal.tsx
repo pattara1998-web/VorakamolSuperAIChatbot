@@ -424,11 +424,35 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
 
+    // 🔧 (Fixed) บีบอัดรูปก่อนเก็บ — รูปต้นฉบับจากกล้องมือถือ 2-8MB ทำให้การส่งรูปหาลูกค้า
+    // ผ่าน Messenger API ล้มเหลว (attachment ใหญ่/URL ช้า) = ต้นเหตุ "ตั้งรูปไว้แต่ลูกค้าไม่ได้รูป"
+    // ย่อด้านยาวสุด 1024px + JPEG คุณภาพ 0.82 → ไฟล์ ~200-400KB ส่งได้เร็วและเสถียร
     const reader = new FileReader();
     reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        onComplete(reader.result);
-      }
+      const original = String(reader.result || '');
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const maxSide = 1024;
+          const scale = Math.min(1, maxSide / Math.max(img.width || 1, img.height || 1));
+          const w = Math.max(1, Math.round((img.width || 1) * scale));
+          const h = Math.max(1, Math.round((img.height || 1) * scale));
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) { onComplete(original); return; }
+          ctx.fillStyle = '#ffffff'; // กันพื้นดำเมื่อ PNG โปร่งใสถูกแปลงเป็น JPEG
+          ctx.fillRect(0, 0, w, h);
+          ctx.drawImage(img, 0, 0, w, h);
+          const compressed = canvas.toDataURL('image/jpeg', 0.82);
+          onComplete(compressed && compressed.startsWith('data:image') && compressed.length > 100 ? compressed : original);
+        } catch {
+          onComplete(original);
+        }
+      };
+      img.onerror = () => onComplete(original);
+      img.src = original;
     };
     reader.readAsDataURL(file);
   };
