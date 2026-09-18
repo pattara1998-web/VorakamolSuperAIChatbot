@@ -197,9 +197,9 @@ let deliverLine: ((page: PageConfig, text: string) => Promise<{ success: boolean
 // Mount DATA_FILE to durable storage when hosting on a serverless platform.
 const DATA_FILE = process.env.DATA_FILE || path.join(process.cwd(), 'data', 'superai-v2.8.json');
 const META_GRAPH_API_VERSION = process.env.META_GRAPH_API_VERSION || 'v24.0';
-// Human-like reply pacing: wait ~1.5s before answering so the page does not
-// instant-fire like a bot (Meta anti-spam / BAN prevention). Configurable.
-const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 1500);
+// Zero artificial delay: ตอบทันทีที่ webhook มาถึง (0ms) — ไม่ถ่วงเวลาเอง
+// เดิม default 1500ms ทำให้ลูกค้ารอ 1.5 วิก่อนเริ่มตอบทุกครั้ง
+const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 0);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // Per-page reply delay: 0 = instant (admin explicitly asked for 0ms support).
 // Falls back to the global REPLY_DELAY_MS only when the page never configured
@@ -4594,6 +4594,43 @@ async function startServer() {
   //   2) fallback อัปโหลดเป็น reusable attachment (/me/message_attachments) แล้ว
   //      ส่งด้วย attachment_id — ใช้ได้แม้ localhost ที่ Messenger เข้า URL เราไม่ได้
   const reusableAttachmentCache = new Map<string, string>(); // key: pageId|dataUrl-hash -> attachment_id
+  // 0ms: cache ผลบีบอัดรูป (hash ต้นฉบับ -> buffer ที่บีบแล้ว) — รูปเดิมที่ส่งซ้ำไม่บีบอัดใหม่
+  const compressedImageCache = new Map<string, { buffer: Buffer; mimeType: string }>();
+  // 0ms: pre-warm attachment — ตอนบันทึกเพจ อัปโหลดรูปทุกรูปเป็น attachment_id ล่วงหน้า
+  // (background ไม่บล็อก response) → ตอนส่งจริงยิงแค่ attachment_id ทันที ไม่ต้องอัปโหลดใน request path
+  async function prewarmPageAttachments(page: any): Promise<void> {
+    try {
+      const token = String(page?.page_access_token || '');
+      if (!token || !token.startsWith('enc:') && !token.startsWith('EAA')) {
+        const dec = String(decryptToken(token) || '');
+        if (!dec.startsWith('EAA')) return;
+      }
+      const urls = new Set<string>();
+      const collect = (v: unknown): void => {
+        if (typeof v === 'string' && (v.startsWith('data:image/') || /^https?:\/\//i.test(v))) urls.add(v);
+        else if (Array.isArray(v)) v.forEach(collect);
+        else if (v && typeof v === 'object') Object.values(v as Record<string, unknown>).forEach(collect);
+      };
+      collect((page as any)?.sales_sequence_steps);
+      collect((page as any)?.comment_reply_images);
+      collect((page as any)?.product?.images);
+      for (const url of urls) {
+        if (/^https?:\/\//i.test(url.trim())) continue; // public URL ไม่ต้อง pre-warm
+        const hash = crypto.createHash('md5').update(url).digest('hex');
+        const cacheKey = `${page?.page_id || 'pg'}|${hash}`;
+        if (reusableAttachmentCache.has(cacheKey)) continue;
+        const decoded = decodeDataUrl(url);
+        if (!decoded) continue;
+        let buf = decoded.buffer; let mime = decoded.mimeType;
+        if (buf.length > 800 * 1024) {
+          const c = await compressImageBuffer(buf);
+          if (c) { buf = c.buffer; mime = c.mimeType; }
+        }
+        const uploaded = await uploadReusableAttachment(token, buf, 'product-image.jpg', mime);
+        if (uploaded.success && uploaded.attachment_id) reusableAttachmentCache.set(cacheKey, uploaded.attachment_id);
+      }
+    } catch { /* pre-warm ล้มเหลวต้องไม่กระทบการบันทึกเพจ */ }
+  }
   async function sendFacebookImageSmart(accessToken: string, recipientId: string, imageUrl: string, pageId?: string) {
     if (!imageUrl) return { success: false, error: 'IMAGE_EMPTY' };
     // M5: Image dedup — ถ้าส่งรูปนี้ไปแล้วในหน้าต่าง 10 นาที → ข้ามทันที
@@ -4612,16 +4649,22 @@ async function startServer() {
     if (!decoded) return { success: false, error: 'IMAGE_DECODE_FAILED' };
     const hash = crypto.createHash('md5').update(imageUrl).digest('hex');
 
-    // (Fixed) บีบอัดรูปใหญ่ก่อนอัปโหลด — รูปจากกล้องมือถือ 2-8MB ทำให้ทั้ง attachment upload
-    // และ /api/media (Messenger ดึงกลับ) ช้า/พลาด = ต้นเหตุ "ตอบรูปไม่ได้" บน Render
+    // 0ms: บีบอัดรูปใหญ่ก่อนอัปโหลด — ใช้ cache ตาม hash (รูปเดิมส่งซ้ำไม่บีบอัดใหม่)
     let uploadBuffer = decoded.buffer;
     let uploadMime = decoded.mimeType;
     if (uploadBuffer.length > 800 * 1024) {
-      const compressed = await compressImageBuffer(uploadBuffer);
-      if (compressed) {
-        uploadBuffer = compressed.buffer;
-        uploadMime = compressed.mimeType;
-        addLog('INFO', 'FACEBOOK_API', recipientId, `🗜️ บีบอัดรูปก่อนส่ง: ${(decoded.buffer.length / 1024).toFixed(0)}KB → ${(uploadBuffer.length / 1024).toFixed(0)}KB`, 'INFO');
+      const cached = compressedImageCache.get(hash);
+      if (cached) {
+        uploadBuffer = cached.buffer;
+        uploadMime = cached.mimeType;
+      } else {
+        const compressed = await compressImageBuffer(uploadBuffer);
+        if (compressed) {
+          uploadBuffer = compressed.buffer;
+          uploadMime = compressed.mimeType;
+          compressedImageCache.set(hash, compressed);
+          addLog('INFO', 'FACEBOOK_API', recipientId, `🗜️ บีบอัดรูปก่อนส่ง: ${(decoded.buffer.length / 1024).toFixed(0)}KB → ${(uploadBuffer.length / 1024).toFixed(0)}KB`, 'INFO');
+        }
       }
     }
 
@@ -4764,26 +4807,40 @@ async function startServer() {
         return true;
       };
       const sendImg = async (imgUrl: string): Promise<void> => {
+        const imgT0 = Date.now();
         try {
           const r: any = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
-          if (r && r.success === false && !r.skipped) {
+          const imgMs = Date.now() - imgT0;
+          if (r && (r as any).skipped) {
+            addLog('AI_REPLY', senderId, pageId, `⏭️ ข้ามรูปซ้ำ M5 (dedup 10 นาที, ${imgMs}ms) — ลูกค้าเคยได้รับรูปนี้แล้ว`, 'INFO');
+            return;
+          }
+          if (r && r.success === false) {
             // 🔧 ไม่กลืน error เงียบ ๆ — log เหตุผลจาก Meta เพื่อวินิจฉัย "ตอบรูปไม่ได้"
             if (!firstError) firstError = String(r.error || 'IMAGE_SEND_FAILED');
-            addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปสเต็ปไม่สำเร็จ (${String(r.error || 'SEND_FAILED').slice(0, 200)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
+            addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปสเต็ปไม่สำเร็จใน ${imgMs}ms (${String(r.error || 'SEND_FAILED').slice(0, 300)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
+          } else if (imgMs > 3000) {
+            addLog('AI_REPLY', senderId, pageId, `⏱️ ส่งรูปสเต็ปช้า ${imgMs}ms (ควร <3 วิ)`, 'WARNING');
           }
         } catch (imgErr: any) {
           if (!firstError) firstError = String(imgErr?.message || imgErr);
-          addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปสเต็ป error (${String(imgErr?.message || imgErr).slice(0, 200)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
+          addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปสเต็ป error ใน ${Date.now() - imgT0}ms (${String(imgErr?.message || imgErr).slice(0, 300)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
         }
       };
       let deliveredThis = false;
+      // 0ms: ข้อความ+รูปของสเต็ปเดียวกันยิงพร้อมกัน (ขนาน) — ไม่รอทีละใบ
+      // ลำดับข้ามสเต็ปยังรักษาโดย loop ตามลำดับ (batch per-step) จึงไม่สลับชุด
+      // IMAGE_FIRST: รูปต้องออกก่อนข้อความเสมอ — ยิงรูปก่อนแล้วค่อยข้อความ แต่รูปหลายใบยิงพร้อมกัน
+      const stepT0 = Date.now();
       if (seqMsg.send_order === 'IMAGE_FIRST' && seqImages.length > 0) {
-        for (const img of seqImages) await sendImg(img);
+        await Promise.all(seqImages.map((img) => sendImg(img)));
         deliveredThis = await sendText();
       } else {
-        deliveredThis = await sendText();
-        for (const img of seqImages) await sendImg(img);
+        const [textResult] = await Promise.all([sendText(), ...seqImages.map((img) => sendImg(img))]);
+        deliveredThis = textResult;
       }
+      const stepMs = Date.now() - stepT0;
+      if (stepMs > 3000) addLog('AI_REPLY', senderId, pageId, `⏱️ สเต็ป ${si + 1}/${seqOut.length} ใช้เวลา ${stepMs}ms (ข้อความ${seqImages.length ? `+รูป ${seqImages.length} ใบ` : ''})`, 'WARNING');
       if (deliveredThis) delivered++;
       if (seqMsg.text) {
         recordSimulatedSend(pageId, senderId, seqMsg.text, seqImages);
@@ -4792,8 +4849,7 @@ async function startServer() {
       } else if (seqImages.length > 0) {
         recordSimulatedSend(pageId, senderId, '', seqImages);
       }
-      // (Speed) 150ms ระหว่างสเต็ป — ทั้งชุด 5-8 ข้อความ+รูป จบใน ~1-2 วิ
-      if (si < seqOut.length - 1) await sleep(150);
+      // 0ms: ไม่เว้น sleep ระหว่างสเต็ป — ยิงชุดต่อไปทันที
     }
     return { delivered, firstError };
   }
@@ -6054,7 +6110,8 @@ async function startServer() {
           );
 
           if (commentId) {
-            await sleep(Math.min(commentDelay, 500)); // ตอบไวขึ้น แต่ยัง human-like ไม่โผล่ทันทีเหมือนบอท
+            // 0ms: commentDelay=0 → ตอบทันที (คง delay เฉพาะเพจที่ตั้งไว้ กัน Meta rate-limit)
+            if (commentDelay > 0) await sleep(Math.min(commentDelay, 500));
             await sendFacebookCommentReply(page.page_access_token || '', commentId, replyText);
           }
 
@@ -6062,19 +6119,30 @@ async function startServer() {
           const autoInboxMsg = `สวัสดีค่ะคุณลูกค้า สนใจ ${page.product?.product_name || 'สินค้า'} แอดมินส่งรายละเอียดและของแถมพิเศษให้ในแชทนี้แล้วนะคะ 🙏`;
           addLog('AI_REPLY', senderId, pageId, `📨 ส่งข้อความทัก Inbox: "${autoInboxMsg}"`, 'SUCCESS');
 
-          await sleep(Math.min(commentDelay, 500));
+          // 0ms: commentDelay=0 → ทัก Inbox ทันที (คง delay เฉพาะเพจที่ตั้งไว้)
+          if (commentDelay > 0) await sleep(Math.min(commentDelay, 500));
           const inboxRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, autoInboxMsg);
           if (!inboxRes.blocked) recordSimulatedSend(pageId, senderId, autoInboxMsg);
 
           // Deliver the configured comment reply images into the customer's inbox
           // (previously they were only counted in the log but never sent).
-          // (Upgraded) ระหว่างรูปแต่ละใบเว้น 400ms พอรักษาลำดับ — ไม่รอ commentDelay ทั้งหมด (กันตอบช้า)
-          for (const imgUrl of replyImages) {
-            await sleep(400);
-            const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl.trim(), pageId);
-            if (!imgRes.success) {
-              addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปคอมเมนต์เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
+          // 0ms: รูปคอมเมนต์หลายใบยิงพร้อมกัน (ขนาน) — ไม่รอใบละ 400ms
+          // คง gap 400ms เฉพาะเพจที่ตั้ง delay ไว้ (กัน Meta rate-limit)
+          if (commentDelay > 0) {
+            for (const imgUrl of replyImages) {
+              await sleep(400);
+              const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl.trim(), pageId);
+              if (!imgRes.success) {
+                addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปคอมเมนต์เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
+              }
             }
+          } else {
+            await Promise.all(replyImages.map(async (imgUrl) => {
+              const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, String(imgUrl).trim(), pageId);
+              if (!imgRes.success && !(imgRes as any).skipped) {
+                addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปคอมเมนต์เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
+              }
+            }));
           }
 
           // 🧠 AI เป็นสมอง (แม้ลูกค้ามาจากคอมเมนต์): เรียบเรียงข้อความทัก Inbox
@@ -6086,7 +6154,8 @@ async function startServer() {
             const ownerData = buildOwnerPreparedData(page);
             const pitchText = await generateAiFallbackReply(page, page.product, 'PROMOTION', [], senderId, pageId, 0.6, 700);
             if (pitchText) {
-              await sleep(Math.min(commentDelay, 800));
+              // 0ms: commentDelay=0 → ส่งพรีเซนทันที (คง delay เฉพาะเพจที่ตั้งไว้)
+              if (commentDelay > 0) await sleep(Math.min(commentDelay, 800));
               const pitchRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, pitchText);
               if (!pitchRes.blocked) {
                 recordSimulatedSend(pageId, senderId, pitchText);
@@ -6096,16 +6165,28 @@ async function startServer() {
               addLog('COMMENT', senderId, pageId, `🧠 AI เรียบเรียงข้อความพรีเซนจากข้อมูลร้าน ${ownerData ? `${ownerData.split('\n').length} รายการ` : '(ไม่มี)'}: "${pitchText.slice(0, 80)}"`, 'SUCCESS');
             }
             // ภาพประกอบตามที่เจ้าของร้านเตรียมไว้ (เฉพาะรูป — ไม่ยิงข้อความสคริปต์)
+            // 0ms: delay_seconds ของสเต็ปถูกบังคับเป็น 0 ใน fast path (default ส่งทันที)
+            // คง delay เฉพาะเพจที่ตั้ง commentDelay ไว้ (กัน Meta rate-limit)
             const ordered = [...sequenceSteps].sort((a, b) => (a.step_number || 0) - (b.step_number || 0));
-            for (const step of ordered) {
-              const stepImage = String(step.image_url || '').trim() || resolveConfiguredStepImage(page, step);
-              if (!stepImage) continue;
-              const stepDelay = Number(step.delay_seconds) > 0 ? Math.min(Number(step.delay_seconds) * 1000, 1500) : Math.min(commentDelay, 800);
-              await sleep(stepDelay);
-              const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, stepImage, pageId);
-              if (!imgRes.success) {
-                addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปพรีเซน (สเต็ป ${step.step_number}) เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
+            const stepImages = ordered
+              .map((step) => ({ step, img: String(step.image_url || '').trim() || resolveConfiguredStepImage(page, step) }))
+              .filter((x) => x.img);
+            if (commentDelay > 0) {
+              for (const { step, img: stepImage } of stepImages) {
+                const stepDelay = Number((step as any).delay_seconds) > 0 ? Math.min(Number((step as any).delay_seconds) * 1000, 1500) : Math.min(commentDelay, 800);
+                await sleep(stepDelay);
+                const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, stepImage, pageId);
+                if (!imgRes.success) {
+                  addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปพรีเซน (สเต็ป ${step.step_number}) เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
+                }
               }
+            } else {
+              await Promise.all(stepImages.map(async ({ step, img: stepImage }) => {
+                const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, stepImage, pageId);
+                if (!imgRes.success && !(imgRes as any).skipped) {
+                  addLog('COMMENT', senderId, pageId, `⚠️ ส่งรูปพรีเซน (สเต็ป ${step.step_number}) เข้า Inbox ไม่สำเร็จ: ${imgRes.error}`, 'WARNING');
+                }
+              }));
             }
           }
         }
@@ -6123,8 +6204,11 @@ async function startServer() {
       pushHistory(pageId, senderId, 'customer', messageText);
 
       // Customer Memory: Check if returning customer with order history
-      const customerOrderCount = await dbService.getCustomerOrderCount(senderId);
-      const customerTotalSpent = await dbService.getCustomerTotalSpent(senderId);
+      // 0ms: query ยอดออเดอร์ 2 ตัวพร้อมกัน (ขนาน) แทนรอทีละตัว
+      const [customerOrderCount, customerTotalSpent] = await Promise.all([
+        dbService.getCustomerOrderCount(senderId),
+        dbService.getCustomerTotalSpent(senderId),
+      ]);
       const isReturningCustomer = customerOrderCount > 0;
       let customerStarRating = 0;
       if (customerOrderCount >= 10) customerStarRating = 5;
@@ -6622,7 +6706,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
               addRecentReply(pageId, senderId, seqJoined);
               addLog('AI_REPLY', senderId, pageId, `⚡ ${seqLogTag}: ส่งสเต็ปตามที่เจ้าของตั้งไว้ครบ ${seqOut.length} ชุด (ข้อความ+รูปตรงตามตั้งค่า 100% ไม่รอ AI)`, 'SUCCESS');
               void sendTypingIndicator(page.page_access_token || '', senderId, false);
-              persistData();
+              // 0ms: persist แบบ fire-and-forget — ไม่บล็อกการตอบลูกค้า
+              void (function () { try { persistData(); } catch { /* non-critical */ } })();
               return;
             }
           } catch (seqErr: any) {
@@ -6647,8 +6732,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
               instantAckMainImage = ackImg;
               try { await sendFacebookImageSmart(page.page_access_token || '', senderId, ackImg, pageId); } catch { /* รูปไม่สำคัญพอจะทำให้ ack ล้ม */ }
             }
-            // (Speed v2) 300ms → 150ms: ack ต้องถึงลูกค้าเร็วที่สุดเท่าที่ทำได้
-            if (ackI < ackParts.length - 1) await sleep(150);
+            // 0ms: ack ต้องถึงลูกค้าเร็วที่สุด — ไม่เว้น sleep ระหว่างข้อความ
+
           }
           instantAckSent = ackParts.length > 0;
           if (instantAckSent) {
@@ -7048,8 +7133,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         // Send the AI answer with human-like pacing
         // (Speed v2) 1.5s → 250ms: Instant Ack ถูกส่งไปแล้ว ลูกค้าไม่รู้สึกว่าบอทเงียบ
         // การรอเพิ่มอีก 1.5 วิก่อนส่งข้อความจริงจึงเป็น "เวลาเสียเปล่า" ล้วน ๆ
-        // (คงไว้ 250ms ขั้นต่ำกันข้อความ/รูปสลับลำดับตอนยิงติดกันเร็วเกินไป)
-        await sleep(Math.min(pageDelay, 250));
+        // 0ms: pageDelay=0 → ไม่รอเลย (คง 250ms เฉพาะเพจที่ตั้ง delay ไว้กันข้อความสลับลำดับ)
+        if (pageDelay > 0) await sleep(Math.min(pageDelay, 250));
         // (New) ปิดสถานะ "กำลังพิมพ์..." ก่อนเริ่มส่งข้อความจริง
         void sendTypingIndicator(page.page_access_token || '', senderId, false);
 
@@ -7102,20 +7187,24 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             const sendImagesFirst = msg.send_order === 'IMAGE_FIRST' && imageList.length > 0;
 
             if (sendImagesFirst) {
-              // ── IMAGE_FIRST: ส่งรูปทั้งหมดก่อน ──
-              for (let j = 0; j < imageList.length; j++) {
-                const imgUrl = imageList[j];
+              // 0ms: IMAGE_FIRST — รูปต้องออกก่อนข้อความเสมอ (รูปหลายใบยิงพร้อมกัน) + log timing/error ครบทุกรูป
+              const imgT0 = Date.now();
+              await Promise.all(imageList.map(async (imgUrl, j) => {
                 const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
                 // backward compat: บันทึก分離画像ใน record แบบ per-image เฉพาะกรณีที่ไม่มี images array รวม
                 if (!msg.images || msg.images.length === 0) {
                   recordSimulatedSend(pageId, senderId, '', [imgUrl]);
                 }
-                if (imgRes.success) {
-                  addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปก่อนข้อความ (${i + 1}/${outgoing.length}) ภาพ ${j + 1}/${imageList.length} สำเร็จ`, 'SUCCESS');
+                const imgMs = Date.now() - imgT0;
+                if ((imgRes as any).skipped) {
+                  addLog('AI_REPLY', senderId, pageId, `⏭️ ข้ามรูปซ้ำ M5 (${i + 1}/${outgoing.length}) ภาพ ${j + 1}/${imageList.length} (${imgMs}ms) — ลูกค้าเคยได้รับรูปนี้แล้ว`, 'INFO');
+                } else if (imgRes.success) {
+                  if (imgMs > 3000) addLog('AI_REPLY', senderId, pageId, `⏱️ ส่งรูปก่อนข้อความ (${i + 1}/${outgoing.length}) ภาพ ${j + 1}/${imageList.length} ช้า ${imgMs}ms`, 'WARNING');
+                  else addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปก่อนข้อความ (${i + 1}/${outgoing.length}) ภาพ ${j + 1}/${imageList.length} สำเร็จ (${imgMs}ms)`, 'SUCCESS');
                 } else {
-                  addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปก่อนข้อความ (${i + 1}/${outgoing.length}) ภาพ ${j + 1}/${imageList.length} ล้มเหลว: ${imgRes.error}`, 'ERROR');
+                  addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปก่อนข้อความ (${i + 1}/${outgoing.length}) ภาพ ${j + 1}/${imageList.length} ล้มเหลวใน ${imgMs}ms: ${String(imgRes.error).slice(0, 300)}`, 'ERROR');
                 }
-              }
+              }));
             }
 
             // ── ส่งข้อความ ──
@@ -7134,21 +7223,25 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
               }
             }
 
-            // ── หากเป็น TEXT_FIRST (ค่าเริ่มต้น) ให้ส่งรูปตามหลังข้อความเหมือนเดิม ──
-            if (!sendImagesFirst) {
+            // 0ms: TEXT_FIRST (ค่าเริ่มต้น) — ข้อความ+รูปยิงพร้อมกัน (ขนาน) แทนรอทีละใบ + log timing/error ครบทุกรูป
+            if (!sendImagesFirst && imageList.length > 0) {
               const recordPerImage = !msg.images || msg.images.length === 0;
-              for (let j = 0; j < imageList.length; j++) {
-                const imgUrl = imageList[j];
+              const imgT0 = Date.now();
+              await Promise.all(imageList.map(async (imgUrl, j) => {
                 const imgRes = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
                 if (recordPerImage) {
                   recordSimulatedSend(pageId, senderId, '', [imgUrl]);
                 }
-                if (imgRes.success) {
-                  addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}) สำเร็จ`, 'SUCCESS');
+                const imgMs = Date.now() - imgT0;
+                if ((imgRes as any).skipped) {
+                  addLog('AI_REPLY', senderId, pageId, `⏭️ ข้ามรูปซ้ำ M5 ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}, ${imgMs}ms) — ลูกค้าเคยได้รับรูปนี้แล้ว`, 'INFO');
+                } else if (imgRes.success) {
+                  if (imgMs > 3000) addLog('AI_REPLY', senderId, pageId, `⏱️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}) ช้า ${imgMs}ms`, 'WARNING');
+                  else addLog('AI_REPLY', senderId, pageId, `🖼️ ส่งรูปประกอบ ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}) สำเร็จ (${imgMs}ms)`, 'SUCCESS');
                 } else {
-                  addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบ ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}) ไม่สำเร็จ: ${imgRes.error}`, 'ERROR');
+                  addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปประกอบ ${i + 1}/${outgoing.length} (${j + 1}/${imageList.length}) ไม่สำเร็จใน ${imgMs}ms: ${String(imgRes.error).slice(0, 300)}`, 'ERROR');
                 }
-              }
+              }));
             }
           } catch (sendErr: any) {
             addLog('AI_REPLY', senderId, pageId, `⚠️ ส่งข้อความ/รูป ${i + 1}/${outgoing.length} ผิดพลาด (ข้ามไปก่อน): ${sendErr?.message || sendErr}`, 'WARNING');
@@ -7156,7 +7249,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           // (Speed v2) gap ระหว่างข้อความ 500/300ms → 220/120ms: ยังรักษาลำดับ
           // ข้อความ→รูปได้ (Messenger รับตามลำดับที่ยิง) แต่ชุด 5-6 ข้อความถึงลูกค้า
           // เร็วขึ้น ~1.5-2 วิ รวมทั้งชุด
-          if (!isLast) await sleep(pageDelay > 0 ? Math.min(220, pageDelay) : 120);
+          if (!isLast && pageDelay > 0) await sleep(Math.min(220, pageDelay)); // 0ms: ไม่เว้น gap ระหว่างข้อความ
           try { dbService.addChatMessage(pageId, senderId, 'admin', msg.text); } catch { /* non-critical */ }
         }
         // Remember what we answered for the conversation memory + anti-repeat.
@@ -7175,8 +7268,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             const closingParts = buildLocalClosingAsk(page, matchedProduct, pageId, senderId);
             for (let ci = 0; ci < closingParts.length; ci++) {
               const part = closingParts[ci];
-              // (Speed v2) 700/400ms → 250/150ms: ข้อความปิดการขายต้องตามมาให้เร็ว
-              await sleep(pageDelay > 0 ? Math.min(250, pageDelay) : 150);
+              // 0ms: ข้อความปิดการขายตามมาทันที (คง delay เฉพาะเพจที่ตั้งไว้)
+              if (pageDelay > 0) await sleep(Math.min(250, pageDelay));
               try {
                 const closeRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, part.text);
                 // ⛔ เฉพาะถูก Banned Guard บล็อกจึงไม่นับว่าส่ง — กรณีอื่น (PSID ปลอมใน
@@ -7186,9 +7279,16 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
                   try { dbService.addChatMessage(pageId, senderId, 'admin', part.text); } catch { /* non-critical */ }
                   pushHistory(pageId, senderId, 'admin', part.text);
                 }
+                // 0ms: รูป closing หลายใบยิงพร้อมกัน (ขนาน) พร้อมข้อความรูปหลายใบ — ไม่รอทีละใบ
+              if (pageDelay > 0) {
                 for (const cImg of (part.images || [])) {
                   try { await sendFacebookImageSmart(page.page_access_token || '', senderId, cImg, pageId); } catch { /* รูปไม่สำคัญพอจะทำให้ closing ล้ม */ }
                 }
+              } else {
+                await Promise.all((part.images || []).map((cImg) =>
+                  sendFacebookImageSmart(page.page_access_token || '', senderId, cImg, pageId).catch(() => ({ success: false }))
+                ));
+              }
                 addLog('AI_REPLY', senderId, pageId, `🛒 ส่งข้อความปิดการขายต่อท้าย (local engine${sentReviewImage ? ' หลังรูปรีวิว' : ''} ${ci + 1}/${closingParts.length}): "${part.text.slice(0, 90)}"${closeRes.blocked ? ' — ⛔ ถูก BANNED_PRODUCT_GUARD บล็อก' : ''}`, closeRes.blocked ? 'WARNING' : 'SUCCESS');
               } catch (closeErr: any) {
                 addLog('AI_REPLY', senderId, pageId, `⚠️ ส่งข้อความปิดการขายไม่สำเร็จ (ข้ามไปก่อน): ${closeErr?.message || closeErr}`, 'WARNING');
@@ -7232,7 +7332,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
               } catch (infoErr: any) {
                 addLog('ORDER', senderId, pageId, `⚠️ ส่งข้อความขอข้อมูลสั่งซื้อไม่สำเร็จ (ข้ามไปก่อน): ${infoErr?.message || infoErr}`, 'WARNING');
               }
-              if (ii < infoParts.length - 1) await sleep(150);
+              // 0ms: ไม่เว้น sleep ระหว่างข้อความขอข้อมูล — ยิงข้อความต่อไปทันที
+
             }
             persistData();
             return;
@@ -7381,8 +7482,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             } catch (fbErr: any) {
               addLog('AI_REPLY', senderId, pageId, `⚠️ ส่งข้อความพรีเซนสำรอง ${fi + 1}/${fbParts.length} ไม่สำเร็จ (ข้ามไปก่อน): ${fbErr?.message || fbErr}`, 'WARNING');
             }
-            // (Speed v2) 350ms → 180ms: พรีเซนสำรองต้องถึงลูกค้าเร็วที่สุด
-            if (fi < fbParts.length - 1) await sleep(180);
+            // 0ms: fallback สำรองต้องถึงลูกค้าเร็วที่สุด — คง gap 180ms เฉพาะเพจที่ตั้ง delay ไว้
+            if (resolvePageDelay(page) > 0 && fi < fbParts.length - 1) await sleep(180);
           }
         } else {
           addLog('AI_REPLY', senderId, pageId, 'ℹ️ คำตอบหลักถูกส่งถึงลูกค้าไปแล้วบางส่วนก่อนเกิดข้อผิดพลาด — ข้ามการส่งพรีเซนสำรอง (กันข้อความซ้ำ)', 'INFO');
@@ -8461,6 +8562,14 @@ ${JSON.stringify(categorySummary, null, 2)}
 
       addLog('INFO', 'USER', 'SYSTEM', `อัปเดตข้อมูลตาราง ${collection.toUpperCase()} จำนวน ${data.length} รายการ`, 'SUCCESS');
       persistData();
+      // 0ms: pre-warm attachment รูปใหม่ทั้งหมดในพื้นหลัง (ไม่บล็อก response) — ส่งจริงครั้งต่อไปไวทันที
+      if (collection === 'pages') {
+        try {
+          for (const p of (data || [])) {
+            if (p && (p as any).page_id) void prewarmPageAttachments(p);
+          }
+        } catch { /* non-critical */ }
+      }
       return res.json({ success: true, count: data.length });
     }
     res.status(400).json({ error: 'Invalid collection or data' });
