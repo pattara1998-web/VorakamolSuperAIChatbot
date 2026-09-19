@@ -1405,7 +1405,20 @@ function buildConfiguredSequenceReply(
   const out: InstantOutgoing = [];
   for (const s of steps) {
     const rawText = String(s?.text_content || '').trim();
-    const img = String(s?.image_url || '').trim();
+    // สเต็ปที่รูปว่าง → ดึงรูปสินค้าช่องที่ตรง step_number (1=main … 6=step6) มาใช้แทน
+    // ใช้ logic เดียวกับ resolveConfiguredStepImage ฝั่ง send path (กัน "ข้อความมาถึงแต่รูปหาย")
+    const ownImg = String(s?.image_url || '').trim();
+    let img = ownImg;
+    if (!img) {
+      const slotMap: Record<number, string> = { 1: 'main', 2: 'detail', 3: 'promotion', 4: 'review', 5: 'closing', 6: 'step6' };
+      const slot = slotMap[Number((s as any)?.step_number)];
+      if (slot) {
+        const images = (page?.product?.images as any) || {};
+        const legacy = page?.product as any;
+        const clear = (u: any) => (typeof u === 'string' ? u.trim() : '');
+        img = clear(images?.[slot]) || clear(legacy?.[`image_${slot}`]) || '';
+      }
+    }
     // BANNED_PRODUCT_GUARD: ข้อความเจ้าของก็ต้องผ่านตาข่ายคำแบน (ตัดเฉพาะประโยคที่แบน ไม่ทิ้งทั้งข้อความ)
     const text = rawText ? (scrubBannedProductContent(rawText) || '') : '';
     const sendOrder = String((s as any)?.send_order || '').trim();
@@ -4806,33 +4819,40 @@ async function startServer() {
         }
         return true;
       };
-      const sendImg = async (imgUrl: string): Promise<void> => {
+      const sendImg = async (imgUrl: string): Promise<boolean> => {
         const imgT0 = Date.now();
         try {
           const r: any = await sendFacebookImageSmart(page.page_access_token || '', senderId, imgUrl, pageId);
           const imgMs = Date.now() - imgT0;
           if (r && (r as any).skipped) {
             addLog('AI_REPLY', senderId, pageId, `⏭️ ข้ามรูปซ้ำ M5 (dedup 10 นาที, ${imgMs}ms) — ลูกค้าเคยได้รับรูปนี้แล้ว`, 'INFO');
-            return;
+            return true; // เคยส่งรูปนี้ให้ลูกค้าแล้ว — นับว่าสเต็ปนี้มีรูปครบ (กันสเต็ปรูปเปล่าถูกนับว่า delivered=0)
           }
           if (r && r.success === false) {
             // 🔧 ไม่กลืน error เงียบ ๆ — log เหตุผลจาก Meta เพื่อวินิจฉัย "ตอบรูปไม่ได้"
             if (!firstError) firstError = String(r.error || 'IMAGE_SEND_FAILED');
             addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปสเต็ปไม่สำเร็จใน ${imgMs}ms (${String(r.error || 'SEND_FAILED').slice(0, 300)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
-          } else if (imgMs > 3000) {
-            addLog('AI_REPLY', senderId, pageId, `⏱️ ส่งรูปสเต็ปช้า ${imgMs}ms (ควร <3 วิ)`, 'WARNING');
+            return false;
           }
+          if (imgMs > 3000) addLog('AI_REPLY', senderId, pageId, `⏱️ ส่งรูปสเต็ปช้า ${imgMs}ms (ควร <3 วิ)`, 'WARNING');
+          return true;
         } catch (imgErr: any) {
           if (!firstError) firstError = String(imgErr?.message || imgErr);
           addLog('AI_REPLY', senderId, pageId, `❌ ส่งรูปสเต็ป error ใน ${Date.now() - imgT0}ms (${String(imgErr?.message || imgErr).slice(0, 300)}) — ข้อความยังส่งต่อปกติ`, 'ERROR');
+          return false;
         }
       };
       let deliveredThis = false;
       // 0ms: ข้อความ+รูปของสเต็ปเดียวกันยิงพร้อมกัน (ขนาน) — ไม่รอทีละใบ
       // ลำดับข้ามสเต็ปยังรักษาโดย loop ตามลำดับ (batch per-step) จึงไม่สลับชุด
+      // สเต็ปรูปเปล่า (text='') ต้องนับรูปว่าส่งสำเร็จด้วย — ไม่เช่นนั้น delivered=0
+      // แล้วระบบสลับไป flow AI ทำให้ลูกค้าได้ข้อความซ้ำ (ต้นเหตุ "รูปไม่ส่งมาเลย" ที่แท้จริง)
       // IMAGE_FIRST: รูปต้องออกก่อนข้อความเสมอ — ยิงรูปก่อนแล้วค่อยข้อความ แต่รูปหลายใบยิงพร้อมกัน
       const stepT0 = Date.now();
-      if (seqMsg.send_order === 'IMAGE_FIRST' && seqImages.length > 0) {
+      if (!seqMsg.text && seqImages.length > 0) {
+        const imgResults = await Promise.all(seqImages.map((img) => sendImg(img)));
+        deliveredThis = imgResults.some(Boolean);
+      } else if (seqMsg.send_order === 'IMAGE_FIRST' && seqImages.length > 0) {
         await Promise.all(seqImages.map((img) => sendImg(img)));
         deliveredThis = await sendText();
       } else {
