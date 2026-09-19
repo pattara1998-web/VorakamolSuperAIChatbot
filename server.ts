@@ -52,12 +52,17 @@ interface DatabaseStore {
     geminiApiKeyUpdatedAt?: string;
     geminiModel?: string;
     // Multi-provider AI configuration
-    aiProvider?: string; // 'GEMINI' | 'ZAI' | 'LMSTUDIO'
+    aiProvider?: string;
     zaiApiKey?: string;
     zaiModel?: string;
     lmStudioBaseUrl?: string;
     lmStudioModel?: string;
     aiSettingsUpdatedAt?: string;
+    // System-wide default reply delay in ms. A page's own `reply_delay_ms`
+    // (set in Pages Hub ▸ ตั้งค่าเพจ) takes priority at send-time; this value is
+    // the fallback used when a page hasn't configured its own. 0 = instant reply.
+    reply_delay_ms?: number;
+    settingsUpdatedAt?: string;
   };
 }
 
@@ -70,7 +75,8 @@ const db: DatabaseStore = {
   customers: [...INITIAL_CUSTOMERS],
   orders: [...INITIAL_ORDERS],
   settings: {
-    geminiApiKey: process.env.GEMINI_API_KEY || ''
+    geminiApiKey: process.env.GEMINI_API_KEY || '',
+    reply_delay_ms: Number(process.env.REPLY_DELAY_MS || 0)
   },
   logs: [
     {
@@ -206,7 +212,10 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // a value. Capped at 30s so a typo can never stall a conversation.
 function resolvePageDelay(page: { reply_delay_ms?: number } | undefined): number {
   const raw = page?.reply_delay_ms;
-  if (raw === undefined || raw === null || Number.isNaN(Number(raw))) return Math.min(REPLY_DELAY_MS, 30000);
+  if (raw === undefined || raw === null || Number.isNaN(Number(raw))) {
+    // No per-page value → fall back to the system-wide default first
+    return Math.min(db.settings.reply_delay_ms ?? REPLY_DELAY_MS, 30000);
+  }
   return Math.min(Math.max(0, Number(raw)), 30000);
 }
 // Hard cap on any single AI call so a hung Gemini request can never leave a
@@ -340,7 +349,33 @@ function classifyIntentInstant(rawText: string): IntentHint {
   for (const [intent, keywords] of INTENT_KEYWORDS) {
     if (keywords.some(k => text.includes(normalizeThaiText(k)))) return intent;
   }
-  return 'QUESTION';
+    return 'QUESTION';
+}
+
+// ---------------------------------------------------------------------------
+// INTENT ROUTING: General question vs. Special (sales-order) intent.
+// Used to decide whether a message follows the "Instant Sales Engine" path
+// (Fast Sequence + Instant Ack + AI) or a lightweight "just answer the
+// question" reply. This makes the routing decision explicit + observable so
+// it can be logged and unit-tested.
+// ---------------------------------------------------------------------------
+// General-question intents: the customer is asking about usage, specs, trust,
+// or just continuing the chat — these get a short factual answer (optionally
+// with a light sales nudge) but NOT the full promotion sequence.
+const GENERAL_QUESTION_INTENTS = new Set<IntentHint>(['QUESTION', 'GREETING', 'TRUST', 'FOLLOWUP']);
+// Promotional intents: the customer is showing buying interest — route into
+// the full Fast Sequence sales path. SHIPPING/COD is promotional too because
+// a shipping question at the top of the funnel is a strong buy signal.
+const PROMOTIONAL_INTENTS = new Set<IntentHint>(['PURCHASE', 'PRICE', 'PROMOTION', 'SHIPPING', 'NEGOTIATION']);
+
+function isGeneralQuestion(intentHint: IntentHint): boolean {
+  return GENERAL_QUESTION_INTENTS.has(intentHint);
+}
+function isSpecialQuestion(intentHint: IntentHint): boolean {
+  return !GENERAL_QUESTION_INTENTS.has(intentHint) && intentHint !== 'ORDER';
+}
+function isPromotionalIntent(intentHint: IntentHint): boolean {
+  return PROMOTIONAL_INTENTS.has(intentHint);
 }
 
 // Regex safety-net: pull phone/address/customer_name straight from the message
@@ -1379,6 +1414,26 @@ function clearCloserState(pageId: string, senderId: string): void {
 // (หมดอายุตาม TTL → ลูกค้ากลับมาใหม่ภายหลังได้พรีเซนครบชุดอีกครั้ง เหมือนแอดมินจริงต้อนรับใหม่)
 const configuredSequenceSentAt = new Map<string, number>();
 const CONFIGURED_SEQUENCE_TTL_MS = 90 * 60 * 1000; // 90 นาที
+
+// 🔒 STRICT VERBATIM MODE ("ส่งสเต็ปตรงตามที่ตั้ง 100%") — toggle ต่อเพจ (send_steps_verbatim)
+// เปิดแล้ว: เจตนาขาย (สนใจ/ถามราคา/โปร/ค่าส่ง/ต่อรอง/ทักทาย) → ส่งข้อความ+รูปที่เจ้าของตั้งไว้
+// ตรงตัว 1:1 ไม่ให้ AI เรียบเรียงใหม่ และห้าม fallback "แต่งชุดเอง" (buildInstantSalesReply)
+// - คำถามทั่วไป (QUESTION) → AI ตอบตามปกติ
+// - กันสแปม 30 นาที: ลูกค้าที่เพิ่งได้ชุดไป → ให้ AI ตอบเฉพาะคำถามแทน ไม่ยิงชุดซ้ำ
+const STRICT_SEQUENCE_TTL_MS = 30 * 60 * 1000;
+function isStrictSequenceMode(page: any): boolean {
+  if (page?.send_steps_verbatim === true) return true;
+  if (page?.send_steps_verbatim === false) return false;
+  // ฟิลด์ยังไม่เคยถูกตั้งค่า (เพจเก่าที่ยังไม่ได้กดเซฟหน้าตั้งค่า):
+  // ถ้าเพจมีสเต็ปที่เจ้าของตั้งไว้ → ถือว่าเปิด "โหมดส่งตรง" เป็นค่าเริ่มต้น
+  // (ตรงกับ default ของ toggle ใน PageSettingsModal — มีสเต็ป = เปิด)
+  return hasConfiguredSteps(page);
+}
+function hasConfiguredSteps(page: any): boolean {
+  return ((page?.sales_sequence_steps || []) as any[]).some(
+    (s: any) => s && (String(s?.text_content || '').trim() || String(s?.image_url || '').trim())
+  );
+}
 function getSequenceSentKey(pageId: string, senderId: string): string {
   return `${pageId}:${senderId}`;
 }
@@ -3620,8 +3675,29 @@ async function startServer() {
       zaiApiKeyConfigured: Boolean(getProviderApiKey('ZAI')),
       lmStudioBaseUrl: getLmStudioBaseUrl(),
       lmStudioModel: db.settings.lmStudioModel || '',
-      zaiModel: db.settings.zaiModel || AI_PROVIDERS.ZAI.defaultModel
+      zaiModel: db.settings.zaiModel || AI_PROVIDERS.ZAI.defaultModel,
+      // System-wide defaults (safe to expose — no secrets)
+      reply_delay_ms: db.settings.reply_delay_ms ?? 0,
+      settingsUpdatedAt: db.settings.settingsUpdatedAt || null
     });
+  });
+
+  // System-wide settings (non-secret values that affect all pages by default)
+  app.post('/api/settings/system', (req: Request, res: Response) => {
+    const { reply_delay_ms } = req.body || {};
+    if (reply_delay_ms !== undefined) {
+      const val = Math.max(0, Math.min(30000, Math.floor(Number(reply_delay_ms) || 0)));
+      if (!Number.isFinite(val) || val < 0 || val > 30000) {
+        return res.status(400).json({ success: false, message: 'reply_delay_ms ต้องเป็น 0-30000 (มิลลิวินาที)' });
+      }
+      db.settings.reply_delay_ms = val;
+      db.settings.settingsUpdatedAt = new Date().toISOString();
+      persistData();
+      dbBridge.broadcastSSE('data_updated', { collection: 'settings' });
+      res.json({ success: true, reply_delay_ms: db.settings.reply_delay_ms, message: 'บันทึกค่าเริ่มต้นการรอคำตอบเรียบร้อยแล้วค่ะ' });
+    } else {
+      res.status(400).json({ success: false, message: 'ไม่พบฟิลด์ที่ต้องอัปเดต' });
+    }
   });
 
   app.post('/api/settings/gemini', async (req: Request, res: Response) => {
@@ -4870,6 +4946,14 @@ async function startServer() {
         recordSimulatedSend(pageId, senderId, '', seqImages);
       }
       // 0ms: ไม่เว้น sleep ระหว่างสเต็ป — ยิงชุดต่อไปทันที
+      // (Upgraded) Pace between steps using the page/system delay so configured
+      // sequences never feel like a robotic wall of text. The gap is capped at
+      // 600ms so a page configured with a long custom delay still sends the
+      // whole sequence within a sane window.
+      const pageDelay = resolvePageDelay(page);
+      if (si < seqOut.length - 1 && pageDelay > 0) {
+        await sleep(Math.min(600, Math.max(180, pageDelay)));
+      }
     }
     return { delivered, firstError };
   }
@@ -6216,6 +6300,16 @@ async function startServer() {
       // Handle MESSENGER MESSAGE Event
       const intentHint: IntentHint = classifyIntentInstant(messageText);
       addLog('MESSAGE', senderId, pageId, `📩 ลูกค้าทักแชท [intent:${intentHint}]: "${messageText}"`, 'INFO', { senderId, pageId, intentHint });
+      // Feature 3 (AI Routing): log the routing decision explicitly so the
+      // Instant Sales Engine path vs lightweight-reply path is observable in
+      // the activity log / SSE stream. General questions get a short factual
+      // answer; special/promotional intents enter the full Fast Sequence.
+      const routingLabel = isGeneralQuestion(intentHint)
+        ? ' general-question path (short factual reply, no full sequence)'
+        : isSpecialQuestion(intentHint)
+          ? ' Instant Sales Engine path (Fast Sequence + Instant Ack + AI)'
+          : ' order-data path (extract + validate + create order)';
+      addLog('INFO', senderId, pageId, `🛣️ Intent Routing [${intentHint}] →${routingLabel}`, 'INFO', { senderId, pageId, intentHint, isGeneral: isGeneralQuestion(intentHint), isSpecial: isSpecialQuestion(intentHint), isPromotional: isPromotionalIntent(intentHint) });
       // Restore conversation memory from PostgreSQL if the server restarted
       await seedHistoryFromDb(pageId, senderId);
       // Remember the customer's message in conversation memory BEFORE any
@@ -6486,7 +6580,7 @@ ${usedRepliesText}
 18. 🔁 ความหลากหลายของประโยค: ห้ามใช้คำเปิด/คำปิดซ้ำกันติด ๆ กันหลายรอบต่อเนื่อง (เช่น "ได้เลยค่า", "รับสิทธิ์ได้เลยนะคะ") — เปลี่ยนวิธีพูดทุกครั้ง อ้างอิงสิ่งที่ลูกค้าพูดเป็นหลัก เพื่อให้บทสนทนาดูเหมือนคนจริงคุยกับคนจริง
 19. ✍️ ตอบแบบแชทจริง: พิมพ์เป็นภาษาไทยอ่านง่าย ใช้เว้นบรรทัด/อิโมจิน้อย ๆ (ไม่เกิน 1-2 ต่อข้อความ) แบบแอดมินมือถือ ไม่เป็นทางการเกิน ไม่ใช้ภาษาเขียนยาวเหยียด
 20. ${getBannedProductPromptRule()}
-21. 🧠 ข้อมูลที่เจ้าของร้านเตรียมไว้ (ด้านล่าง "ข้อมูล/สคริปต์ที่เจ้าของร้านเตรียมไว้"): นี่คือ "ความรู้ของร้าน" ไม่ใช่ข้อความที่ต้องส่ง — ให้อ่านทำความเข้าใจ แล้วเลือกหยิบมาเรียบเรียงใหม่ด้วยถ้อยคำของคุณเองแบบแอดมินคุยจริง ⛔ ห้ามคัดลอกทั้งดุ้น ห้ามส่งรวดเดียวทุกบรรทัด ห้ามพูดซ้ำกับที่คุยไปแล้ว ใช้เฉพาะส่วนที่ "ตอบคำถามล่าสุดของลูกค้า" และห้ามใส่ข้อความ/ราคาที่ไม่มีในข้อมูลนี้หรือในสเปกสินค้าด้านล่าง
+21. 🧠 ข้อมูลที่เจ้าของร้านเตรียมไว้ (ด้านล่าง "ข้อมูล/สคริปต์ที่เจ้าของร้านเตรียมไว้"): นี่คือ "ความรู้ของร้าน" ไม่ใช่ข้อความที่ต้องส่ง — ให้อ่านทำความเข้าใจ แล้วเลือกหยิบมาเรียบเรียงใหม่ด้วยถ้อยคำของคุณเองแบบแอดมินคุยจริง ⛔ ห้ามคัดลอกทั้งดุ้น ห้ามส่งรวดเดียวทุกบรรทัด ห้ามพูดซ้ำกับที่คุยไปแล้ว ใช้เฉพาะส่วนที่ "ตอบคำถามล่าสุดของลูกค้า" และห้ามใส่ข้อความ/ราคาที่ไม่มีในข้อมูลนี้หรือในสเปกสินค้าด้านล่าง | ถ้าลูกค้าแสดงเจตนาซื้อ/ถามราคา/ถามโปรโมชั่น → ยึดข้อความขาย ราคา และข้อเสนอ (ส่งฟรี/COD/ของแถม) จากข้อมูลนี้เป็นหลักตรงตัว เรียบเรียงสั้นลงได้ แต่ห้ามเปลี่ยน/เพิ่ม/ตัดราคาหรือเงื่อนไข
 
 📝 ข้อมูล/สคริปต์ที่เจ้าของร้านเตรียมไว้ (ใช้เป็น "ความรู้" เท่านั้น — เรียบเรียงใหม่ด้วยคำของคุณเอง เลือกใช้เฉพาะที่ตรงกับคำถามลูกค้า):
 ${ownerScriptData || '(เจ้าของร้านยังไม่ได้เตรียมข้อมูลเพิ่มเติม — ตอบจากข้อมูลสินค้าและสเปกด้านล่างนี้เท่านั้น)'}
@@ -6703,12 +6797,27 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         }
 
         // (3) เจตนาขาย → สเต็ปครบชุด (ใช้เมื่อคีย์เวิร์ดไม่แมตช์ หรือกฎนั้นเพิ่งส่งไปไม่นาน)
-        if (seqOut.length === 0 && !consultantMode && seqStepsConfigured.length > 0
+        // 🔒 โหมดส่งตรง (send_steps_verbatim): ส่งสเต็ปตรงตัวโดยไม่ให้ consultantMode บล็อก
+        //     และใช้ TTL กันสแปม 30 นาที (แทน 90 นาทีของโหมด AI-first)
+        const strictMode = isStrictSequenceMode(page);
+        const seqTtlMs = strictMode ? STRICT_SEQUENCE_TTL_MS : CONFIGURED_SEQUENCE_TTL_MS;
+        if (seqOut.length === 0 && seqStepsConfigured.length > 0
           && SALES_SEQ_INTENTS.includes(intentHint)
-          && Date.now() - (configuredSequenceSentAt.get(seqStateKey) || 0) > CONFIGURED_SEQUENCE_TTL_MS) {
+          && (strictMode || !consultantMode)
+          && Date.now() - (configuredSequenceSentAt.get(seqStateKey) || 0) > seqTtlMs) {
           seqOut = buildConfiguredSequenceReply(page, intentHint);
-          seqLogTag = 'Fast Sequence';
+          seqLogTag = strictMode ? 'Fast Sequence (โหมดส่งตรง)' : 'Fast Sequence';
           seqTtlKey = seqStateKey;
+        } else if (seqOut.length === 0 && strictMode && seqStepsConfigured.length > 0
+          && SALES_SEQ_INTENTS.includes(intentHint)) {
+          // 🔍 โหมดส่งตรงแต่ชุดไม่ถูกส่ง → log เหตุผลให้เจ้าของเห็นใน Activity log ได้ทันที
+          const lastSentAt = configuredSequenceSentAt.get(seqStateKey) || 0;
+          const sentAgoMin = lastSentAt > 0 ? Math.round((Date.now() - lastSentAt) / 60000) : 0;
+          if (sentAgoMin > 0) {
+            addLog('INFO', senderId, pageId, `⏭️ โหมดส่งตรง: ลูกค้าเพิ่งได้รับชุดสเต็ปไป ${sentAgoMin} นาทีก่อน (กันสแปม 30 นาที) → ให้ AI ตอบเฉพาะคำถามแทน ไม่ยิงชุดซ้ำ`, 'INFO');
+          } else if (consultantMode) {
+            addLog('INFO', senderId, pageId, `⏭️ โหมดส่งตรง: ลูกค้าเก่า (โหมดที่ปรึกษา) ยังไม่มีเจตนาซื้อใหม่ → ให้ AI ตอบตามบริบทแทน`, 'INFO');
+          }
         }
 
         if (seqOut.length > 0) {
@@ -6796,6 +6905,15 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
               `มีอะไรให้ช่วยเพิ่มเติมไหมคะ 😊 ${page.product?.product_name || matchedProduct.product_name}${aPackLine ? ` (${aPackLine})` : ''} — ถามเรื่องการใช้งาน วิธีดูแล หรือสเปกได้เลยนะคะ ยินดีตอบทุกคำถามค่ะ`
             ).map(t => ({ text: t } as InstantOutgoing[number]));
             addLog('AI_REPLY', senderId, pageId, `🤝 โหมดที่ปรึกษา + AI ตอบว่าง → ตอบสั้นแบบที่ปรึกษาจากข้อมูลจริง (ไม่พรีเซนสเต็ป)`, 'WARNING');
+          } else if (strictMode && hasConfiguredSteps(page)
+            && Date.now() - (configuredSequenceSentAt.get(seqStateKey) || 0) > seqTtlMs) {
+            // 🔒 โหมดส่งตรง: ห้าม "แต่งชุดเอง" — ส่งสเต็ปที่เจ้าของตั้งไว้ตรงตัวแทน
+            localOutgoing = buildConfiguredSequenceReply(page, intentHint);
+            addLog('AI_REPLY', senderId, pageId, `🔒 โหมดส่งตรง + AI ตอบว่าง → ส่งสเต็ปตามที่เจ้าของตั้งไว้ตรงตัว ${localOutgoing.length} ชุด (ไม่แต่งข้อความเอง)`, 'WARNING');
+          } else if (strictMode && hasConfiguredSteps(page)) {
+            // กันสแปม: ลูกค้าเพิ่งได้ชุดไป → ปิดการขายสั้น ๆ จากข้อมูลจริง ไม่ยิงชุดเต็มซ้ำ
+            localOutgoing = buildLocalClosingAsk(page, matchedProduct);
+            addLog('AI_REPLY', senderId, pageId, `🔒 โหมดส่งตรง + AI ตอบว่าง + ลูกค้าเพิ่งได้ชุดไป → ส่งข้อความปิดการขายสั้นแทน (ไม่ยิงชุดซ้ำ)`, 'WARNING');
           } else {
             localOutgoing = buildInstantSalesReply(page, matchedProduct, intentHint, resolveInstantImageMap(page, matchedProduct), messageText, senderId);
             addLog('AI_REPLY', senderId, pageId, `⚡ AI ตอบว่าง → Instant Engine พรีเซนเต็มชุดจากข้อมูลจริงใน DB ${localOutgoing.length} ข้อความ (ไม่เรียก AI ซ้ำ ไม่ให้ลูกค้ารอ)`, 'WARNING');
@@ -7465,16 +7583,25 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           if (await tryCreateLocalOrderFromMessage()) return;
 
           // 🤝 โหมดที่ปรึกษา: ห้ามพรีเซนสเต็ปใส่ลูกค้าที่ปิดการขายแล้ว — ตอบสั้นเชิญถามต่อ
+          // 🔒 โหมดส่งตรง (scope-local): บล็อกนี้อยู่นอก scope ของ strictMode หลัก → คำนวณซ้ำที่นี่
+          const fbStrict = isStrictSequenceMode(page) && hasConfiguredSteps(page);
+          const fbStrictTtlOk = Date.now() - (configuredSequenceSentAt.get(getSequenceSentKey(pageId, senderId)) || 0) > STRICT_SEQUENCE_TTL_MS;
           const fbParts: InstantOutgoing = recipientFallback
             ? [{ text: recipientFallback }]
             : consultantMode
             ? polishInstantText(
                 `มีอะไรให้ช่วยเพิ่มเติมไหมคะ 😊 ${page.product?.product_name || matchedProduct.product_name} — ถามเรื่องการใช้งาน วิธีดูแล หรือสเปกได้เลยนะคะ ยินดีตอบทุกคำถามค่ะ`
               ).map(t => ({ text: t } as InstantOutgoing[number]))
-            : buildInstantSalesReply(page, matchedProduct, intentHint, fbImgMap, messageText, senderId);
+            : (fbStrict
+              ? (fbStrictTtlOk
+                ? buildConfiguredSequenceReply(page, intentHint)
+                : buildLocalClosingAsk(page, matchedProduct))
+              : buildInstantSalesReply(page, matchedProduct, intentHint, fbImgMap, messageText, senderId));
           addLog('AI_REPLY', senderId, pageId, consultantMode
             ? `🤝 AI ล้มเหลว + โหมดที่ปรึกษา → ตอบสั้นแบบที่ปรึกษา (ไม่พรีเซนสเต็ป)`
-            : `⚡ AI ล้มเหลว → Instant Engine พรีเซนเต็มชุดจากข้อมูลจริง ${fbParts.length} ข้อความ (ไม่เรียก AI ซ้ำ ไม่ให้ลูกค้ารอ)`, 'WARNING');
+            : (fbStrict
+              ? `🔒 โหมดส่งตรง + AI ล้มเหลว → ส่งสเต็ป/ปิดการขายจากสิ่งที่เจ้าของตั้งไว้ ${fbParts.length} ชุด (ไม่แต่งข้อความเอง)`
+              : `⚡ AI ล้มเหลว → Instant Engine พรีเซนเต็มชุดจากข้อมูลจริง ${fbParts.length} ข้อความ (ไม่เรียก AI ซ้ำ ไม่ให้ลูกค้ารอ)`), 'WARNING');
           for (let fi = 0; fi < fbParts.length; fi++) {
             const fbMsg = fbParts[fi];
             // กันส่ง "รูปหลัก" ซ้ำ — instant ack แนบรูปหลักไปให้ลูกค้าแล้ว

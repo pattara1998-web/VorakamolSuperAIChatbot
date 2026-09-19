@@ -56,7 +56,12 @@ const tsCode = [
     const end = src.indexOf('];', start) + 2;
     return src.slice(start, end);
   })(),
-  extract('classifyIntentInstant'),
+    extract('classifyIntentInstant'),
+  extractConst('const GENERAL_QUESTION_INTENTS'),
+  extractConst('const PROMOTIONAL_INTENTS'),
+  extract('isGeneralQuestion'),
+  extract('isSpecialQuestion'),
+  extract('isPromotionalIntent'),
   extract('sanitizeCustomerFacingText'),
   extract('stripStartingPricePhrasing'),
   extract('splitLongOutgoingText'),
@@ -101,7 +106,10 @@ const tsCode = [
     return src.slice(start, end).replace(/\r?\n\s*$/, '\n');
   })(),
   extract('buildLocalClosingAsk'),
-  extract('buildLocalOrderInfoRequest')
+  extract('buildLocalOrderInfoRequest'),
+  extract('isStrictSequenceMode'),
+  extract('hasConfiguredSteps'),
+  extractConst('const STRICT_SEQUENCE_TTL_MS')
 ].join('\n');
 
 const jsCode = transformSync(tsCode, { loader: 'ts', format: 'cjs', target: 'node18' }).code;
@@ -110,9 +118,9 @@ if (process.env.DEBUG_TSCODE) {
   console.log('[DEBUG] DEFAULT_KEYWORD_TRIGGERS at tsCode lines:', hits, '| total chars', tsCode.length);
 }
 const {
-  buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger
+  buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger, isGeneralQuestion, isSpecialQuestion, isPromotionalIntent, isStrictSequenceMode, hasConfiguredSteps, STRICT_SEQUENCE_TTL_MS
 } = new Function(
-  `${jsCode}\nreturn { buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyInstantIntent: classifyIntentInstant, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger };`
+  `${jsCode}\nreturn { buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyInstantIntent: classifyIntentInstant, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger, isGeneralQuestion, isSpecialQuestion, isPromotionalIntent, isStrictSequenceMode, hasConfiguredSteps, STRICT_SEQUENCE_TTL_MS };`
 )();
 
 let pass = 0, fail = 0;
@@ -364,6 +372,35 @@ const kwCustomMiss = matchKeywordTrigger(kwCustomPage, 'มีโปรอะไ
 check('กฎเจ้าของไม่แมตช์ → ตกไปใช้ค่าเริ่มต้นได้ปกติ', kwCustomMiss && kwCustomMiss.stepNumbers.includes(3));
 const kwBlankRule = matchKeywordTrigger({ ...kwPage, keyword_triggers: [{ id: 'x', label: 'ว่าง', keywords: ['ทดสอบ'], step_numbers: [] }] }, 'ทดสอบค่ะ');
 check('กฎตั้งไว้แต่ไม่เลือกสเต็ป → ข้ามไปใช้ค่าเริ่มต้น (ไม่ค้าง)', kwBlankRule === null);
+
+// ── Intent Routing Helpers (Feature 3: AI Routing) ──
+// Verify the routing classification is correct so the Instant Sales Engine
+// only fires on genuine purchase/price/promo/shipping intents and stays quiet
+// on general questions (usage/specs/trust/greeting/followup).
+console.log('── Intent Routing Helpers ──');
+check('GREETING → general, not special', isGeneralQuestion('GREETING') && !isSpecialQuestion('GREETING') && !isPromotionalIntent('GREETING'));
+check('QUESTION → general, not special', isGeneralQuestion('QUESTION') && !isSpecialQuestion('QUESTION') && !isPromotionalIntent('QUESTION'));
+check('TRUST → general, not special', isGeneralQuestion('TRUST') && !isSpecialQuestion('TRUST') && !isPromotionalIntent('TRUST'));
+check('FOLLOWUP → general, not special', isGeneralQuestion('FOLLOWUP') && !isSpecialQuestion('FOLLOWUP') && !isPromotionalIntent('FOLLOWUP'));
+check('PURCHASE → special + promotional', isSpecialQuestion('PURCHASE') && isPromotionalIntent('PURCHASE') && !isGeneralQuestion('PURCHASE'));
+check('PRICE → special + promotional', isSpecialQuestion('PRICE') && isPromotionalIntent('PRICE') && !isGeneralQuestion('PRICE'));
+check('PROMOTION → special + promotional', isSpecialQuestion('PROMOTION') && isPromotionalIntent('PROMOTION') && !isGeneralQuestion('PROMOTION'));
+check('SHIPPING → special + promotional', isSpecialQuestion('SHIPPING') && isPromotionalIntent('SHIPPING') && !isGeneralQuestion('SHIPPING'));
+check('NEGOTIATION → special + promotional', isSpecialQuestion('NEGOTIATION') && isPromotionalIntent('NEGOTIATION') && !isGeneralQuestion('NEGOTIATION'));
+check('ORDER → neither general nor special (order-data path)', !isGeneralQuestion('ORDER') && !isSpecialQuestion('ORDER') && !isPromotionalIntent('ORDER'));
+check('sales seq intents 모두 promotional 아님 (GREETING/PRICE/PROMOTION/SHIPPING/NEGOTIATION만)', isPromotionalIntent('GREETING') === false && isPromotionalIntent('PRICE') === true && isPromotionalIntent('PROMOTION') === true && isPromotionalIntent('SHIPPING') === true && isPromotionalIntent('NEGOTIATION') === true && isPromotionalIntent('PURCHASE') === true);
+
+// ── 🔒 Strict Verbatim Mode ("ส่งสเต็ปตรงตามที่ตั้ง 100%") ──
+console.log('── Strict Verbatim Mode ──');
+check('STRICT_SEQUENCE_TTL_MS = 30 นาที (กันสแปมตามที่เจ้าของเลือก)', STRICT_SEQUENCE_TTL_MS === 30 * 60 * 1000);
+check('เปิด toggle (send_steps_verbatim: true) → isStrictSequenceMode = true', isStrictSequenceMode({ send_steps_verbatim: true }));
+check('ปิด toggle (send_steps_verbatim: false) → isStrictSequenceMode = false (ปิดได้จริง)', !isStrictSequenceMode({ send_steps_verbatim: false, sales_sequence_steps: [{ step_number: 1, text_content: 'สวัสดี' }] }));
+check('ไม่เคยตั้งค่า + ไม่มีสเต็ป / page null → isStrictSequenceMode = false', !isStrictSequenceMode({}) && !isStrictSequenceMode(null) && !isStrictSequenceMode({ sales_sequence_steps: [] }));
+check('ไม่เคยตั้งค่า + มีสเต็ป → เปิดโหมดส่งตรงอัตโนมัติ (default ตรงกับ toggle ใน UI)', isStrictSequenceMode({ sales_sequence_steps: [{ step_number: 1, text_content: 'สวัสดีค่ะ' }] }));
+check('มีสเต็ปข้อความ/รูป → hasConfiguredSteps = true', hasConfiguredSteps({ sales_sequence_steps: [{ step_number: 1, text_content: 'สวัสดีค่ะ' }, { step_number: 2, image_url: 'https://img.example/x.jpg' }] }));
+check('สเต็ปว่างทั้งหมด/ไม่มีสเต็ป → hasConfiguredSteps = false', !hasConfiguredSteps({ sales_sequence_steps: [{ step_number: 1, text_content: '', image_url: '' }] }) && !hasConfiguredSteps({ sales_sequence_steps: [] }) && !hasConfiguredSteps({}));
+check('โหมดส่งตรง: buildConfiguredSequenceReply ยังส่งสเต็ปตรงตัว (regression)', buildConfiguredSequenceReply(ownerPage, 'PURCHASE')[0].text === 'สวัสดีค่ะ ที่หั่นผักกะทัดรัด พกพาสะดวกค่ะ');
+check('โหมดส่งตรง fallback: buildLocalClosingAsk ยังปิดการขายด้วยการขอชื่อ-ที่อยู่-เบอร์ (ไม่พัง)', buildLocalClosingAsk(ownerPage, null).length >= 1 && /ชื่อ|ที่อยู่|เบอร์/.test(buildLocalClosingAsk(ownerPage, null).map(m => m.text).join(' ')));
 
 console.log(`\nสรุป: ผ่าน ${pass} / ไม่ผ่าน ${fail}`);
 process.exit(fail > 0 ? 1 : 0);

@@ -10,6 +10,7 @@ import { CommentModerationTab } from './components/CommentModerationTab';
 import { FollowUpEngineTab } from './components/FollowUpEngineTab';
 import { OrdersAndLineTab } from './components/OrdersAndLineTab';
 import { SystemDocsTab } from './components/SystemDocsTab';
+import { SystemSettingsTab } from './components/SystemSettingsTab';
 import { ChatInboxTab } from './components/ChatInboxTab';
 import { BroadcastTab } from './components/BroadcastTab';
 import { FacebookConnectModal } from './components/FacebookConnectModal';
@@ -902,6 +903,13 @@ export default function App() {
             pages={pages}
             selectedPageId={selectedPageId}
             theme={theme}
+          />
+        )}
+
+        {activeTab === 'system_settings' && (
+          <SystemSettingsTab
+            theme={theme}
+            onRefresh={() => fetchBackendData()}
           />
         )}
 

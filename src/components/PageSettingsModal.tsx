@@ -1118,6 +1118,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                       กรอก <strong>ข้อความขาย / จุดเด่น / ของแถม / ข้อความปิดการขาย</strong> และแนบ <strong>รูปภาพ</strong> ที่นี่ได้เลยค่ะ —
                       ระบบจะไม่ยิงข้อความเหล่านี้ซ้ำ ๆ ออกไปตรง ๆ อีก แต่ส่งเป็น <strong>"ข้อมูลความรู้"</strong> ให้ AI อ่านแล้ว
                       เรียบเรียงเป็นคำตอบของตัวเองตามที่ลูกค้าถาม เหมือนแอดมินจริงที่คุยกับลูกค้า (ส่วนรูปภาพ AI จะส่งเป็นภาพประกอบให้อัตโนมัติ)
+                      — หรือเปิด <strong>"โหมดส่งตรง"</strong> ด้านล่างเพื่อให้ระบบส่งข้อความ+รูปที่ตั้งไว้ตรงตัว 100%
                     </p>
                   </div>
                 </div>
@@ -1130,6 +1131,27 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
                   <Plus className="w-4 h-4" />
                   <span>+ เพิ่มชุดข้อมูลให้ AI</span>
                 </button>
+              </div>
+
+              {/* 🔒 Strict Verbatim Mode Toggle ("ส่งสเต็ปตรงตามที่ตั้ง 100%") */}
+              <div className="flex items-center justify-between p-3.5 bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800/80 rounded-lg">
+                <div className="pr-3">
+                  <span className="text-xs font-semibold text-slate-900 dark:text-zinc-200 block">ส่งสเต็ปตรงตามที่ตั้งไว้ 100% (โหมดส่งตรง)</span>
+                  <span className="text-[11px] text-slate-500 dark:text-zinc-400 block leading-relaxed">
+                    <strong className="text-slate-600 dark:text-zinc-300">เปิด:</strong> ลูกค้าแสดงเจตนาขาย (สนใจ/ถามราคา/โปรโมชั่น/ค่าส่ง) → ระบบส่งข้อความ+รูปที่คุณตั้งไว้ตรงตัว ไม่ให้ AI เรียบเรียงใหม่ • คำถามทั่วไปยังให้ AI ตอบ • กันสแปม: ลูกค้าเดิมทักซ้ำใน 30 นาที → ให้ AI ตอบแทน ไม่ยิงชุดซ้ำ
+                    <br />
+                    <strong className="text-slate-600 dark:text-zinc-300">ปิด:</strong> AI ใช้ข้อมูลนี้เป็น "ความรู้" แล้วเรียบเรียงคำตอบเอง
+                  </span>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                  <input
+                    type="checkbox"
+                    checked={formData.send_steps_verbatim ?? (formData.sales_sequence_steps || []).some((s: any) => String(s?.text_content || '').trim() || String(s?.image_url || '').trim())}
+                    onChange={e => setFormData(prev => ({ ...prev, send_steps_verbatim: e.target.checked }))}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500"></div>
+                </label>
               </div>
 
               {/* Dynamic Steps List */}

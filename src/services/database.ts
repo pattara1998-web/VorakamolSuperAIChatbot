@@ -124,6 +124,7 @@ async function initTables() {
       rate_limit_per_hour INTEGER DEFAULT 30,
       quick_replies TEXT DEFAULT '[]',
       sales_sequence_auto_trigger INTEGER DEFAULT 0,
+      send_steps_verbatim INTEGER DEFAULT 0,
       cod_summary_template TEXT DEFAULT '',
       cod_summary_fields TEXT DEFAULT '',
       product TEXT DEFAULT '{}',
@@ -324,6 +325,9 @@ async function initTables() {
     ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS followup_level INTEGER DEFAULT 0;
     ALTER TABLE conversation_state ADD COLUMN IF NOT EXISTS followup_at TEXT;
 
+    -- 🔒 Strict Verbatim Mode ("ส่งสเต็ปตรงตามที่ตั้ง 100%"): ฐานข้อมูลเก่าอาจยังไม่มีคอลัมน์นี้
+    ALTER TABLE pages ADD COLUMN IF NOT EXISTS send_steps_verbatim INTEGER DEFAULT 0;
+
     ALTER TABLE products ADD COLUMN IF NOT EXISTS cost_price DOUBLE PRECISION DEFAULT 0;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS shipping_cost DOUBLE PRECISION DEFAULT 0;
     -- Promotion Packages + Shipping Matrix: ฐานข้อมูลเก่าที่สร้างก่อนหน้ายังไม่มีคอลัมน์เหล่านี้
@@ -479,6 +483,7 @@ export interface DbPage {
   rate_limit_per_hour: number;
   quick_replies: string;
   sales_sequence_auto_trigger: number;
+  send_steps_verbatim: number;
   cod_summary_template: string;
   cod_summary_fields: string;
   product: string;
@@ -493,7 +498,7 @@ export interface DbPage {
 }
 
 const PAGE_JSON_FIELDS = ['toxic_keywords', 'purchase_keywords', 'comment_reply_images', 'followup_messages', 'quick_replies', 'product', 'sequence', 'sales_sequence_steps', 'keyword_triggers', 'cod_summary_fields'];
-const PAGE_BOOL_FIELDS = ['is_active', 'auto_reply', 'auto_close_ai', 'ai_brevity_mode', 'scrape_comments_enabled', 'auto_inbox_with_comment_context', 'hide_toxic_comments', 'comment_auto_tag_customer', 'followup_enabled', 'bot_stopped', 'sales_sequence_auto_trigger', 'is_connected'];
+const PAGE_BOOL_FIELDS = ['is_active', 'auto_reply', 'auto_close_ai', 'ai_brevity_mode', 'scrape_comments_enabled', 'auto_inbox_with_comment_context', 'hide_toxic_comments', 'comment_auto_tag_customer', 'followup_enabled', 'bot_stopped', 'sales_sequence_auto_trigger', 'send_steps_verbatim', 'is_connected'];
 
 export async function getAllPages(): Promise<DbPage[]> {
   const res = await q('SELECT * FROM pages ORDER BY updated_at DESC');
@@ -1191,6 +1196,7 @@ export function dbPageToPageConfig(row: DbPage): any {
     rate_limit_per_hour: row.rate_limit_per_hour,
     quick_replies: parseJson(row.quick_replies, []),
     sales_sequence_auto_trigger: Boolean(row.sales_sequence_auto_trigger),
+    send_steps_verbatim: Boolean(row.send_steps_verbatim),
     cod_summary_template: row.cod_summary_template,
     cod_summary_fields: parseJson(row.cod_summary_fields, ''),
     product: parseJson(row.product, {}),

@@ -321,6 +321,14 @@ export interface PageConfig {
   // Sales Sequence auto-trigger: fire immediately on first message or "สนใจ"
   sales_sequence_auto_trigger?: boolean;
 
+  // 🔒 Strict Verbatim Mode ("ส่งสเต็ปตรงตามที่ตั้ง 100%"):
+  // - เจตนาขาย (PURCHASE/PRICE/PROMOTION/SHIPPING/NEGOTIATION/GREETING/TRUST) →
+  //   ส่งข้อความ+รูปจาก sales_sequence_steps ตรงตัว 1:1 (ไม่ให้ AI เรียบเรียงใหม่,
+  //   ไม่ใช้ fallback แต่งชุดเอง buildInstantSalesReply)
+  // - คำถามทั่วไป (QUESTION) → AI ตอบตามปกติ
+  // - กันสแปม 30 นาที: ลูกค้าที่เพิ่งได้ชุดไป → ให้ AI ตอบแทน ไม่ยิงชุดซ้ำ
+  send_steps_verbatim?: boolean;
+
   // COD Order Summary Format & Selected Fields
   cod_summary_template?: string;
   cod_summary_fields?: CodSummaryFieldsConfig;

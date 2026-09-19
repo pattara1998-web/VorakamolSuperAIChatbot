@@ -29,6 +29,10 @@ export interface DatabaseStore {
     lmStudioBaseUrl?: string;
     lmStudioModel?: string;
     aiSettingsUpdatedAt?: string;
+    // System-wide default reply delay in ms (0 = instant). A page's own
+    // `reply_delay_ms` takes priority at send-time — see resolvePageDelay().
+    reply_delay_ms?: number;
+    settingsUpdatedAt?: string;
   };
 }
 
@@ -110,6 +114,15 @@ export async function loadFromDatabase(db: DatabaseStore): Promise<boolean> {
       db.settings.geminiApiKeyUpdatedAt = geminiUpdatedAt;
     }
 
+    // System-wide defaults
+    const replyDelayMs = await dbService.getSetting('reply_delay_ms');
+    if (replyDelayMs !== null) {
+      const n = Number(replyDelayMs);
+      if (Number.isFinite(n) && n >= 0 && n <= 30000) db.settings.reply_delay_ms = n;
+    }
+    const settingsUpdatedAt = await dbService.getSetting('settings_updatedAt');
+    if (settingsUpdatedAt) db.settings.settingsUpdatedAt = settingsUpdatedAt;
+
     // Multi-provider AI settings
     for (const key of PROVIDER_SETTING_KEYS) {
       const val = await dbService.getSetting(`ai_${key}`);
@@ -172,6 +185,12 @@ export async function saveToDatabase(db: DatabaseStore): Promise<void> {
     }
     if (db.settings.geminiApiKeyUpdatedAt) {
       await dbService.setSetting('gemini_apiKeyUpdatedAt', db.settings.geminiApiKeyUpdatedAt);
+    }
+    if (typeof db.settings.reply_delay_ms === 'number' && db.settings.reply_delay_ms > 0) {
+      await dbService.setSetting('reply_delay_ms', String(db.settings.reply_delay_ms));
+    }
+    if (db.settings.settingsUpdatedAt) {
+      await dbService.setSetting('settings_updatedAt', db.settings.settingsUpdatedAt);
     }
 
     // Multi-provider AI settings
@@ -246,6 +265,7 @@ export function flattenPage(page: PageConfig): Record<string, any> {
     rate_limit_per_hour: page.rate_limit_per_hour ?? 30,
     quick_replies: JSON.stringify(page.quick_replies || []),
     sales_sequence_auto_trigger: page.sales_sequence_auto_trigger ? 1 : 0,
+    send_steps_verbatim: page.send_steps_verbatim ? 1 : 0,
     cod_summary_template: page.cod_summary_template || '',
     cod_summary_fields: typeof page.cod_summary_fields === 'string' ? page.cod_summary_fields : JSON.stringify(page.cod_summary_fields || ''),
     product: JSON.stringify(page.product || {}),

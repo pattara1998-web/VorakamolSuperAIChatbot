@@ -19,6 +19,7 @@ import {
   Sparkles,
   Layers,
   Settings,
+  Settings as SettingsIcon,
   Trophy,
   Sun,
   Moon,
@@ -104,6 +105,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   const navItems: Array<{id: string, label: string, icon: any, badge?: string, count?: number, iconColor?: string}> = [
     { id: 'pages_hub', label: 'ศูนย์รวมเพจ (Pages Hub)', icon: Layers, iconColor: 'text-blue-500' },
     { id: 'chat_inbox', label: 'แชท Inbox 💬', icon: Inbox, iconColor: 'text-cyan-500' },
+    { id: 'system_settings', label: 'ตั้งค่าระบบ (System Settings)', icon: Settings, iconColor: 'text-slate-500' },
     { id: 'broadcast', label: 'Broadcast ลูกค้า 📣', icon: Megaphone, iconColor: 'text-orange-500' },
     { id: 'dashboard', label: 'แดชบอร์ด & ยอดขาย', icon: LayoutDashboard, badge: 'PRO', iconColor: 'text-indigo-500' },
     ...(isFacebookConnected ? [] : [{ id: 'simulator', label: 'จำลองแชท AI ปิดการขาย', icon: MessageSquare, badge: 'TEST', iconColor: 'text-emerald-500' } as any]),
