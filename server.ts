@@ -429,6 +429,16 @@ function buildOwnerPreparedData(page: any): string {
   }
 
   const prod = page?.product || {};
+  // 📋 ราคา/แพ็กจริงจาก DB — ต้องมาก่อนเสมอ ให้ AI มีราคาใช้แม้สเต็ปถูกกรองออก
+  // (ต้นเหตุ "ถามราคาเท่าไหร่" แล้ว AI ตอบว่าง: ราคาอยู่ท้าย prompt ถูก BANNED guard ตัดทิ้งหมด)
+  const priceSnapshot = resolveProductPricing(page, null);
+  if (priceSnapshot.packs.length > 0) {
+    push(`- ราคาแพ็กจริง: ${priceSnapshot.packs.map(p => `${p.name} ฿${p.price.toLocaleString()}${p.free_shipping ? ' (ส่งฟรี)' : ''}`).join(' | ')}`);
+  } else if (priceSnapshot.sale > 0) {
+    push(`- ราคาขายจริง: ฿${priceSnapshot.sale.toLocaleString()}`);
+  }
+  if (String(prod.product_name || '').trim()) push(`- ชื่อสินค้า: ${prod.product_name}`);
+  if (String(prod.description || '').trim()) push(`- รายละเอียดสินค้า: ${String(prod.description).slice(0, 400)}`);
   const extraKnowledge = [
     prod.custom_specs,
     prod.specs?.custom_specs,
@@ -655,18 +665,15 @@ function compactSpecText(specs: string): string {
 }
 // ---------------------------------------------------------------------------
 // 🚫 BANNED PRODUCT GUARD (single source of truth)
-// ปัญหาจริง: ข้อความขายสินค้าเก่าที่ถูกยกเลิก ("กล่องตัดยา พกพาง่าย 💊 ... โปรอยู่ ฿990")
-// ยังหลุดไปถึงลูกค้าซ้ำ ๆ ทั้งที่โค้ด/ฐานข้อมูลในเครื่องไม่มีข้อความนี้แล้ว
-// ต้นเหตุ 2 ทาง: (1) ข้อมูลสินค้า/สเต็ปเก่าค้างในฐานข้อมูล Production (2) AI อ่าน
-// ประวัติแชทเก่าแล้ว "พูดเลียนแบบ" (parrot) ข้อความเดิมกลับมา
+// ปัญหาเดิม: ข้อความขายสินค้าเก่าที่ถูกยกเลิกราคา ("โปรอยู่ ฿990") ยังหลุดไปถึงลูกค้าซ้ำ ๆ
+// ทั้งที่ไม่มีในฐานข้อมูลเครื่องแล้ว — ต้นเหตุ 2 ทาง: (1) ข้อมูลสินค้า/สเต็ปเก่าค้างใน
+// ฐานข้อมูล Production (2) AI อ่านประวัติแชทเก่าแล้ว "พูดเลียนแบบ" (parrot) ข้อความเดิมกลับมา
 // การ์ดนี้จึงมี 3 ชั้น: กรองที่จุดส่งจริงทุกช่องทาง + ห้าม AI พูดถึงใน prompt
 // + เครื่องมือล้างข้อมูล (endpoint /api/admin/purge-banned-product + สคริปต์)
 // รายการคำแบนเพิ่ม/ลดได้ และถูกเก็บถาวรใน data/banned-product-phrases.json
 // ---------------------------------------------------------------------------
 const BANNED_PHRASES_FILE = process.env.BANNED_PHRASES_FILE || path.join(process.cwd(), 'data', 'banned-product-phrases.json');
 const DEFAULT_BANNED_PRODUCT_PHRASES = [
-  'กล่องตัดยา',
-  'ตัดยา พกพาง่าย',
   'โปรอยู่ 990',
   'พกพาง่าย 990',
   'สเปกหรือโปรโมชั่นเพิ่มแจ้งได้เลย'
@@ -6981,9 +6988,12 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             localOutgoing = buildConfiguredSequenceReply(page, intentHint);
             addLog('AI_REPLY', senderId, pageId, `🔒 โหมดส่งตรง + AI ตอบว่าง → ส่งสเต็ปตามที่เจ้าของตั้งไว้ตรงตัว ${localOutgoing.length} ชุด (ไม่แต่งข้อความเอง)`, 'WARNING');
           } else if (strictMode && hasConfiguredSteps(page)) {
-            // คำถามอื่น + AI ตอบว่าง → ปิดการขายสั้น 1 ข้อความ (ไม่ดัมพ์ตารางแพ็กทั้งชุด)
-            localOutgoing = [{ text: 'สนใจรับเป็นชุดไหนดีคะ 😊 แจ้งชื่อ-ที่อยู่-เบอร์โทรได้เลยนะคะ เดี๋ยวแอดมินสรุปยอดให้ค่ะ' }];
-            addLog('AI_REPLY', senderId, pageId, `🔒 โหมดส่งตรง + AI ตอบว่าง → ปิดการขายสั้น 1 ข้อความ (ไม่ดัมพ์ตารางแพ็ก)`, 'WARNING');
+            // คำถามอื่น (ราคา/โปร/ส่งฟรี/รายละเอียด...) + AI ตอบว่าง:
+            // ตอบจากข้อมูลจริงใน DB ทันที ผ่าน buildInstantSalesReply (ราคาแพ็ก/โปร/ค่าส่ง/รายละเอียดสินค้า)
+            // แทนข้อความปิดการขายเพียว ๆ ที่ไม่ตอบคำถามลูกค้าเลย
+            // (ต้นเหตุ: "ถามราคาเท่าไหร่" กลับได้ "สนใจรับเป็นชุดไหนดีคะ" โดยไม่มีราคา)
+            localOutgoing = buildInstantSalesReply(page, matchedProduct, intentHint, resolveInstantImageMap(page, matchedProduct), messageText, senderId);
+            addLog('AI_REPLY', senderId, pageId, `🔒 โหมดส่งตรง + AI ตอบว่าง → ตอบคำถามจากข้อมูลจริงใน DB ${localOutgoing.length} ข้อความ (ไม่ยิงปิดการขายเพียว ๆ)`, 'WARNING');
           } else {
             localOutgoing = buildInstantSalesReply(page, matchedProduct, intentHint, resolveInstantImageMap(page, matchedProduct), messageText, senderId);
             addLog('AI_REPLY', senderId, pageId, `⚡ AI ตอบว่าง → Instant Engine พรีเซนเต็มชุดจากข้อมูลจริงใน DB ${localOutgoing.length} ข้อความ (ไม่เรียก AI ซ้ำ ไม่ให้ลูกค้ารอ)`, 'WARNING');
@@ -7643,7 +7653,8 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
 
           // 🤝 โหมดที่ปรึกษา: ห้ามพรีเซนสเต็ปใส่ลูกค้าที่ปิดการขายแล้ว — ตอบสั้นเชิญถามต่อ
           // 🔒 โหมดส่งตรง (scope-local): บล็อกนี้อยู่นอก scope ของ strictMode หลัก → คำนวณซ้ำที่นี่
-          // กฎ: "สนใจ" (PURCHASE) → ส่งสเต็ปตรงตัว / คำถามอื่น → ปิดการขายสั้น 1 ข้อความ (ไม่ดัมพ์ตารางแพ็ก)
+          // กฎ: "สนใจ" (PURCHASE) → ส่งสเต็ปตรงตัว / คำถามอื่น → ตอบจากข้อมูลจริงใน DB
+          // (ต้นเหตุ: "ถามราคาเท่าไหร่" กลับได้ "สนใจรับเป็นชุดไหนดีคะ" โดยไม่มีราคา)
           const fbStrict = isStrictSequenceMode(page) && hasConfiguredSteps(page);
           const fbIsPurchase = intentHint === 'PURCHASE';
           const fbParts: InstantOutgoing = recipientFallback
@@ -7655,7 +7666,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             : (fbStrict
               ? (fbIsPurchase
                 ? buildConfiguredSequenceReply(page, intentHint)
-                : [{ text: 'สนใจรับเป็นชุดไหนดีคะ 😊 แจ้งชื่อ-ที่อยู่-เบอร์โทรได้เลยนะคะ เดี๋ยวแอดมินสรุปยอดให้ค่ะ' }])
+                : buildInstantSalesReply(page, matchedProduct, intentHint, fbImgMap, messageText, senderId))
               : buildInstantSalesReply(page, matchedProduct, intentHint, fbImgMap, messageText, senderId));
           addLog('AI_REPLY', senderId, pageId, consultantMode
             ? `🤝 AI ล้มเหลว + โหมดที่ปรึกษา → ตอบสั้นแบบที่ปรึกษา (ไม่พรีเซนสเต็ป)`

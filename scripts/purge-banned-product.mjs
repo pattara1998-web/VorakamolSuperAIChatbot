@@ -24,8 +24,6 @@ import fs from 'fs';
 import path from 'path';
 
 const DEFAULT_BANNED_PRODUCT_PHRASES = [
-  'กล่องตัดยา',
-  'ตัดยา พกพาง่าย',
   'โปรอยู่ 990',
   'พกพาง่าย 990',
   'สเปกหรือโปรโมชั่นเพิ่มแจ้งได้เลย'
