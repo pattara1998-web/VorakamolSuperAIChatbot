@@ -3648,7 +3648,7 @@ async function startServer() {
   app.get('/api/health', (req: Request, res: Response) => {
     res.json({
       status: 'ok',
-      version: '2.9.0-strict-purchase',
+      version: '2.9.1-image-fix',
       uptime: process.uptime(),
       connected_pages: db.pages.filter(p => p.is_active).length,
       total_products: db.amulet.length + db.china.length + db.otop.length + db.agriculture.length,
