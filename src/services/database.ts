@@ -327,6 +327,10 @@ async function initTables() {
 
     -- 🔒 Strict Verbatim Mode ("ส่งสเต็ปตรงตามที่ตั้ง 100%"): ฐานข้อมูลเก่าอาจยังไม่มีคอลัมน์นี้
     ALTER TABLE pages ADD COLUMN IF NOT EXISTS send_steps_verbatim INTEGER DEFAULT 0;
+    -- 🔧 แก้บั๊ก: ALTER TABLE ... DEFAULT 0 จะใส่ 0 ให้ "แถวเดิมทุกแถว" ทำให้โหมดส่งตรง
+    -- ถูกปิดเองทั้งระบบทั้งที่เจ้าของไม่ได้ปิด → backfill: เพจไหนมีสเต็ปตั้งไว้ = เปิดให้อัตโนมัติ
+    UPDATE pages SET send_steps_verbatim = 1
+    WHERE sales_sequence_steps IS NOT NULL AND sales_sequence_steps != '[]' AND sales_sequence_steps != '';
 
     ALTER TABLE products ADD COLUMN IF NOT EXISTS cost_price DOUBLE PRECISION DEFAULT 0;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS shipping_cost DOUBLE PRECISION DEFAULT 0;

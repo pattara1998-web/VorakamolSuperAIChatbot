@@ -159,7 +159,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
   const originalPageIdRef = React.useRef(page?.page_id);
 
   const [activeSubTab, setActiveSubTab] = useState<
-    'ai_persona' | 'sales_sequence' | 'comments' | 'followup' | 'detailed_specs' | 'product_promos' | 'cod_summary' | 'notifications' | 'facebook' | 'bot_settings' | 'chat_buttons'
+    'ai_persona' | 'sales_sequence' | 'comments' | 'followup' | 'detailed_specs' | 'product_detail' | 'product_promos' | 'cod_summary' | 'notifications' | 'facebook' | 'bot_settings' | 'chat_buttons'
   >('ai_persona');
 
   // Detect current theme from <html> class (App.tsx syncs it with the theme state)
@@ -656,6 +656,18 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
     });
   };
 
+  // 📋 ฟอร์มรายละเอียดสินค้าแบบละเอียด (product.detail) — เก็บใน JSON product เดิม
+  // AI จะดึงข้อมูลจากฟอร์มนี้ไปตอบลูกค้า (ผ่าน buildOwnerPreparedData ฝั่ง server)
+  const handleUpdateDetail = (key: string, value: any) => {
+    setFormData(prev => ({
+      ...prev,
+      product: {
+        ...prev.product,
+        detail: { ...(prev.product?.detail || {}), [key]: value }
+      }
+    }));
+  };
+
   const handleSave = async () => {
     if (formData.is_active && formData.auto_reply) {
       try {
@@ -989,6 +1001,7 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
             { id: 'comments', label: '3. ตอบคอมเมนต์ + รูป 6 ใบ', icon: MessageSquare },
             { id: 'followup', label: '4. ปรับเวลาติดตามออเดอร์', icon: Clock },
             { id: 'detailed_specs', label: '5. ข้อมูลสินค้าละเอียด & ขนส่ง 🚚', icon: FileText },
+            { id: 'product_detail', label: '5b. ฟอร์มรายละเอียดสินค้าให้ AI 📋', icon: FileText },
             { id: 'product_promos', label: '6. แพ็กเกจโปรโมชั่น (ราคา/แถม)', icon: ShoppingBag },
             { id: 'cod_summary', label: '7. ระบบสรุปยอดลูกค้า (COD)', icon: Copy },
             { id: 'notifications', label: '8. ส่งสรุปไป Telegram / LINE', icon: Bell },
@@ -2392,6 +2405,78 @@ export const PageSettingsModal: React.FC<PageSettingsModalProps> = ({
               </div>
             </div>
           )}
+
+          {/* TAB 5b: PRODUCT DETAIL FORM (ให้ AI ใช้ตอบลูกค้า) */}
+          {activeSubTab === 'product_detail' && (() => {
+            const det = formData.product?.detail || {};
+            const inputCls = "w-full bg-slate-50 dark:bg-[#16161C] border border-slate-200 dark:border-zinc-800 rounded-lg p-2.5 text-xs text-slate-900 dark:text-zinc-100 focus:border-indigo-500 outline-none leading-relaxed";
+            return (
+              <div className="space-y-5">
+                <div className="bg-emerald-50/70 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-800/40 rounded-xl p-4 flex items-start gap-3">
+                  <Info className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+                  <div className="text-xs text-emerald-900 dark:text-emerald-300 space-y-1">
+                    <p className="font-bold">ฟอร์มรายละเอียดสินค้าแบบละเอียด (AI จะดึงจากข้อมูลนี้ไปตอบลูกค้า)</p>
+                    <p className="text-slate-600 dark:text-zinc-400 leading-relaxed">
+                      กรอกให้ครบเท่าที่มี — AI จะตอบคำถามลูกค้า (สเปค วิธีใช้ การันตี ส่งฟรี ฯลฯ) จากข้อมูลจริงในฐานข้อมูลตรงนี้เท่านั้น ไม่เดา ไม่แต่งเอง
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-zinc-300 block">✨ จุดเด่น / ข้อความขาย (1 บรรทัด = 1 จุดเด่น)</label>
+                  <textarea rows={4} className={inputCls}
+                    value={(det.selling_points || []).join('\n')}
+                    onChange={e => handleUpdateDetail('selling_points', e.target.value.split('\n').map((s: string) => s.trim()).filter(Boolean))}
+                    placeholder={'ตัดเม็ดยาได้แม่นยำ ไม่แตกเละ\nพลาสติก ABS ทนทาน ใบมีดสแตนเลสไม่เป็นสนิม\nขนาดเล็ก พกพาสะดวก'} />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-zinc-300 block">📐 สเปค / วัสดุ / ขนาด</label>
+                  <textarea rows={3} className={inputCls} value={det.material_specs || ''} onChange={e => handleUpdateDetail('material_specs', e.target.value)} placeholder="เช่น พลาสติก ABS แข็งแรง ขนาด 7x4 ซม. ใบมีดสแตนเลสคุณภาพสูง" />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-zinc-300 block">📖 วิธีใช้งาน</label>
+                  <textarea rows={3} className={inputCls} value={det.usage_guide || ''} onChange={e => handleUpdateDetail('usage_guide', e.target.value)} placeholder="เช่น วางเม็ดยาในช่อง กดฝาลงเบา ๆ เม็ดยาจะถูกหั่นตรงเส้น" />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-zinc-300 block">👤 เหมาะกับใคร</label>
+                  <textarea rows={2} className={inputCls} value={det.suitable_for || ''} onChange={e => handleUpdateDetail('suitable_for', e.target.value)} placeholder="เช่น ผู้สูงอายุ ผู้ที่ต้องแบ่งยาทุกวัน คนที่กินยาหลายชนิด" />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-zinc-300 block">⚠️ ข้อควรระวัง</label>
+                  <textarea rows={2} className={inputCls} value={det.cautions || ''} onChange={e => handleUpdateDetail('cautions', e.target.value)} placeholder="เช่น เก็บพ้นมือเด็ก ระวังใบมีดคม" />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-zinc-300 block">⭐ การรับประกัน / การันตี</label>
+                  <textarea rows={2} className={inputCls} value={det.guarantee || ''} onChange={e => handleUpdateDetail('guarantee', e.target.value)} placeholder="เช่น การันตีของถึงมือ ส่งจริง 100% เสียหายเปลี่ยนใหม่ฟรี" />
+                </div>
+
+                <div className="space-y-3 border border-slate-200 dark:border-zinc-800 rounded-xl p-4">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold text-slate-700 dark:text-zinc-300">💬 คำถามที่พบบ่อย (FAQ)</label>
+                    <button type="button" onClick={() => handleUpdateDetail('faq', [...(det.faq || []), { q: '', a: '' }])} className="text-[11px] font-bold text-indigo-600 dark:text-indigo-400 hover:underline cursor-pointer">+ เพิ่มคำถาม</button>
+                  </div>
+                  {(det.faq || []).length === 0 && (
+                    <p className="text-[11px] text-slate-400 dark:text-zinc-500">ยังไม่มี FAQ — เพิ่มคู่คำถาม-คำตอบที่ลูกค้าถามบ่อย เช่น "ส่งฟรีไหม" → AI จะตอบตามนี้เสมอ</p>
+                  )}
+                  {(det.faq || []).map((f, i) => (
+                    <div key={i} className="grid grid-cols-1 sm:grid-cols-2 gap-2 items-start bg-white dark:bg-[#121216] border border-slate-200 dark:border-zinc-800 rounded-lg p-2.5">
+                      <input type="text" className={inputCls} value={f.q || ''} onChange={e => { const next = [...(det.faq || [])]; next[i] = { ...next[i], q: e.target.value }; handleUpdateDetail('faq', next); }} placeholder={`คำถามที่ ${i + 1} เช่น ส่งฟรีไหม`} />
+                      <div className="flex gap-2">
+                        <input type="text" className={inputCls} value={f.a || ''} onChange={e => { const next = [...(det.faq || [])]; next[i] = { ...next[i], a: e.target.value }; handleUpdateDetail('faq', next); }} placeholder="คำตอบ (AI จะใช้ตรงนี้)" />
+                        <button type="button" onClick={() => handleUpdateDetail('faq', (det.faq || []).filter((_, j) => j !== i))} className="text-[11px] text-red-500 hover:text-red-600 px-2 shrink-0 cursor-pointer">ลบ</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <p className="text-[11px] text-slate-400 dark:text-zinc-500">อย่าลืมกด "บันทึกการตั้งค่า" เพื่อเก็บข้อมูลลงฐานข้อมูล — AI จะเริ่มใช้ข้อมูลนี้ทันทีหลังบันทึก</p>
+              </div>
+            );
+          })()}
 
           {/* TAB 6: PROMOTION TIERS */}
           {activeSubTab === 'product_promos' && (

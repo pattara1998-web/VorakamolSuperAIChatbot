@@ -221,6 +221,28 @@ export interface PageProductConfig {
   promo_price_3?: number;
   promo_description?: string;
   attributes?: Record<string, string>; // e.g. temple, master, material, size, weight
+
+  // 📋 ฟอร์มรายละเอียดสินค้าแบบละเอียด — AI ดึงข้อมูลนี้จาก DB ไปตอบลูกค้า
+  // (เก็บในคอลัมน์ product JSON เดิม → ไม่ต้อง migrate ตาราง)
+  detail?: ProductDetailForm;
+}
+
+/** ฟอร์มรายละเอียดสินค้าแบบละเอียด (แท็บ 5b ในตั้งค่าเพจ) */
+export interface ProductDetailForm {
+  /** ✨ จุดเด่น / ข้อความขาย (หลายรายการ) */
+  selling_points?: string[];
+  /** 📐 สเปค / วัสดุ / ขนาด */
+  material_specs?: string;
+  /** 📖 วิธีใช้งาน */
+  usage_guide?: string;
+  /** 👤 เหมาะกับใคร */
+  suitable_for?: string;
+  /** ⚠️ ข้อควรระวัง */
+  cautions?: string;
+  /** ⭐ การรับประกัน / การันตี */
+  guarantee?: string;
+  /** 💬 คำถามที่พบบ่อย (คู่คำถาม-คำตอบ) */
+  faq?: Array<{ q: string; a: string }>;
 }
 
 export interface CodSummaryFieldsConfig {

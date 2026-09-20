@@ -438,6 +438,23 @@ function buildOwnerPreparedData(page: any): string {
   ].map(v => String(v || '').trim()).filter(Boolean);
   for (const t of extraKnowledge) push(`- ${t}`);
 
+  // 📋 ฟอร์มรายละเอียดสินค้าแบบละเอียด (product.detail) — ข้อมูลมีโครงชัดเจน
+  // AI ตอบคำถามลูกค้า (สเปค/วิธีใช้/การันตี/ค่าส่ง) จากข้อมูลจริงนี้เป็นหลัก
+  const det = (prod as any).detail || {};
+  if (Array.isArray(det.selling_points) && det.selling_points.some((s: any) => String(s || '').trim())) {
+    push(`- จุดเด่นสินค้า: ${det.selling_points.map((s: any) => String(s || '').trim()).filter(Boolean).join(' | ')}`);
+  }
+  if (String(det.material_specs || '').trim()) push(`- สเปค/วัสดุ/ขนาด: ${det.material_specs}`);
+  if (String(det.usage_guide || '').trim()) push(`- วิธีใช้งาน: ${det.usage_guide}`);
+  if (String(det.suitable_for || '').trim()) push(`- เหมาะกับใคร: ${det.suitable_for}`);
+  if (String(det.cautions || '').trim()) push(`- ข้อควรระวัง: ${det.cautions}`);
+  if (String(det.guarantee || '').trim()) push(`- การรับประกัน/การันตี: ${det.guarantee}`);
+  if (Array.isArray(det.faq)) {
+    for (const f of det.faq) {
+      if (f && String(f.q || '').trim() && String(f.a || '').trim()) push(`- คำถามที่พบบ่อย: ${f.q} → คำตอบ: ${f.a}`);
+    }
+  }
+
   return lines.join('\n');
 }
 
@@ -1151,18 +1168,19 @@ let instantAckRotation = 0;
 
 // (1) ทักทายทันที + รูปหลัก — ส่งก่อนเรียก AI เสมอ ลูกค้าได้คำตอบ <2 วิ
 function buildInstantAck(page: any, intentHint: IntentHint, matchedProduct?: any): InstantOutgoing {
-  const adminName = String(page?.admin_name || '').trim();
+  // (โหมดส่งตรง) ไม่ใช้ admin_name ในข้อความทักทายแล้ว — ชื่อแอดมินที่เจ้าของตั้งผิด/เป็นชื่อเพจ
+  // จะโผล่เป็นข้อความแปลก ๆ ในแชท เช่น "เพจหนังมันดูทั้งคืนดูแลเองค่ะ" → ใช้ "แอดมิน" เสมอ
   const productName = String(page?.product?.product_name || matchedProduct?.product_name || page?.page_name || '').trim();
   const imgMap = resolveInstantImageMap(page, matchedProduct);
   const out: InstantOutgoing = [];
 
   // ลูกค้าส่งข้อมูลสั่งซื้อ → รับทราบสั้น ๆ (ห้ามทักทายใหม่/ห้ามแนบรูป — AI จะสรุปยอดต่อ)
   if (intentHint === 'ORDER') {
-    for (const t of polishInstantText(`รับทราบค่ะ 🙏 เดี๋ยว${adminName || 'แอดมิน'}ตรวจสอบข้อมูลแล้วสรุปยอดให้เลยค่ะ`)) out.push({ text: t });
+    for (const t of polishInstantText(`รับทราบค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบข้อมูลแล้วสรุปยอดให้เลยค่ะ`)) out.push({ text: t });
     return out;
   }
 
-  const who = adminName ? `${adminName}ดูแลเองค่ะ` : 'แอดมินดูแลเองค่ะ';
+  const who = 'แอดมินดูแลเองค่ะ';
   const variants = [
     `สวัสดีค่ะ 🙏 ${who}`,
     `หวัดดีค่ะ 😊 ${who}`,
@@ -3630,6 +3648,7 @@ async function startServer() {
   app.get('/api/health', (req: Request, res: Response) => {
     res.json({
       status: 'ok',
+      version: '2.9.0-strict-purchase',
       uptime: process.uptime(),
       connected_pages: db.pages.filter(p => p.is_active).length,
       total_products: db.amulet.length + db.china.length + db.otop.length + db.agriculture.length,
@@ -6581,6 +6600,7 @@ ${usedRepliesText}
 19. ✍️ ตอบแบบแชทจริง: พิมพ์เป็นภาษาไทยอ่านง่าย ใช้เว้นบรรทัด/อิโมจิน้อย ๆ (ไม่เกิน 1-2 ต่อข้อความ) แบบแอดมินมือถือ ไม่เป็นทางการเกิน ไม่ใช้ภาษาเขียนยาวเหยียด
 20. ${getBannedProductPromptRule()}
 21. 🧠 ข้อมูลที่เจ้าของร้านเตรียมไว้ (ด้านล่าง "ข้อมูล/สคริปต์ที่เจ้าของร้านเตรียมไว้"): นี่คือ "ความรู้ของร้าน" ไม่ใช่ข้อความที่ต้องส่ง — ให้อ่านทำความเข้าใจ แล้วเลือกหยิบมาเรียบเรียงใหม่ด้วยถ้อยคำของคุณเองแบบแอดมินคุยจริง ⛔ ห้ามคัดลอกทั้งดุ้น ห้ามส่งรวดเดียวทุกบรรทัด ห้ามพูดซ้ำกับที่คุยไปแล้ว ใช้เฉพาะส่วนที่ "ตอบคำถามล่าสุดของลูกค้า" และห้ามใส่ข้อความ/ราคาที่ไม่มีในข้อมูลนี้หรือในสเปกสินค้าด้านล่าง | ถ้าลูกค้าแสดงเจตนาซื้อ/ถามราคา/ถามโปรโมชั่น → ยึดข้อความขาย ราคา และข้อเสนอ (ส่งฟรี/COD/ของแถม) จากข้อมูลนี้เป็นหลักตรงตัว เรียบเรียงสั้นลงได้ แต่ห้ามเปลี่ยน/เพิ่ม/ตัดราคาหรือเงื่อนไข
+22. 🚫 ห้ามแนะนำตัวเอง/เอ่ยชื่อแอดมิน ชื่อเพจ หรือชื่อร้านในคำตอบ (เว้นแต่ลูกค้าถามหาโดยเฉพาะ) — เข้าเรื่องตอบคำถามลูกค้าทันที
 
 📝 ข้อมูล/สคริปต์ที่เจ้าของร้านเตรียมไว้ (ใช้เป็น "ความรู้" เท่านั้น — เรียบเรียงใหม่ด้วยคำของคุณเอง เลือกใช้เฉพาะที่ตรงกับคำถามลูกค้า):
 ${ownerScriptData || '(เจ้าของร้านยังไม่ได้เตรียมข้อมูลเพิ่มเติม — ตอบจากข้อมูลสินค้าและสเปกด้านล่างนี้เท่านั้น)'}
@@ -6783,10 +6803,15 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         let seqTtlKey = seqStateKey;
 
         // (2) 🔑 Keyword Trigger — คีย์เวิร์ดที่เจ้าของตั้ง (หรือค่าเริ่มต้น) → ส่งเฉพาะสเต็ปที่ผูกไว้ทันที
+        // 🔒 โหมดส่งตรง: กฎของเจ้าของร้าน — "สนใจ" (PURCHASE) = ส่งสเต็ปที่ตั้งไว้ตรงตัวเสมอ
+        // คำอื่นทั้งหมด (ราคา/ส่งฟรี/โปรฯ/ทักทาย/คำถาม) → ให้ AI ตอบแบบแอดมินจากข้อมูลจริง
+        const strictMode = isStrictSequenceMode(page);
+        const isPurchaseRequest = intentHint === 'PURCHASE';
+
         const kwRule = (!consultantMode && seqStepsConfigured.length > 0)
           ? matchKeywordTrigger(page, messageText)
           : null;
-        if (kwRule) {
+        if (kwRule && !strictMode) {
           const kwKey = `${pageId}:${senderId}:${kwRule.ruleKey}`;
           if (Date.now() - (keywordTriggerSentAt.get(kwKey) || 0) > KEYWORD_TRIGGER_TTL_MS) {
             // closingImages: false → ลูกค้าขอเฉพาะเรื่อง ห้ามยิงรูปสเต็ปอื่นปน (ปิดการขายเป็นข้อความล้วน)
@@ -6794,30 +6819,37 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
             seqLogTag = `Keyword Trigger "${kwRule.label}" (สเต็ป ${kwRule.stepNumbers.join(',')})`;
             seqTtlKey = kwKey;
           }
+        } else if (kwRule && strictMode) {
+          // 🔑 โหมดส่งตรง: คีย์เวิร์ดไม่ยิงสเต็ปตรง → แนบ "สเต็ปที่ผูกไว้" เข้า prompt ให้ AI ตอบแบบแอดมินแทน
+          const kwStepTexts = ((page.sales_sequence_steps || []) as any[])
+            .filter((s: any) => kwRule.stepNumbers.includes(Number(s?.step_number)) && String(s?.text_content || '').trim())
+            .sort((a: any, b: any) => Number(a.step_number || 0) - Number(b.step_number || 0))
+            .map((s: any) => `• ${String(s.text_content).trim()}`)
+            .join('\n');
+          if (kwStepTexts) {
+            promptContext += `\n\n🔑 ลูกค้าถามเรื่องที่ตรงกับคีย์เวิร์ด "${kwRule.label}" — เจ้าของร้านเตรียมข้อความสำหรับเรื่องนี้ไว้ด้านล่าง ให้อ่านแล้วตอบลูกค้าแบบแอดมินคุยจริง (สั้น กระชับ จัดบรรทัดอ่านง่าย ไม่ต้องคัดลอกทั้งดุ้น):\n${kwStepTexts}`;
+          }
         }
 
-        // (3) เจตนาขาย → สเต็ปครบชุด (ใช้เมื่อคีย์เวิร์ดไม่แมตช์ หรือกฎนั้นเพิ่งส่งไปไม่นาน)
-        // 🔒 โหมดส่งตรง (send_steps_verbatim): ส่งสเต็ปตรงตัวโดยไม่ให้ consultantMode บล็อก
-        //     และใช้ TTL กันสแปม 30 นาที (แทน 90 นาทีของโหมด AI-first)
-        const strictMode = isStrictSequenceMode(page);
-        const seqTtlMs = strictMode ? STRICT_SEQUENCE_TTL_MS : CONFIGURED_SEQUENCE_TTL_MS;
-        if (seqOut.length === 0 && seqStepsConfigured.length > 0
-          && SALES_SEQ_INTENTS.includes(intentHint)
-          && (strictMode || !consultantMode)
-          && Date.now() - (configuredSequenceSentAt.get(seqStateKey) || 0) > seqTtlMs) {
-          seqOut = buildConfiguredSequenceReply(page, intentHint);
-          seqLogTag = strictMode ? 'Fast Sequence (โหมดส่งตรง)' : 'Fast Sequence';
-          seqTtlKey = seqStateKey;
-        } else if (seqOut.length === 0 && strictMode && seqStepsConfigured.length > 0
-          && SALES_SEQ_INTENTS.includes(intentHint)) {
-          // 🔍 โหมดส่งตรงแต่ชุดไม่ถูกส่ง → log เหตุผลให้เจ้าของเห็นใน Activity log ได้ทันที
-          const lastSentAt = configuredSequenceSentAt.get(seqStateKey) || 0;
-          const sentAgoMin = lastSentAt > 0 ? Math.round((Date.now() - lastSentAt) / 60000) : 0;
-          if (sentAgoMin > 0) {
-            addLog('INFO', senderId, pageId, `⏭️ โหมดส่งตรง: ลูกค้าเพิ่งได้รับชุดสเต็ปไป ${sentAgoMin} นาทีก่อน (กันสแปม 30 นาที) → ให้ AI ตอบเฉพาะคำถามแทน ไม่ยิงชุดซ้ำ`, 'INFO');
-          } else if (consultantMode) {
-            addLog('INFO', senderId, pageId, `⏭️ โหมดส่งตรง: ลูกค้าเก่า (โหมดที่ปรึกษา) ยังไม่มีเจตนาซื้อใหม่ → ให้ AI ตอบตามบริบทแทน`, 'INFO');
+        // (3) เจตนาขาย → สเต็ปครบชุด
+        //    • โหมดส่งตรง: เฉพาะ PURCHASE ("สนใจ") → ส่งสเต็ปตรงเสมอ (ไม่สน TTL กันสแปม — ทุกครั้งที่ขอซื้อ)
+        //    • โหมด AI-first (toggle ปิด): เจตนาขายทุกประเภท + TTL 90 นาที + ไม่อยู่ในโหมดที่ปรึกษา
+        if (strictMode) {
+          if (seqOut.length === 0 && isPurchaseRequest && seqStepsConfigured.length > 0) {
+            seqOut = buildConfiguredSequenceReply(page, intentHint);
+            seqLogTag = 'Fast Sequence (โหมดส่งตรง)';
+            seqTtlKey = seqStateKey;
+          } else if (seqOut.length === 0 && seqStepsConfigured.length > 0
+            && SALES_SEQ_INTENTS.includes(intentHint)) {
+            addLog('INFO', senderId, pageId, `🧠 โหมดส่งตรง: "${intentHint}" ไม่ใช่คำขอซื้อตรง ๆ → ให้ AI ตอบแบบแอดมินจากข้อมูลร้าน (สเต็ปถูกแนบเป็นข้อมูลให้ AI ใช้)`, 'INFO');
           }
+        } else if (seqOut.length === 0 && seqStepsConfigured.length > 0
+          && SALES_SEQ_INTENTS.includes(intentHint)
+          && !consultantMode
+          && Date.now() - (configuredSequenceSentAt.get(seqStateKey) || 0) > CONFIGURED_SEQUENCE_TTL_MS) {
+          seqOut = buildConfiguredSequenceReply(page, intentHint);
+          seqLogTag = 'Fast Sequence';
+          seqTtlKey = seqStateKey;
         }
 
         if (seqOut.length > 0) {
@@ -6905,15 +6937,14 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
               `มีอะไรให้ช่วยเพิ่มเติมไหมคะ 😊 ${page.product?.product_name || matchedProduct.product_name}${aPackLine ? ` (${aPackLine})` : ''} — ถามเรื่องการใช้งาน วิธีดูแล หรือสเปกได้เลยนะคะ ยินดีตอบทุกคำถามค่ะ`
             ).map(t => ({ text: t } as InstantOutgoing[number]));
             addLog('AI_REPLY', senderId, pageId, `🤝 โหมดที่ปรึกษา + AI ตอบว่าง → ตอบสั้นแบบที่ปรึกษาจากข้อมูลจริง (ไม่พรีเซนสเต็ป)`, 'WARNING');
-          } else if (strictMode && hasConfiguredSteps(page)
-            && Date.now() - (configuredSequenceSentAt.get(seqStateKey) || 0) > seqTtlMs) {
-            // 🔒 โหมดส่งตรง: ห้าม "แต่งชุดเอง" — ส่งสเต็ปที่เจ้าของตั้งไว้ตรงตัวแทน
+          } else if (strictMode && hasConfiguredSteps(page) && isPurchaseRequest) {
+            // 🔒 โหมดส่งตรง: "สนใจ" → ส่งสเต็ปที่เจ้าของตั้งไว้ตรงตัว (ไม่แต่งชุดเอง)
             localOutgoing = buildConfiguredSequenceReply(page, intentHint);
             addLog('AI_REPLY', senderId, pageId, `🔒 โหมดส่งตรง + AI ตอบว่าง → ส่งสเต็ปตามที่เจ้าของตั้งไว้ตรงตัว ${localOutgoing.length} ชุด (ไม่แต่งข้อความเอง)`, 'WARNING');
           } else if (strictMode && hasConfiguredSteps(page)) {
-            // กันสแปม: ลูกค้าเพิ่งได้ชุดไป → ปิดการขายสั้น ๆ จากข้อมูลจริง ไม่ยิงชุดเต็มซ้ำ
-            localOutgoing = buildLocalClosingAsk(page, matchedProduct);
-            addLog('AI_REPLY', senderId, pageId, `🔒 โหมดส่งตรง + AI ตอบว่าง + ลูกค้าเพิ่งได้ชุดไป → ส่งข้อความปิดการขายสั้นแทน (ไม่ยิงชุดซ้ำ)`, 'WARNING');
+            // คำถามอื่น + AI ตอบว่าง → ปิดการขายสั้น 1 ข้อความ (ไม่ดัมพ์ตารางแพ็กทั้งชุด)
+            localOutgoing = [{ text: 'สนใจรับเป็นชุดไหนดีคะ 😊 แจ้งชื่อ-ที่อยู่-เบอร์โทรได้เลยนะคะ เดี๋ยวแอดมินสรุปยอดให้ค่ะ' }];
+            addLog('AI_REPLY', senderId, pageId, `🔒 โหมดส่งตรง + AI ตอบว่าง → ปิดการขายสั้น 1 ข้อความ (ไม่ดัมพ์ตารางแพ็ก)`, 'WARNING');
           } else {
             localOutgoing = buildInstantSalesReply(page, matchedProduct, intentHint, resolveInstantImageMap(page, matchedProduct), messageText, senderId);
             addLog('AI_REPLY', senderId, pageId, `⚡ AI ตอบว่าง → Instant Engine พรีเซนเต็มชุดจากข้อมูลจริงใน DB ${localOutgoing.length} ข้อความ (ไม่เรียก AI ซ้ำ ไม่ให้ลูกค้ารอ)`, 'WARNING');
@@ -7400,7 +7431,7 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           // การถามจำนวนชุดแต่ยังไม่ได้ขอชื่อ/ที่อยู่/เบอร์ → ทำให้ closing message ถูกข้ามไปผิด)
           const askedForOrderInfo = /ชื่อ|นามสกุล|ที่อยู่|เบอร์โทร|เบอร์มือถือ|เบอร์|จัดส่ง|ที่อยู่จัดส่ง/.test(replyText);
           const sentReviewImage = outgoing.some(o => Boolean(o.imageUrl) && o.imageUrl === imgMap.review);
-          if (!askedForOrderInfo && !consultantMode && (sentReviewImage || includeClosingAsk || intent === 'ORDER')) {
+          if (!askedForOrderInfo && !consultantMode && !isStrictSequenceMode(page) && (sentReviewImage || includeClosingAsk || intent === 'ORDER')) {
             // (Instant Engine) ข้อความปิดการขายสร้างจาก local engine (ราคา/แพ็กจริงจาก DB
             // + รูป closing) — แทน generateAiClosingMessage: ไม่ต้องรอ AI อีก 1 round-trip
             const closingParts = buildLocalClosingAsk(page, matchedProduct, pageId, senderId);
@@ -7436,8 +7467,14 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
         }
 
         // If ORDER is detected
-        if (intent === 'ORDER' || (parsed.orderData && (parsed.orderData.phone_number || parsed.orderData.address))) {
-          const od = parsed.orderData || {};
+        // 🧾 ต้องมีข้อมูลสั่งซื้อที่ "ลูกค้าพิมพ์มาเองในข้อความนี้" เท่านั้น — ห้ามนับของเก่าในโปรไฟล์
+        // (ลูกค้าพิมพ์แค่ "สนใจ" ต้องไม่โดนถามชื่อ-ที่อยู่-เบอร์ทั้งชุด)
+        const typedOrderProbe = extractOrderInfo(messageText);
+        const hasTypedOrderData = Boolean(typedOrderProbe.phone_number || typedOrderProbe.address);
+        if (hasTypedOrderData && (intent === 'ORDER' || parsed.orderData || intentHint === 'PURCHASE' || intentHint === 'NEGOTIATION')) {
+          const od: any = { ...(parsed.orderData || {}) };
+          if (!od.phone_number && typedOrderProbe.phone_number) od.phone_number = typedOrderProbe.phone_number;
+          if (!od.address && typedOrderProbe.address) od.address = typedOrderProbe.address;
           const qty = Number(od.quantity) || 1;
           // Pack prices are totals. Never trust AI-generated monetary values.
           const quote = calculateOrderQuote(resolveProductPricing(page, matchedProduct), qty,
@@ -7584,8 +7621,9 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
 
           // 🤝 โหมดที่ปรึกษา: ห้ามพรีเซนสเต็ปใส่ลูกค้าที่ปิดการขายแล้ว — ตอบสั้นเชิญถามต่อ
           // 🔒 โหมดส่งตรง (scope-local): บล็อกนี้อยู่นอก scope ของ strictMode หลัก → คำนวณซ้ำที่นี่
+          // กฎ: "สนใจ" (PURCHASE) → ส่งสเต็ปตรงตัว / คำถามอื่น → ปิดการขายสั้น 1 ข้อความ (ไม่ดัมพ์ตารางแพ็ก)
           const fbStrict = isStrictSequenceMode(page) && hasConfiguredSteps(page);
-          const fbStrictTtlOk = Date.now() - (configuredSequenceSentAt.get(getSequenceSentKey(pageId, senderId)) || 0) > STRICT_SEQUENCE_TTL_MS;
+          const fbIsPurchase = intentHint === 'PURCHASE';
           const fbParts: InstantOutgoing = recipientFallback
             ? [{ text: recipientFallback }]
             : consultantMode
@@ -7593,9 +7631,9 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
                 `มีอะไรให้ช่วยเพิ่มเติมไหมคะ 😊 ${page.product?.product_name || matchedProduct.product_name} — ถามเรื่องการใช้งาน วิธีดูแล หรือสเปกได้เลยนะคะ ยินดีตอบทุกคำถามค่ะ`
               ).map(t => ({ text: t } as InstantOutgoing[number]))
             : (fbStrict
-              ? (fbStrictTtlOk
+              ? (fbIsPurchase
                 ? buildConfiguredSequenceReply(page, intentHint)
-                : buildLocalClosingAsk(page, matchedProduct))
+                : [{ text: 'สนใจรับเป็นชุดไหนดีคะ 😊 แจ้งชื่อ-ที่อยู่-เบอร์โทรได้เลยนะคะ เดี๋ยวแอดมินสรุปยอดให้ค่ะ' }])
               : buildInstantSalesReply(page, matchedProduct, intentHint, fbImgMap, messageText, senderId));
           addLog('AI_REPLY', senderId, pageId, consultantMode
             ? `🤝 AI ล้มเหลว + โหมดที่ปรึกษา → ตอบสั้นแบบที่ปรึกษา (ไม่พรีเซนสเต็ป)`

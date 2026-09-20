@@ -107,6 +107,7 @@ const tsCode = [
   })(),
   extract('buildLocalClosingAsk'),
   extract('buildLocalOrderInfoRequest'),
+  extract('buildOwnerPreparedData'),
   extract('isStrictSequenceMode'),
   extract('hasConfiguredSteps'),
   extractConst('const STRICT_SEQUENCE_TTL_MS')
@@ -118,9 +119,9 @@ if (process.env.DEBUG_TSCODE) {
   console.log('[DEBUG] DEFAULT_KEYWORD_TRIGGERS at tsCode lines:', hits, '| total chars', tsCode.length);
 }
 const {
-  buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger, isGeneralQuestion, isSpecialQuestion, isPromotionalIntent, isStrictSequenceMode, hasConfiguredSteps, STRICT_SEQUENCE_TTL_MS
+  buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger, isGeneralQuestion, isSpecialQuestion, isPromotionalIntent, isStrictSequenceMode, hasConfiguredSteps, STRICT_SEQUENCE_TTL_MS, buildOwnerPreparedData
 } = new Function(
-  `${jsCode}\nreturn { buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyInstantIntent: classifyIntentInstant, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger, isGeneralQuestion, isSpecialQuestion, isPromotionalIntent, isStrictSequenceMode, hasConfiguredSteps, STRICT_SEQUENCE_TTL_MS };`
+  `${jsCode}\nreturn { buildInstantAck, buildInstantSalesReply, buildLocalClosingAsk, buildLocalOrderInfoRequest, classifyInstantIntent: classifyIntentInstant, classifyIntentInstant, buildConfiguredSequenceReply, matchKeywordTrigger, isGeneralQuestion, isSpecialQuestion, isPromotionalIntent, isStrictSequenceMode, hasConfiguredSteps, STRICT_SEQUENCE_TTL_MS, buildOwnerPreparedData };`
 )();
 
 let pass = 0, fail = 0;
@@ -401,6 +402,29 @@ check('มีสเต็ปข้อความ/รูป → hasConfiguredSte
 check('สเต็ปว่างทั้งหมด/ไม่มีสเต็ป → hasConfiguredSteps = false', !hasConfiguredSteps({ sales_sequence_steps: [{ step_number: 1, text_content: '', image_url: '' }] }) && !hasConfiguredSteps({ sales_sequence_steps: [] }) && !hasConfiguredSteps({}));
 check('โหมดส่งตรง: buildConfiguredSequenceReply ยังส่งสเต็ปตรงตัว (regression)', buildConfiguredSequenceReply(ownerPage, 'PURCHASE')[0].text === 'สวัสดีค่ะ ที่หั่นผักกะทัดรัด พกพาสะดวกค่ะ');
 check('โหมดส่งตรง fallback: buildLocalClosingAsk ยังปิดการขายด้วยการขอชื่อ-ที่อยู่-เบอร์ (ไม่พัง)', buildLocalClosingAsk(ownerPage, null).length >= 1 && /ชื่อ|ที่อยู่|เบอร์/.test(buildLocalClosingAsk(ownerPage, null).map(m => m.text).join(' ')));
+
+// ── 📋 ฟอร์มรายละเอียดสินค้า (product.detail → ความรู้ของ AI) ──
+console.log('── Product Detail Form ──');
+const detailPage = {
+  product: {
+    product_name: 'กล่องตัดเม็ดยา',
+    detail: {
+      selling_points: ['ตัดเม็ดยาได้แม่นยำ', 'พกพาสะดวก'],
+      material_specs: 'พลาสติก ABS + ใบมีดสแตนเลส',
+      usage_guide: 'วางเม็ดยาแล้วกดฝา',
+      suitable_for: 'ผู้สูงอายุ',
+      cautions: 'เก็บพ้นมือเด็ก',
+      guarantee: 'การันตีคุณภาพ 1 เดือน',
+      faq: [{ q: 'ส่งฟรีไหม', a: 'ซื้อครบ 199 ขึ้นไปส่งฟรีค่ะ' }]
+    }
+  }
+};
+const detailData = buildOwnerPreparedData(detailPage);
+check('ฟอร์ม: จุดเด่นถูกป้อนเข้า prompt', detailData.includes('จุดเด่นสินค้า:') && detailData.includes('ตัดเม็ดยาได้แม่นยำ'));
+check('ฟอร์ม: สเปค/วัสดุ/ขนาดถูกป้อน', detailData.includes('สเปค/วัสดุ/ขนาด: พลาสติก ABS'));
+check('ฟอร์ม: วิธีใช้/เหมาะกับใคร/ข้อควรระวัง/การันตีถูกป้อน', detailData.includes('วิธีใช้งาน: วางเม็ดยา') && detailData.includes('เหมาะกับใคร: ผู้สูงอายุ') && detailData.includes('ข้อควรระวัง: เก็บพ้นมือเด็ก') && detailData.includes('การรับประกัน/การันตี: การันตีคุณภาพ'));
+check('ฟอร์ม: FAQ คู่คำถาม-คำตอบถูกป้อน', detailData.includes('ส่งฟรีไหม') && detailData.includes('ซื้อครบ 199 ขึ้นไปส่งฟรี'));
+check('ฟอร์ม: ว่าง/ไม่มี detail → ไม่พัง (คืน string)', typeof buildOwnerPreparedData({ product: { product_name: 'x', detail: {} } }) === 'string' && typeof buildOwnerPreparedData({}) === 'string');
 
 console.log(`\nสรุป: ผ่าน ${pass} / ไม่ผ่าน ${fail}`);
 process.exit(fail > 0 ? 1 : 0);
