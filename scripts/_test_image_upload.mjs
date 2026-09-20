@@ -81,6 +81,10 @@ globalThis.fetch = async (url, init) => {
 const buf = Buffer.alloc(2048, 7);
 const okUpload = { ok: true, json: async () => ({ attachment_id: 'ATT_123' }) };
 
+// ⚠️ ต้องห่อ async IIFE — โค้ดที่ esbuild แปลงเป็น CJS แล้วรันผ่าน new Function
+// ไม่รองรับ top-level await
+(async () => {
+
 // ── 1) อัปโหลด reusable attachment: รูปแบบ multipart ต้องตรงสเปค Meta ──
 console.log('── uploadReusableAttachment (multipart ตามสเปค Meta) ──');
 setPlan(okUpload);
@@ -147,4 +151,5 @@ check('token ว่าง → ไม่ยิง API (PAGE_ACCESS_TOKEN_OR_IMAGE
 
 console.log(`\nสรุป: ผ่าน ${pass} / ไม่ผ่าน ${fail}`);
 process.exit(fail > 0 ? 1 : 0);
+})().catch((e) => { console.error('TEST CRASH:', e); process.exit(1); });
 

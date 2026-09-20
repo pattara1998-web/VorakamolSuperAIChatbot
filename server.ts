@@ -3648,7 +3648,7 @@ async function startServer() {
   app.get('/api/health', (req: Request, res: Response) => {
     res.json({
       status: 'ok',
-      version: '2.9.1-image-fix',
+      version: '2.9.2-dedup-fix',
       uptime: process.uptime(),
       connected_pages: db.pages.filter(p => p.is_active).length,
       total_products: db.amulet.length + db.china.length + db.otop.length + db.agriculture.length,
@@ -7366,29 +7366,12 @@ ${JSON.stringify(((page.product?.promotions?.length ? page.product.promotions : 
           const msg = outgoing[i];
           const isLast = i === outgoing.length - 1;
           try {
-            if (isLast && shouldSendQuickReplies) {
-              const qrRes: any = await sendFacebookQuickReplies(page.page_access_token || '', senderId, msg.text, quickReplies);
-              // ⛔ บล็อกเฉพาะเมื่อ Banned Guard สั่งห้าม — ที่เหลือบันทึกคำตอบที่ AI เรียบร้อย
-              // เสมอ เพื่อให้ Live Simulator เห็นข้อความจริงที่ระบบส่งออก (เดิม gate ด้วย
-              // .success ทำให้ PSID ปลอมของ simulator ที่ Messenger ปฏิเสธ → โชว์ว่า
-              // "ระบบไม่ตอบ" ทั้งที่ AI ทำงานปกติทุกอย่าง)
-              if (!qrRes?.blocked) {
-                // ✅ ใหม่: บันทึกข้อความพร้อม images array (ถ้ามี) → Live Simulator แสดง
-                // "ข้อความ N ข้อความ + รูป M ใบ" ได้ตรงกับสิ่งที่ลูกค้าจะได้รับจริง
-                recordSimulatedSend(pageId, senderId, msg.text, msg.images);
-              }
-              addLog('INFO', senderId, pageId, `🔘 ส่ง Quick Reply ${quickReplies.length} ปุ่ม พร้อมข้อความตอบกลับ (${i + 1}/${outgoing.length})${qrRes?.blocked ? ' — ⛔ ถูก BANNED_PRODUCT_GUARD บล็อก' : ''}`, qrRes?.blocked ? 'WARNING' : 'SUCCESS');
-            } else {
-              const msgRes: any = await sendFacebookMessage(page.page_access_token || '', senderId, msg.text);
-              // ⛔ ไม่บันทึกว่า "ส่งแล้ว" เฉพาะเมื่อถูก Banned Guard บล็อกเท่านั้น
-              if (!msgRes.blocked) {
-                // ✅ ใหม่: บันทึกข้อความพร้อม images array (ถ้ามี) — ทำให้ Live Simulator
-                // แสดงข้อความ+รูปครบถ้วน แทนที่จะเป็นข้อความเท็จ + ราคาปลอม
-                recordSimulatedSend(pageId, senderId, msg.text, msg.images);
-              } else {
-                addLog('AI_REPLY', senderId, pageId, `⛔ ข้อความตอบกลับ (${i + 1}/${outgoing.length}) ถูก BANNED_PRODUCT_GUARD บล็อก — ไม่ส่งถึงลูกค้า`, 'WARNING');
-              }
-            }
+            // (Removed — ต้นเหตุ "ข้อความเด้งซ้ำเป็นคู่ ๆ") บล็อกส่งข้อความชุดเก่าที่ตกค้าง
+            // ซ้ำซ้อนกับบล็อก "── ส่งข้อความ ──" ด้านล่าง (ที่รองรับทั้ง IMAGE_FIRST/TEXT_FIRST
+            // + Quick Reply ครบ) ทำให้ทุกข้อความถูกยิง 2 ครั้ง และรูปถูกยิงซ้ำอีกครั้ง
+            // → เหลือผู้ส่งรายการเดียวต่อ 1 ข้อความ: IMAGE_FIRST = รูปก่อนแล้วข้อความ /
+            //   TEXT_FIRST = ข้อความก่อนแล้วรูป (ดูบล็อกด้านล่าง)
+
             // ✅ ใหม่: buildInstantSalesReply ได้ inject send_order ลงใน msg แล้ว
             // ถ้า msg.send_order === 'IMAGE_FIRST' ให้ส่งรูปก่อนแล้วค่อยข้อความ
             const imageList: string[] = msg.images && msg.images.length > 0 ? msg.images : (msg.imageUrl ? [msg.imageUrl] : []);
