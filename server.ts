@@ -4679,13 +4679,24 @@ async function startServer() {
   async function sendFacebookImage(accessToken: string, recipientId: string, imageUrl: string) {
     const rawToken = decryptToken(accessToken);
     if (!rawToken?.startsWith('EAA') || !imageUrl) return { success: false, error: 'PAGE_ACCESS_TOKEN_OR_IMAGE_NOT_CONFIGURED' };
-    try {
+    const post = async (payload: Record<string, any>) => {
       const response = await fetch(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/messages?access_token=${encodeURIComponent(rawToken)}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recipient: { id: recipientId }, message: { attachment: { type: 'image', payload: { url: imageUrl, is_reusable: true } } } })
+        body: JSON.stringify({ recipient: { id: recipientId }, message: { attachment: { type: 'image', payload } } })
       });
-      const data = await response.json();
+      const data: any = await response.json();
       if (!response.ok || data.error) throw new Error(data.error?.message || 'Send image failed');
+      return data;
+    };
+    try {
+      // 🔧 ยิง 2 รอบ: รอบแรกแบบ is_reusable (มาตรฐาน) — ถ้า Meta ปฏิเสธ flag นี้
+      // ให้ลองซ้ำแบบ URL ธรรมดา เพื่อไม่ให้รูปหายทั้งใบเพราะ flag เดียว
+      let data: any;
+      try {
+        data = await post({ url: imageUrl, is_reusable: true });
+      } catch {
+        data = await post({ url: imageUrl });
+      }
       return { success: true, messageId: data.message_id };
     } catch (error: any) {
       addLog('INFO', 'FACEBOOK_API', recipientId, `❌ ส่งรูปประกอบไม่สำเร็จ: ${error.message}`, 'ERROR');
@@ -4839,15 +4850,41 @@ async function startServer() {
 
   // Upload raw bytes to /me/message_attachments and get a reusable attachment_id.
   // Used by the admin chat "attach image" button so a local file can be sent.
+  //
+  // 🔧 (Fixed — ต้นเหตุ "รูปไม่ส่ง") Meta Attachment Upload API รับ multipart/form-data
+  // แค่ 2 field เท่านั้น: `message` (JSON string) + `filedata` (ตัวไฟล์)
+  // ของเดิมส่ง is_reusable / type / source ตรง ๆ → Meta ตอบกลับ
+  // "(#100) The parameter message is required" → อัปโหลดล้มทุกครั้ง แล้วรูปไม่ถึงลูกค้า
+  // (ยืนยันจาก log จริง: "⚠️ อัปโหลด attachment ไม่สำเร็จ ((#100) The parameter message is required)")
+  function attachmentTypeFromMime(mimeType: string): 'IMAGE' | 'VIDEO' | 'AUDIO' | 'FILE' {
+    const m = String(mimeType || '').toLowerCase();
+    if (m.startsWith('image/')) return 'IMAGE';
+    if (m.startsWith('video/')) return 'VIDEO';
+    if (m.startsWith('audio/')) return 'AUDIO';
+    return 'FILE';
+  }
+  function extensionForMime(mimeType: string): string {
+    const m = String(mimeType || '').toLowerCase();
+    if (m.includes('png')) return 'png';
+    if (m.includes('gif')) return 'gif';
+    if (m.includes('webp')) return 'webp';
+    if (m.includes('bmp')) return 'bmp';
+    if (m.startsWith('video/')) return m.includes('quicktime') ? 'mov' : 'mp4';
+    if (m.startsWith('audio/')) return m.includes('mpeg') ? 'mp3' : 'm4a';
+    return 'jpg';
+  }
   async function uploadReusableAttachment(accessToken: string, buffer: Buffer, filename: string, mimeType: string): Promise<{ success: boolean; attachment_id?: string; error?: string }> {
     const rawToken = decryptToken(accessToken);
     if (!rawToken?.startsWith('EAA')) return { success: false, error: 'PAGE_ACCESS_TOKEN_NOT_CONFIGURED' };
     if (!buffer || buffer.length === 0) return { success: false, error: 'EMPTY_FILE' };
     try {
+      const mime = mimeType || 'image/jpeg';
+      const attachType = attachmentTypeFromMime(mime);
+      // นามสกุลไฟล์ต้องตรงกับ mime จริง (Meta ใช้ทั้งสองอย่างในการตรวจชนิดไฟล์)
+      const safeName = `product-image.${extensionForMime(mime)}`;
       const form = new FormData();
-      form.append('is_reusable', 'true');
-      form.append('type', mimeType || 'image/jpeg');
-      form.append('source', new Blob([new Uint8Array(buffer)], { type: mimeType || 'image/jpeg' }), filename || 'upload.bin');
+      form.append('message', JSON.stringify({ attachment: { type: attachType, payload: { is_reusable: true } } }));
+      form.append('filedata', new Blob([new Uint8Array(buffer)], { type: mime }), safeName || filename || 'product-image.jpg');
       const response = await fetch(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/message_attachments?access_token=${encodeURIComponent(rawToken)}`, {
         method: 'POST',
         body: form
@@ -4857,6 +4894,8 @@ async function startServer() {
       if (!data.attachment_id) throw new Error('Graph API ไม่คืนค่า attachment_id');
       return { success: true, attachment_id: data.attachment_id };
     } catch (error: any) {
+      // ไม่กลืน error เงียบ ๆ — ให้เห็นใน Activity log ว่าอัปโหลดรูปพลาดเพราะอะไร
+      addLog('INFO', 'FACEBOOK_API', '', `❌ อัปโหลด attachment ไม่สำเร็จ: ${String(error?.message || error)}`, 'ERROR');
       return { success: false, error: error.message };
     }
   }
