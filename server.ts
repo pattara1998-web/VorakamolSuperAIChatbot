@@ -232,7 +232,10 @@ const AI_FAST_RETRY_MS = Number(process.env.AI_FAST_RETRY_MS || 4000);
 // งบเวลารวมของ "หนึ่งคำตอบ" — ต่อให้ลองหลายโมเดล/หลายรอบ ระบบจะหยุดที่งบนี้
 // แล้วตอบด้วยข้อความสำรองที่ยังขายได้ (buildInstantSalesReply) เพื่อไม่ให้ลูกค้ารอนาน
 const AI_DEADLINE_MS = Number(process.env.AI_DEADLINE_MS || 9000);
-const AI_FAST_MODEL = process.env.AI_FAST_MODEL || 'gemini-2.5-flash-lite';
+// ⚠️ gemini-2.5-flash-lite ถูก Google ปิดสิทธิ์ generate สำหรับคีย์ใหม่ (404 "no longer
+// available to new users") — ตัวแทนที่ยิงได้จริงคือ gemini-3.5-flash-lite (Google แนะนำ
+// เองในข้อความ 404; รายชื่อโมเดลมีชีวิตจริงดูได้ที่ live-models.json — probe จาก API)
+const AI_FAST_MODEL = process.env.AI_FAST_MODEL || 'gemini-3.5-flash-lite';
 // โมเดลที่เพิ่งโดน 503/quota จะถูกพักชั่วคราว — กันเสียเวลาไปกับโมเดลที่กำลัง
 // overload ทุกลูกค้าในช่วงเดียวกับที่ Google ประกาศ high demand
 const modelCooldownUntil = new Map<string, number>();
@@ -2589,10 +2592,11 @@ function getGemini(): GoogleGenAI {
 // ---------------------------------------------------------------------------
 const DEFAULT_GEMINI_MODEL = 'gemini-3.6-flash';
 // โมเดลฟรี "flash-lite" ที่คีย์ฟรีใช้ยิงได้จริง — ใช้เป็นตัวหลักได้ตามที่แอดมินขอ
-const FREE_GEMINI_LITE_MODEL = 'gemini-2.5-flash-lite';
-const GEMINI_MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-2.5-flash-lite', 'gemini-3.7-flash', 'gemini-2.5-flash'];
+const FREE_GEMINI_LITE_MODEL = 'gemini-3.5-flash-lite';
+const GEMINI_MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.7-flash', 'gemini-2.5-flash'];
 const DEPRECATED_GEMINI_MODELS = new Set([
-  'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'
+  'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro',
+  'gemini-2.5-flash-lite'
 ]);
 // ผู้ใช้หลายคนพิมพ์ "gemini 3.1 flash lite" (โมเดลฟรี) — นายแมตช์ชื่อเล่น/ที่พิมพ์ผิด
 // ให้ไปใช้ flash-lite ฟรีที่ยิงได้จริง เพื่อกัน AI ตก fallback แล้วตอบได้แค่ข้อความเดียว
@@ -2600,6 +2604,7 @@ const GEMINI_MODEL_ALIASES: Record<string, string> = {
   'gemini-3.1-flash-lite': FREE_GEMINI_LITE_MODEL,
   'gemini-3.1-flash': 'gemini-2.5-flash',
   'gemini-2.5-flash-lite-001': FREE_GEMINI_LITE_MODEL,
+  'gemini-2.5-flash-lite': FREE_GEMINI_LITE_MODEL,
   'gemini-flash-lite': FREE_GEMINI_LITE_MODEL
 };
 function normalizeGeminiModelId(model?: string | null): string {
@@ -2646,7 +2651,7 @@ const AI_PROVIDERS: Record<AiProvider, ProviderInfo> = {
     keySetting: 'geminiApiKey',
     modelSetting: 'geminiModel',
     defaultModel: DEFAULT_GEMINI_MODEL,
-    fastModel: 'gemini-2.5-flash-lite',
+    fastModel: 'gemini-3.5-flash-lite',
     setupHint: 'สร้างคีย์ฟรีได้ที่ aistudio.google.com/apikey'
   },
   ZAI: {
@@ -3019,11 +3024,9 @@ async function generateAiJson(prompt: string, options: { temperature?: number; m
 // และจำโมเดลที่ใช้ได้ไว้ใน settings เพื่อไม่ต้องเสียเวลาลองใหม่ทุกข้อความ
 const GEMINI_GENERATION_FALLBACKS = [
   'gemini-3.6-flash',
-  'gemini-2.5-flash-lite',
+  'gemini-3.5-flash-lite',
   'gemini-2.5-flash',
-  'gemini-2.0-flash-lite',
-  'gemini-flash-latest',
-  'gemini-2.0-flash'
+  'gemini-flash-latest'
 ];
 
 function isModelOrQuotaError(err: any): boolean {
