@@ -303,7 +303,7 @@ check('รูปยึดกับสเต็ปของมัน 1:1', seqRep
 check('สเต็ปมีรูปอย่างเดียว → ส่งเป็นรูปเปล่าได้ (text ว่าง)', seqReply[2].text === '' && seqReply[2].images?.[0] === 'https://img.example/o3.jpg');
 check('send_order จากสเต็ปถูกส่งต่อ', seqReply[3].send_order === 'IMAGE_FIRST');
 const seqNoClosing = buildConfiguredSequenceReply({ ...ownerPage, sales_sequence_steps: ownerPage.sales_sequence_steps.slice(0, 2) }, 'PRICE');
-check('ไม่มีสเต็ปปิดการขาย → เติม closing ท้ายชุด (intent ไม่ใช่ GREETING)', /ชื่อ|เบอร์|ที่อยู่/.test(seqNoClosing.map(m => m.text).join(' ')));
+check('ไม่มีสเต็ปปิดการขาย → PRICE ไม่ยัด closing พ่วง (ตอบตรงคำถาม AI-first)', !/ชื่อ|เบอร์|ที่อยู่/.test(seqNoClosing.map(m => m.text).join(' ')));
 const seqGreet = buildConfiguredSequenceReply({ ...ownerPage, sales_sequence_steps: ownerPage.sales_sequence_steps.slice(0, 2) }, 'GREETING');
 check('GREETING → ไม่ยัดปิดการขาย (2 ชุดพอดี)', seqGreet.length === 2);
 
@@ -402,6 +402,21 @@ check('มีสเต็ปข้อความ/รูป → hasConfiguredSte
 check('สเต็ปว่างทั้งหมด/ไม่มีสเต็ป → hasConfiguredSteps = false', !hasConfiguredSteps({ sales_sequence_steps: [{ step_number: 1, text_content: '', image_url: '' }] }) && !hasConfiguredSteps({ sales_sequence_steps: [] }) && !hasConfiguredSteps({}));
 check('โหมดส่งตรง: buildConfiguredSequenceReply ยังส่งสเต็ปตรงตัว (regression)', buildConfiguredSequenceReply(ownerPage, 'PURCHASE')[0].text === 'สวัสดีค่ะ ที่หั่นผักกะทัดรัด พกพาสะดวกค่ะ');
 check('โหมดส่งตรง fallback: buildLocalClosingAsk ยังปิดการขายด้วยการขอชื่อ-ที่อยู่-เบอร์ (ไม่พัง)', buildLocalClosingAsk(ownerPage, null).length >= 1 && /ชื่อ|ที่อยู่|เบอร์/.test(buildLocalClosingAsk(ownerPage, null).map(m => m.text).join(' ')));
+
+// ── 🔧 ตอบตรงคำถาม ไม่โยนมาหมด (ฟีดแบ็กลูกค้า: ถามราคา/ส่งฟรีแล้วได้ปิดการขายพ่วง) ──
+console.log('── ตอบตรงคำถาม ไม่โยนปิดการขายพ่วง ──');
+const seqPrice = buildConfiguredSequenceReply({ ...ownerPage, sales_sequence_steps: ownerPage.sales_sequence_steps.slice(0, 2) }, 'PRICE');
+check('PRICE → ไม่เติม closing ต่อท้าย (ตอบเฉพาะเรื่องที่ถาม)', !/ชื่อ|เบอร์|ที่อยู่|แจ้ง/.test(seqPrice.map(m => m.text).join(' ')));
+const seqShip = buildConfiguredSequenceReply({ ...ownerPage, sales_sequence_steps: ownerPage.sales_sequence_steps.slice(0, 2) }, 'SHIPPING');
+check('SHIPPING → ไม่เติม closing ต่อท้าย', !/ชื่อ|เบอร์|ที่อยู่|แจ้ง/.test(seqShip.map(m => m.text).join(' ')));
+const seqPromo = buildConfiguredSequenceReply({ ...ownerPage, sales_sequence_steps: ownerPage.sales_sequence_steps.slice(0, 2) }, 'PROMOTION');
+check('PROMOTION → ไม่เติม closing ต่อท้าย', !/ชื่อ|เบอร์|ที่อยู่|แจ้ง/.test(seqPromo.map(m => m.text).join(' ')));
+const seqBuy = buildConfiguredSequenceReply({ ...ownerPage, sales_sequence_steps: ownerPage.sales_sequence_steps.slice(0, 2) }, 'PURCHASE');
+check('PURCHASE → ยังเติม closing ท้ายชุด (เจตนาซื้อจริง)', /ชื่อ|เบอร์|ที่อยู่|แจ้ง/.test(seqBuy.map(m => m.text).join(' ')));
+const presShipNoLogistics = buildInstantSalesReply(fullPage, null, 'SHIPPING');
+check('SHIPPING fallback → ไม่ยัดประโยคขนส่งกลางพรีเซน', !presShipNoLogistics.map(m => m.text).join(' ').includes('ส่งผ่าน') && !presShipNoLogistics.map(m => m.text).join(' ').includes('จัดส่ง'));
+const ackNoName = buildInstantAck({ page_name: 'เพจหนังมันดูทั้งคืน', product: {} }, 'PRICE');
+check('ไม่มีชื่อสินค้าจริง (ตรงชื่อเพจ) → ack ไม่เอาชื่อเพจมาถาม', !ackNoName.map(m => m.text).join(' ').includes('เพจหนังมันดูทั้งคืน'));
 
 // ── 📋 ฟอร์มรายละเอียดสินค้า (product.detail → ความรู้ของ AI) ──
 console.log('── Product Detail Form ──');
